@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import functools
-from abc import ABC, abstractmethod
 from contextlib import contextmanager
 
 import flydsl.compiler as flyc
@@ -27,9 +26,6 @@ from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP, SmemAllocator, SmemPt
 
 from .tensor_shim import GTensor, STensor, get_dtype_in_kernel
 
-SPLIT_K_SEMAPHORE_MAX_LEN = 256
-
-
 @contextmanager
 def _if_then(if_op):
     """SCF IfOp then-region (flydsl ``if cond: return`` does not early-exit)."""
@@ -46,17 +42,8 @@ def swizzle_xor16(row, col_in_bytes, k_blocks16):
     return col_in_bytes ^ ((row % k_blocks16) * 16)
 
 
-class WmmaHalfBase(ABC):
-    @abstractmethod
-    def __init__(self, dtype: str):
-        pass
-
-    @abstractmethod
-    def __call__(self, a_frag, b_frag, c_frag):
-        pass
-
-
-class WmmaHalf_m16n16k16(WmmaHalfBase):
+# bf16 MFMA atoms. gfx942 uses the 16x16x16 atom; gfx950 the 16x16x32 atom.
+class WmmaHalf_m16n16k16:
     WMMA_M = 16
     WMMA_N = 16
     WMMA_K = 16
@@ -64,22 +51,15 @@ class WmmaHalf_m16n16k16(WmmaHalfBase):
     WMMA_B_FRAG_VALUES = 4
     WMMA_C_FRAG_VALUES = 4
 
-    def __init__(self, dtype: str):
-        self.dtype = dtype
-
     def __call__(self, a_frag, b_frag, c_frag):
-        if self.dtype == "bf16":
-            a_frag_vi16 = vector.bitcast(T.vec(self.WMMA_A_FRAG_VALUES, T.i16), a_frag)
-            b_frag_vi16 = vector.bitcast(T.vec(self.WMMA_B_FRAG_VALUES, T.i16), b_frag)
-            return rocdl.mfma_f32_16x16x16bf16_1k(
-                T.f32x4, [a_frag_vi16, b_frag_vi16, c_frag, 0, 0, 0]
-            )
-        return rocdl.mfma_f32_16x16x16f16(
-            T.vec(self.WMMA_C_FRAG_VALUES, T.f32), [a_frag, b_frag, c_frag, 0, 0, 0]
+        a_frag_vi16 = vector.bitcast(T.vec(self.WMMA_A_FRAG_VALUES, T.i16), a_frag)
+        b_frag_vi16 = vector.bitcast(T.vec(self.WMMA_B_FRAG_VALUES, T.i16), b_frag)
+        return rocdl.mfma_f32_16x16x16bf16_1k(
+            T.f32x4, [a_frag_vi16, b_frag_vi16, c_frag, 0, 0, 0]
         )
 
 
-class WmmaHalf_m16n16k32(WmmaHalfBase):
+class WmmaHalf_m16n16k32:
     WMMA_M = 16
     WMMA_N = 16
     WMMA_K = 32
@@ -87,34 +67,10 @@ class WmmaHalf_m16n16k32(WmmaHalfBase):
     WMMA_B_FRAG_VALUES = 8
     WMMA_C_FRAG_VALUES = 4
 
-    def __init__(self, dtype: str):
-        self.dtype = dtype
-
     def __call__(self, a_frag, b_frag, c_frag):
-        if self.dtype == "bf16":
-            return rocdl.mfma_f32_16x16x32_bf16(
-                T.vec(self.WMMA_C_FRAG_VALUES, T.f32), [a_frag, b_frag, c_frag, 0, 0, 0]
-            )
-        return rocdl.mfma_f32_16x16x32_f16(
+        return rocdl.mfma_f32_16x16x32_bf16(
             T.vec(self.WMMA_C_FRAG_VALUES, T.f32), [a_frag, b_frag, c_frag, 0, 0, 0]
         )
-
-
-class OnlineScheduler:
-    def __init__(self, total_signals: int, init_count: int = 0):
-        self.total_signals = total_signals
-        self.current_signal_id = init_count
-        self.remaining = init_count
-
-    def release(self, count: int):
-        count = min(count, self.total_signals - self.current_signal_id)
-        self.current_signal_id += count
-        self.remaining += count
-
-    def consume(self, count: int):
-        count = min(count, self.remaining)
-        self.remaining -= count
-        return count
 
 
 @functools.lru_cache(maxsize=1024)
@@ -136,15 +92,15 @@ def compile_jagged_dense_bmm_kernel(
     XCD_REMAP: int = 0,
     M_TILES: int = 0,
 ):
-    """Grouped jagged×dense BMM + optional bias (SPLIT_K=1).
+    """Grouped jagged x dense BMM + optional fused bias.
 
-    ``Dense`` must be presented as ``(B, N, K)`` row-major (transpose of genrec
-    ``(B, K, N)``). Grid mirrors Triton: ``(N_tiles, M_tiles(max_seq_len), B)``.
+    ``Dense`` must be presented as ``(B, N, K)`` row-major (the transpose of the
+    ``(B, K, N)`` reference layout). Grid is ``(N_tiles, M_tiles(max_seq_len), B)``.
 
     Per-block ``seq_offsets`` row bases are folded into buffer descriptors (i64
     byte bump) so element indices stay within int32 for large ``L``.
 
-    ``XCD_REMAP`` (HipKittens Algorithm 1, chiplet/L2-aware scheduling, gfx942
+    ``XCD_REMAP`` (chiplet/L2-aware block-id remap; gfx942
     has 8 XCDs): when ``>0`` the raw block id is remapped so all tiles of a group
     ``b`` are dispatched to the same XCD (``b % NXCD``), keeping ``Dense[b]``
     resident in that XCD's 4 MB L2 instead of being reloaded into all 8 XCDs.
@@ -153,29 +109,26 @@ def compile_jagged_dense_bmm_kernel(
     output is identical; requires ``batch_count % NXCD == 0`` else it falls back
     to identity at launch. Most impactful on the HBM-bound, B-heavy N=16384 shapes.
     """
-    SPLIT_K = 1
     assert BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS <= 16
     assert TILE_M * TILE_N * TILE_K <= 256 * 256 * 64
     if (TILE_M == 256) and (TILE_N == 256):
-        assert (TILE_K == 64) and (SPLIT_K == 1) and (STAGES == 2)
+        assert (TILE_K == 64) and (STAGES == 2)
     assert STAGES >= 2
     N_BLOCKS = n // TILE_N
     assert (N_BLOCKS >= 1) and (n % TILE_N == 0)
-    IS_SPLIT_K = SPLIT_K > 1
     IS_SLICE_K = BLOCK_K_WARPS > 1
     BLOCK_K = TILE_K
-    assert (k % SPLIT_K == 0) and (k // SPLIT_K >= 1)
-    ks = k // SPLIT_K
+    ks = k
     assert (ks % BLOCK_K == 0) and (ks // BLOCK_K >= 1)
     assert BLOCK_K >= 32
     GPU_ARCH = get_rocm_arch()
     if GPU_ARCH == "gfx942":
-        WMMA_IMPL = WmmaHalf_m16n16k16(dtype)
+        WMMA_IMPL = WmmaHalf_m16n16k16()
         DMA_BYTES = 4
         MFMA_PER_WARP_K = 2
         ASYNC_COPY = True
     else:
-        WMMA_IMPL = WmmaHalf_m16n16k32(dtype)
+        WMMA_IMPL = WmmaHalf_m16n16k32()
         DMA_BYTES = 16
         MFMA_PER_WARP_K = 1
         ASYNC_COPY = True
@@ -252,7 +205,7 @@ def compile_jagged_dense_bmm_kernel(
     LDG_WAIT_COUNT = LDG_REG_B_COUNT_AS + LDG_REG_A_COUNT_AS
     assert ((STAGES - 2) * LDG_WAIT_COUNT) < 63
 
-    # gfx942 MI300X: 8 XCDs (chiplets), each with its own 4 MB L2 slice.
+    # gfx942: 8 XCDs (chiplets), each with its own L2 slice.
     NXCD = 8
     KERNEL_NAME = (
         f"jdbba_{dtype}_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}x{STAGES}"
@@ -277,8 +230,6 @@ def compile_jagged_dense_bmm_kernel(
         seq_offsets: fx.Pointer,
         max_seq_len: fx.Int32,
         batch_count: fx.Int32,
-        semaphore: fx.Pointer,
-        signal: fx.Pointer,
     ):
         dtype_ = get_dtype_in_kernel(dtype)
         c_zero_d = arith.constant(0.0, type=dtype_)
@@ -299,10 +250,6 @@ def compile_jagged_dense_bmm_kernel(
             base_ptr, smem_a_offset, dtype_, shape=(BLOCK_K_WARPS * BLOCK_M * BLOCK_N,)
         )
         cs_ = STensor(smem_c_ptr, dtype_, shape=(BLOCK_K_WARPS, BLOCK_M, BLOCK_N))
-        if const_expr(IS_SPLIT_K):
-            semaphore_ = GTensor(semaphore, dtype=T.i32, shape=(-1,))
-            signal_ = GTensor(signal, dtype=T.i32, shape=(-1,))
-            signal_idx = fx.Int32(fx.block_idx.x)
 
         tid = fx.thread_idx.x
         wid = tid // WARP_SIZE
@@ -311,8 +258,8 @@ def compile_jagged_dense_bmm_kernel(
         w_tid = tid % WARP_SIZE
 
         if const_expr(XCD_REMAP_ON):
-            # HipKittens Algorithm 1 (chiplet/L2-aware): remap the raw block id so
-            # every tile of a group b lands on one XCD (groups assigned to XCDs in
+            # Chiplet/L2-aware remap: rewrite the raw block id so every tile of a
+            # group b lands on one XCD (groups assigned to XCDs in
             # CHUNK-sized runs), keeping Dense[b] resident in that XCD's 4 MB L2
             # instead of being reloaded into all 8 XCDs. HW assigns workgroup
             # flat-id -> XCD round-robin (xcd = flat % NXCD). All divisors are
@@ -337,7 +284,6 @@ def compile_jagged_dense_bmm_kernel(
             b_idx = fx.block_idx.z
             block_n_idx = fx.block_idx.x
             block_m_idx = fx.block_idx.y
-        ks_idx = fx.Index(0)
         ks_begin = arith.constant(0, type=T.i32)
 
         seq_start = fx.Index(SEQ_[fx.Index(b_idx)])
@@ -404,115 +350,6 @@ def compile_jagged_dense_bmm_kernel(
                     llvm_ptr._value if const_expr(hasattr(llvm_ptr, "_value")) else llvm_ptr
                 )
                 return ptr_v
-
-            def zero_c():
-                # zero c if current block is the first block
-                is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
-                cond_ks0 = arith.cmpi(arith.CmpIPredicate.eq, ks_idx, fx.Index(0))
-                cond_ks0_if = scf.IfOp(cond_ks0, results_=[], has_else=False)
-                with ir.InsertionPoint(cond_ks0_if.then_block):
-                    zero_vec = vector.broadcast(T.vec(LDG_VEC_SIZE, dtype_), c_zero_d)
-                    for i in range_constexpr(LDG_REG_C_COUNT):
-                        global_tid = BLOCK_THREADS * i + tid
-                        m_local_idx = global_tid // LDG_C_X_THREADS
-                        n_local_idx = global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE
-                        m_row = m_offset + fx.Index(m_local_idx)
-                        init_vec = zero_vec
-                        if const_expr(HAS_BIAS):
-                            if const_expr(ELEMENTWISE):
-                                init_vec = BIAS_.vec_load(
-                                    (m_row, n_offset + n_local_idx), LDG_VEC_SIZE
-                                )
-                            else:
-                                init_vec = BIAS_.vec_load(
-                                    (b_row_base + n_offset + n_local_idx,), LDG_VEC_SIZE
-                                )
-                        cond_boundary = arith.cmpi(
-                            arith.CmpIPredicate.ult, m_row, seq_len
-                        )
-                        cond_boundary_if = scf.IfOp(
-                            cond_boundary, results_=[], has_else=False
-                        )
-                        with ir.InsertionPoint(cond_boundary_if.then_block):
-                            bytes_offset = C_.linear_offset(
-                                (m_row, n_offset + n_local_idx)
-                            )
-                            c_ptr = get_llvm_ptr(C, bytes_offset, DTYPE_BYTES)
-                            llvm.InlineAsmOp(
-                                None,
-                                [c_ptr, init_vec],
-                                "global_store_dwordx4 $0, $1, off sc0 sc1",
-                                "v,v",
-                                has_side_effects=True,
-                            )
-                            scf.YieldOp([])
-                    gpu.barrier()
-                    # trigger signal when zeroc is done by the first arrived block
-                    is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-                    with ir.InsertionPoint(is_t0_cond_if.then_block):
-                        signal_ptr = get_llvm_ptr(signal, signal_idx, 4)
-                        llvm.InlineAsmOp(
-                            None,
-                            [signal_ptr, arith.constant(1, type=T.i32)],
-                            "global_store_dword $0, $1, off sc0 sc1",
-                            "v,v",
-                            has_side_effects=True,
-                        )
-                        scf.YieldOp([])
-                    gpu.barrier()
-                    scf.YieldOp([])
-
-            def split_k_barrier():
-                # spin-wait until signal triggered
-                is_t0_cond = arith.cmpi(arith.CmpIPredicate.eq, fx.Index(tid), fx.Index(0))
-                is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-                with ir.InsertionPoint(is_t0_cond_if.then_block):
-                    init_cur = arith.constant(0, type=T.i32)
-                    w = scf.WhileOp([T.i32], [init_cur])
-                    before = ir.Block.create_at_start(w.before, [T.i32])
-                    after = ir.Block.create_at_start(w.after, [T.i32])
-                    with ir.InsertionPoint(before):
-                        cur = before.arguments[0]
-                        need_wait = arith.CmpIOp(
-                            arith.CmpIPredicate.eq, cur, arith.constant(0, type=T.i32)
-                        ).result
-                        scf.ConditionOp(need_wait, [cur])
-                    with ir.InsertionPoint(after):
-                        signal_ptr = get_llvm_ptr(signal, signal_idx, 4)
-                        data = llvm.InlineAsmOp(
-                            T.i32,
-                            [signal_ptr],
-                            "global_load_dword $0, $1, off sc1",
-                            "=v,v",
-                            has_side_effects=True,
-                        ).result
-                        rocdl.s_waitcnt(0)
-                        scf.YieldOp([data])
-                    scf.YieldOp([])
-                rocdl.sched_barrier(0)
-                gpu.barrier()
-                # clean semaphore and signal if this is the last block within split-k group
-                is_t0_cond_if = scf.IfOp(is_t0_cond, results_=[], has_else=False)
-                with ir.InsertionPoint(is_t0_cond_if.then_block):
-                    semaphore_ptr = get_llvm_ptr(semaphore, signal_idx, 4)
-                    arrive_idx = llvm.AtomicRMWOp(
-                        llvm.AtomicBinOp.add,
-                        semaphore_ptr,
-                        arith.constant(1, type=T.i32),
-                        llvm.AtomicOrdering.monotonic,
-                        syncscope="agent",
-                        alignment=4,
-                    ).result
-                    cond_ksl = arith.cmpi(
-                        arith.CmpIPredicate.eq, fx.Index(arrive_idx), fx.Index(SPLIT_K - 1)
-                    )
-                    cond_ksl_if = scf.IfOp(cond_ksl, results_=[], has_else=False)
-                    with ir.InsertionPoint(cond_ksl_if.then_block):
-                        semaphore_[signal_idx] = arith.constant(0, type=T.i32)
-                        signal_[signal_idx] = arith.constant(0, type=T.i32)
-                        scf.YieldOp([])
-                    scf.YieldOp([])
-                gpu.barrier()
 
             def ldg_a(k_offset):
                 vecs = []
@@ -750,9 +587,6 @@ def compile_jagged_dense_bmm_kernel(
 
             warp_offset = get_dma_copy_warp_offset()
 
-            if const_expr(IS_SPLIT_K):
-                zero_c()
-
             if const_expr(B_TO_LDS):
 
                 for s in range_constexpr(STAGES - 1):
@@ -873,84 +707,37 @@ def compile_jagged_dense_bmm_kernel(
                         else:
                             cs_[0, lds_m_idx, lds_n_idx] = val
 
-            # write back to global
-            if const_expr(IS_SPLIT_K):
-                split_k_barrier()
-                for i in range_constexpr(LDG_REG_C_COUNT):
-                    global_tid = BLOCK_THREADS * i + tid
-                    m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-                    n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
-                    m_global_idx = m_offset + m_local_idx
-                    n_global_idx = n_offset + n_local_idx
-                    cond_boundary = arith.cmpi(
-                        arith.CmpIPredicate.ult, m_global_idx, seq_len
-                    )
-                    cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
-                    with ir.InsertionPoint(cond_boundary_if.then_block):
-                        pk_val = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                        for ksi in range_constexpr(1, BLOCK_K_WARPS):
-                            pk_val += cs_.vec_load(
-                                (ksi, m_local_idx, n_local_idx), LDG_VEC_SIZE
-                            )
-                        linear_offset_c = C_.linear_offset((m_global_idx, n_global_idx))
-                        # split to vec2s
-                        vec2_ty = T.vec(2, dtype_)
-                        for vec_idx in range_constexpr(LDG_VEC_SIZE // 2):
-                            e0 = vector.extract(
-                                pk_val, static_position=[vec_idx * 2], dynamic_position=[]
-                            )
-                            e1 = vector.extract(
-                                pk_val,
-                                static_position=[vec_idx * 2 + 1],
-                                dynamic_position=[],
-                            )
-                            pair = vector.from_elements(vec2_ty, [e0, e1])
-                            pair_v = (
-                                pair._value if const_expr(hasattr(pair, "_value")) else pair
-                            )
-                            pair_ptr_v = get_llvm_ptr(
-                                C, linear_offset_c + vec_idx * 2, DTYPE_BYTES
-                            )
-                            llvm.AtomicRMWOp(
-                                llvm.AtomicBinOp.fadd,
-                                pair_ptr_v,
-                                pair_v,
-                                llvm.AtomicOrdering.monotonic,
-                                syncscope="agent",
-                                alignment=4,
-                            )
-                        scf.YieldOp([])
-            else:
-                gpu.barrier()
-                for i in range_constexpr(LDG_REG_C_COUNT):
-                    global_tid = BLOCK_THREADS * i + tid
-                    m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
-                    n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
-                    m_global_idx = m_offset + m_local_idx
-                    cond_boundary = arith.cmpi(
-                        arith.CmpIPredicate.ult, m_global_idx, seq_len
-                    )
-                    cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
-                    with ir.InsertionPoint(cond_boundary_if.then_block):
-                        vec = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
-                        for ksi in range_constexpr(1, BLOCK_K_WARPS):
-                            vec += cs_.vec_load(
-                                (ksi, m_local_idx, n_local_idx), LDG_VEC_SIZE
-                            )
-                        if const_expr(HAS_BIAS):
-                            if const_expr(ELEMENTWISE):
-                                bias_vec = BIAS_.vec_load(
-                                    (m_global_idx, n_offset + n_local_idx), LDG_VEC_SIZE
-                                )
-                            else:
-                                bias_vec = BIAS_.vec_load(
-                                    (b_row_base + n_offset + n_local_idx,), LDG_VEC_SIZE
-                                )
-                            vec = vec + bias_vec
-                        C_.vec_store(
-                            (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
+            # write back to global: LDS-staged C tile -> bias add -> vectorized store
+            gpu.barrier()
+            for i in range_constexpr(LDG_REG_C_COUNT):
+                global_tid = BLOCK_THREADS * i + tid
+                m_local_idx = fx.Index(global_tid // LDG_C_X_THREADS)
+                n_local_idx = fx.Index(global_tid % LDG_C_X_THREADS * LDG_VEC_SIZE)
+                m_global_idx = m_offset + m_local_idx
+                cond_boundary = arith.cmpi(
+                    arith.CmpIPredicate.ult, m_global_idx, seq_len
+                )
+                cond_boundary_if = scf.IfOp(cond_boundary, results_=[], has_else=False)
+                with ir.InsertionPoint(cond_boundary_if.then_block):
+                    vec = cs_.vec_load((0, m_local_idx, n_local_idx), LDG_VEC_SIZE)
+                    for ksi in range_constexpr(1, BLOCK_K_WARPS):
+                        vec += cs_.vec_load(
+                            (ksi, m_local_idx, n_local_idx), LDG_VEC_SIZE
                         )
-                        scf.YieldOp([])
+                    if const_expr(HAS_BIAS):
+                        if const_expr(ELEMENTWISE):
+                            bias_vec = BIAS_.vec_load(
+                                (m_global_idx, n_offset + n_local_idx), LDG_VEC_SIZE
+                            )
+                        else:
+                            bias_vec = BIAS_.vec_load(
+                                (b_row_base + n_offset + n_local_idx,), LDG_VEC_SIZE
+                            )
+                        vec = vec + bias_vec
+                    C_.vec_store(
+                        (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
+                    )
+                    scf.YieldOp([])
 
     @flyc.jit
     def launch_jdbba_kernel(
@@ -962,8 +749,6 @@ def compile_jagged_dense_bmm_kernel(
         max_seq_len: fx.Int32,
         batch_count: fx.Int32,
         m_tiles: fx.Int32,
-        semaphore: fx.Pointer,
-        signal: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),
     ):
         allocator.finalized = False
@@ -973,7 +758,7 @@ def compile_jagged_dense_bmm_kernel(
 
         jdbba_kernel._func.__name__ = KERNEL_NAME
         launcher = jdbba_kernel(
-            C, A, B, BIAS, seq_offsets, max_seq_len, batch_count, semaphore, signal
+            C, A, B, BIAS, seq_offsets, max_seq_len, batch_count
         )
         if const_expr(WAVES_PER_EU > 0):
             _wpe = int(WAVES_PER_EU)
