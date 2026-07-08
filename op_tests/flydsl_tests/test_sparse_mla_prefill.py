@@ -210,6 +210,55 @@ def test_empty_kv_len():
     assert cos_mean > 0.98, f"cosine too low: {cos_mean}"
 
 
+def test_large_launch_int64_base(sq=32768):
+    """Single launch with num_queries*128*512 >= 2^31 (the int64 q/out base).
+
+    At sq=32768 the flat bf16 q/out tensor has 32768*128*512 = 2^31 elements =
+    exactly 4 GiB.  A single CDNA buffer resource over all of q/out would (a)
+    overflow the host int32 memref-shape field packed by the FlyDSL ABI and (b)
+    hit the 32-bit buffer voffset (4 GiB) ceiling on-device.  This test proves
+    the per-CTA int64-base launch runs and is numerically correct -- especially
+    for the LAST query (q_idx=sq-1), whose byte base (~4 GiB) is past INT32_MAX.
+
+    Correctness is checked on a representative subset of rows (incl. the last
+    two queries) so the dense f32 oracle stays cheap; the FULL sq-query kernel
+    is launched.  topk/skv are kept tiny so only q/out are large.
+    """
+    topk, skv = 8, 256
+    assert sq * 128 * 512 >= 2**31, "test must cross the 2^31 element boundary"
+    device = "cuda"
+    # VRAM guard: q + out are bf16 [sq,128,512] (=4 GiB each at sq=32768), plus
+    # fp8-round temporaries.  Skip gracefully if the device can't hold it.
+    need_bytes = int(sq) * 128 * 512 * 2 * 4  # q + out + headroom for casts
+    free_bytes, _ = torch.cuda.mem_get_info()
+    if free_bytes < need_bytes:
+        print(f"[SKIP large_int64_base] need ~{need_bytes/1e9:.1f} GB, free {free_bytes/1e9:.1f} GB")
+        return
+    scale = 1.0 / math.sqrt(512)
+    g = torch.Generator(device=device).manual_seed(7)
+    q = torch.randn(sq, 128, 512, generator=g, dtype=torch.bfloat16, device=device) * 0.3
+    q_in = _fp8_round_bf16(q)
+    del q
+    torch.cuda.empty_cache()
+    kv = torch.randn(skv, 512, generator=g, dtype=torch.bfloat16, device=device) * 0.3
+    kv_fp8 = kv.to(torch.float8_e4m3fnuz)
+    kv_ref = kv_fp8.to(torch.float32)
+    indices = torch.randint(0, skv, (sq, topk), generator=g, dtype=torch.int32, device=device)
+    indptr = torch.arange(sq + 1, dtype=torch.int32, device=device) * topk
+    out = _run_csr(q_in, kv_fp8, indices, indptr, scale, sq)
+    assert not torch.isnan(out).any(), "NaN in output"
+    # Representative rows including the last query (byte base > INT32_MAX).
+    check = torch.tensor([0, 1, sq // 2, sq - 2, sq - 1], dtype=torch.long, device=device)
+    ref_sub = reference_prefill(q_in[check].float(), kv_ref, indices[check].long(), scale, 512)
+    cos_mean, cos_min, max_abs = _metrics(out[check], ref_sub)
+    print(
+        f"[large_int64_base] sq={sq} (elems={sq*128*512}) rows={check.tolist()} "
+        f"cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}"
+    )
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+    assert cos_min > 0.99, f"per-row cosine too low: {cos_min}"
+
+
 # ===========================================================================
 # Phase B packed fp8_ds_mla cache coverage.
 #
@@ -939,6 +988,8 @@ def _main():
     test_basic()
     test_all_invalid()
     test_empty_kv_len()
+    # Large single launch: num_queries*128*512 >= 2^31 (per-CTA int64 q/out base)
+    test_large_launch_int64_base()
     # Phase B2
     test_b2_two_region()
     test_b2_multitile()

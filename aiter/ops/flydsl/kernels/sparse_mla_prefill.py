@@ -320,18 +320,36 @@ def kn_sparse_mla_prefill(
     c_zero_v4i32 = Vec.filled(4, 0, fx.Int32)
     c_log2e = fx.Float32(LOG2E)
 
-    # ---- Buffer resources ----
-    query_rsrc = buffer_ops.create_buffer_resource(query)
-    kv_rsrc = buffer_ops.create_buffer_resource(kv_buffer)
-    indices_rsrc = buffer_ops.create_buffer_resource(indices)
-    indptr_rsrc = buffer_ops.create_buffer_resource(indptr)
-    final_output_rsrc = buffer_ops.create_buffer_resource(final_output)
-
     # ---- Thread indices ----
     q_idx = gpu.block_idx.x
     tid = gpu.thread_id("x")
     warp_idx = tid / WARP_SIZE
     lane_idx = tid % WARP_SIZE
+
+    # ---- Buffer resources ----
+    # q and final_output use a PER-CTA int64 byte base (one CTA == one query
+    # token) so a single launch can address >= 2^31 bf16 elements. The base
+    # pointer is advanced to this query's first row via an i64 GEP; all
+    # in-resource offsets below then stay query-local int32 (< 128*512*2 B).
+    # The multiply MUST be i64: at q_idx ~ 32k, q_idx * 131072 exceeds 2^31.
+    q_idx_i64 = ArithValue(arith.index_cast(T.i64, _raw(_idx(q_idx))))
+    q_byte_base = _raw(q_idx_i64 * (NUM_QO_HEADS * QK_HEAD_DIM * 2))
+    o_byte_base = _raw(q_idx_i64 * (NUM_QO_HEADS * V_HEAD_DIM * 2))
+    # num_records bounds each per-CTA buffer to exactly this query's bytes: with
+    # the base advanced ~4 GiB for the last CTA, an over-claimed (4 GiB) size
+    # would let a stray voffset resolve into unmapped memory past the tensor end
+    # and fault; the accurate size masks it instead (all real offsets are < size).
+    Q_CTA_BYTES = NUM_QO_HEADS * QK_HEAD_DIM * 2
+    O_CTA_BYTES = NUM_QO_HEADS * V_HEAD_DIM * 2
+    query_rsrc = buffer_ops.create_buffer_resource(
+        query, base_byte_offset=q_byte_base, num_records_bytes=Q_CTA_BYTES
+    )
+    kv_rsrc = buffer_ops.create_buffer_resource(kv_buffer)
+    indices_rsrc = buffer_ops.create_buffer_resource(indices)
+    indptr_rsrc = buffer_ops.create_buffer_resource(indptr)
+    final_output_rsrc = buffer_ops.create_buffer_resource(
+        final_output, base_byte_offset=o_byte_base, num_records_bytes=O_CTA_BYTES
+    )
 
     # ---- KV thread-to-data mapping (V2: warp w -> rows {w*2, w*2+1, w*2+16, w*2+17}) ----
     kv_ld_row_base = lane_idx / 32 * 16 + (lane_idx / 16) % 2 + warp_idx * 2
@@ -499,8 +517,9 @@ def kn_sparse_mla_prefill(
 
         row = lane_idx / 4
         col = (lane_idx % 4) * 16
-        # bf16 element index into [num_queries, num_heads, head_dim]
-        base_elem = (_idx(q_idx_val) * NUM_QO_HEADS + warp_idx * 16 + row) * QK_HEAD_DIM + col
+        # query-local bf16 element index (query_rsrc base is already advanced to
+        # this token's first row via the per-CTA i64 base): rows 0..127 only.
+        base_elem = (warp_idx * 16 + row) * QK_HEAD_DIM + col
 
         row_st = lane_idx / 4
         col_st = (lane_idx % 4) * 16
@@ -547,9 +566,16 @@ def kn_sparse_mla_prefill(
         for i in range_constexpr(P_VALS_PER_THR):
             sub_offset = (i // 4) * 16 + (i % 4)
             pos = col_0_start + sub_offset
-            slot = buffer_ops.buffer_load(indices_rsrc, _i32(pos), vec_width=1, dtype=T.i32)
+            # Clamp the gather offset to 0 when pos is past this query's CSR end:
+            # ``indices`` has only ``nnz`` entries and the last query's tile can
+            # run past the buffer, so an unclamped load reads unmapped memory
+            # (faults). The result is masked out below (``pos >= kv_end``), so
+            # reading index[0] here is harmless.
+            oob = _raw(pos >= kv_end)
+            safe_pos = ArithValue(oob).select(_raw(c_zero_i32), _i32(pos))
+            slot = buffer_ops.buffer_load(indices_rsrc, safe_pos, vec_width=1, dtype=T.i32)
             slot_a = ArithValue(slot)
-            inv = ArithValue(_raw(pos >= kv_end))
+            inv = ArithValue(oob)
             inv = inv | (slot_a < 0)
             inv = inv | (slot_a >= skv)
             result[i] = ArithValue(_raw(inv)).select(_raw(c_neg_inf), result[i])
@@ -757,7 +783,8 @@ def kn_sparse_mla_prefill(
     kv_start_v = ArithValue(kv_start)
     kv_len = _raw(ArithValue(kv_end) - kv_start_v)
 
-    row_base = _idx(q_idx) * NUM_QO_HEADS + warp_idx * 16
+    # query-local output row (final_output_rsrc base is per-CTA): rows 0..127.
+    row_base = warp_idx * 16
 
     # Load Q (bf16 -> fp8) unconditionally; cheap relative to KV path.
     q_nope_packs = _load_q_to_regs(q_idx)
@@ -1090,7 +1117,19 @@ def compile_sparse_mla_prefill_paged(
         c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
         c_log2e = fx.Float32(LOG2E)
 
-        query_rsrc = buffer_ops.create_buffer_resource(query)
+        # PER-CTA int64 byte base for q / final_output (one CTA == one query
+        # token) so a single launch addresses >= 2^31 bf16 elements; in-resource
+        # offsets stay query-local int32. See the Phase A kernel for rationale.
+        q_idx = gpu.block_idx.x
+        # i64 multiply: at q_idx ~ 32k, q_idx * (128*head_dim*2) exceeds 2^31.
+        q_idx_i64 = ArithValue(arith.index_cast(T.i64, _raw(_idx(q_idx))))
+        q_byte_base = _raw(q_idx_i64 * (NUM_QO_HEADS * QK_HEAD_DIM * 2))
+        o_byte_base = _raw(q_idx_i64 * (NUM_QO_HEADS * V_HEAD_DIM * 2))
+        Q_CTA_BYTES = NUM_QO_HEADS * QK_HEAD_DIM * 2
+        O_CTA_BYTES = NUM_QO_HEADS * V_HEAD_DIM * 2
+        query_rsrc = buffer_ops.create_buffer_resource(
+            query, base_byte_offset=q_byte_base, num_records_bytes=Q_CTA_BYTES
+        )
         main_cache_rsrc = buffer_ops.create_buffer_resource(main_cache)
         main_indices_rsrc = buffer_ops.create_buffer_resource(main_indices)
         main_indptr_rsrc = buffer_ops.create_buffer_resource(main_indptr)
@@ -1099,7 +1138,9 @@ def compile_sparse_mla_prefill_paged(
         extra_indices_rsrc = buffer_ops.create_buffer_resource(extra_indices)
         extra_indptr_rsrc = buffer_ops.create_buffer_resource(extra_indptr)
         extra_bt_rsrc = buffer_ops.create_buffer_resource(extra_block_table)
-        final_output_rsrc = buffer_ops.create_buffer_resource(final_output)
+        final_output_rsrc = buffer_ops.create_buffer_resource(
+            final_output, base_byte_offset=o_byte_base, num_records_bytes=O_CTA_BYTES
+        )
         if const_expr(not SINGLE_REQUEST):
             q_req_rsrc = buffer_ops.create_buffer_resource(q_req)
         if const_expr(HAS_SINK):
@@ -1125,7 +1166,6 @@ def compile_sparse_mla_prefill_paged(
         else:
             qk_softmax_scale = softmax_scale
 
-        q_idx = gpu.block_idx.x
         tid = gpu.thread_id("x")
         warp_idx = tid / WARP_SIZE
         lane_idx = tid % WARP_SIZE
@@ -1423,7 +1463,8 @@ def compile_sparse_mla_prefill_paged(
             p_lds_q_warp = lds_base_idx + P_LDS_Q + warp_idx * SZ_LDS_Q_PER_WARP
             row = lane_idx / 4
             col = (lane_idx % 4) * 16
-            base_elem = (_idx(q_idx_val) * NUM_QO_HEADS + warp_idx * 16 + row) * QK_HEAD_DIM + col
+            # query-local element index (query_rsrc base is per-CTA i64): rows 0..127.
+            base_elem = (warp_idx * 16 + row) * QK_HEAD_DIM + col
             row_st = lane_idx / 4
             col_st = (lane_idx % 4) * 16
             lds_st_offset = (row_st / 2) * Q_BYTES_PER_2ROWS + (row_st % 2) * Q_ELEM_PER_ROW + col_st
@@ -1462,8 +1503,9 @@ def compile_sparse_mla_prefill_paged(
         # No LDS round-trip needed (the 4 dims are contiguous within a head row).
         def _load_q_rope_bf16(q_idx_val):
             head = warp_idx * 16 + (lane_idx % 16)
+            # query-local element index (query_rsrc base is per-CTA i64).
             base_elem = (
-                (_idx(q_idx_val) * NUM_QO_HEADS + head) * QK_HEAD_DIM
+                head * QK_HEAD_DIM
                 + PK_NOPE_DIM
                 + (lane_idx / 16) * 4
             )
@@ -1487,9 +1529,14 @@ def compile_sparse_mla_prefill_paged(
             for i in range_constexpr(P_VALS_PER_THR):
                 sub_offset = (i // 4) * 16 + (i % 4)
                 pos = col_0_start + sub_offset
-                slot = buffer_ops.buffer_load(idx_rsrc, _i32(pos), vec_width=1, dtype=T.i32)
+                # Clamp OOB gather offset to 0 (result masked by pos >= kv_end);
+                # the last query's tile can otherwise read past the CSR buffer
+                # end into unmapped memory. See the Phase A kernel for rationale.
+                oob = _raw(pos >= kv_end)
+                safe_pos = ArithValue(oob).select(_raw(c_zero_i32), _i32(pos))
+                slot = buffer_ops.buffer_load(idx_rsrc, safe_pos, vec_width=1, dtype=T.i32)
                 slot_a = ArithValue(slot)
-                inv = ArithValue(_raw(pos >= kv_end))
+                inv = ArithValue(oob)
                 inv = inv | (slot_a < 0)
                 inv = inv | (slot_a >= skv)
                 result[i] = ArithValue(_raw(inv)).select(_raw(c_neg_inf), result[i])
@@ -1746,7 +1793,8 @@ def compile_sparse_mla_prefill_paged(
         else:
             total_tiles = n0_tiles
 
-        row_base = _idx(q_idx) * NUM_QO_HEADS + warp_idx * 16
+        # query-local output row (final_output_rsrc base is per-CTA): rows 0..127.
+        row_base = warp_idx * 16
         q_nope_packs = _load_q_to_regs(q_idx)
         q_rope_packs = _load_q_rope_bf16(q_idx) if const_expr(ROPE_BF16) else None
 

@@ -158,7 +158,15 @@ def _require_bf16_contiguous(t: torch.Tensor, name: str) -> torch.Tensor:
 
 
 def _flat_bf16(t: torch.Tensor, name: str) -> torch.Tensor:
-    return _require_bf16_contiguous(t, name).view(-1)
+    # Collapse [num_queries, num_heads, head_dim] -> [num_queries*num_heads,
+    # head_dim] (contiguous view, no copy).  We deliberately do NOT flatten to
+    # 1D: a fully-flat [num_queries*128*head_dim] tensor whose leading dim hits
+    # 2^31 (num_queries >= 32768 for bf16 512-d) overflows the int32 shape field
+    # the FlyDSL host ABI packs per memref dim (struct 'i').  The 2D shape keeps
+    # every dim < 2^31 (max 128*max_queries), and the kernel indexes q/out as a
+    # flat byte buffer via a per-CTA int64 base, so rank is immaterial on-device.
+    t = _require_bf16_contiguous(t, name)
+    return t.reshape(t.shape[0] * t.shape[1], t.shape[2])
 
 
 def _validate_qout(q: torch.Tensor, out: torch.Tensor) -> tuple[int, int, int, int]:
