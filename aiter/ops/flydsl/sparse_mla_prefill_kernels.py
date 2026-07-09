@@ -43,10 +43,10 @@ def _stub_i32(device: torch.device) -> torch.Tensor:
     return _STUB[key]
 
 
-def _stub_sink(device: torch.device) -> torch.Tensor:
-    key = ("sink", str(device))
+def _stub_sink(device: torch.device, num_heads: int = NUM_HEADS) -> torch.Tensor:
+    key = ("sink", str(device), int(num_heads))
     if key not in _STUB:
-        _STUB[key] = torch.zeros(NUM_HEADS, dtype=torch.float32, device=device)
+        _STUB[key] = torch.zeros(int(num_heads), dtype=torch.float32, device=device)
     return _STUB[key]
 
 
@@ -59,6 +59,7 @@ def _stub_f32_one(device: torch.device) -> torch.Tensor:
 
 @lru_cache(maxsize=64)
 def _get_kernel(
+    num_q_heads: int,
     head_dim: int,
     v_dim: int,
     num_regions: int,
@@ -79,6 +80,7 @@ def _get_kernel(
     rope_bf16: bool = False,
 ):
     return compile_sparse_mla_prefill(
+        num_q_heads=num_q_heads,
         head_dim=head_dim,
         v_dim=v_dim,
         num_regions=num_regions,
@@ -176,9 +178,11 @@ def _validate_qout(q: torch.Tensor, out: torch.Tensor) -> tuple[int, int, int, i
     out_sq, out_h, v_dim = out.shape
     if (out_sq, out_h) != (num_queries, num_heads):
         raise ValueError("q and out must share (num_queries, num_heads)")
-    if num_heads != NUM_HEADS or head_dim not in SUPPORTED_HEAD_DIMS or v_dim != V_DIM:
+    # num_heads: DSv4 pro=128, flash=8; any count in [1, 128] is supported (one
+    # CTA per query token, 8 warps x 16 head-columns; surplus columns masked).
+    if not (1 <= num_heads <= NUM_HEADS) or head_dim not in SUPPORTED_HEAD_DIMS or v_dim != V_DIM:
         raise NotImplementedError(
-            f"requires H={NUM_HEADS}, head_dim in {SUPPORTED_HEAD_DIMS}, v_dim={V_DIM}; "
+            f"requires 1<=H<={NUM_HEADS}, head_dim in {SUPPORTED_HEAD_DIMS}, v_dim={V_DIM}; "
             f"got H={num_heads}, head_dim={head_dim}, v_dim={v_dim}"
         )
     return num_queries, num_heads, head_dim, v_dim
@@ -238,12 +242,13 @@ def _resolve_sink(
     *,
     has_sink: bool,
     device: torch.device,
+    num_heads: int = NUM_HEADS,
 ) -> torch.Tensor:
     if not has_sink:
-        return _stub_sink(device)
+        return _stub_sink(device, num_heads)
     if attn_sink is None:
-        raise ValueError("attn_sink [128] float32 is required for this kernel specialization")
-    return _require_f32_1d(attn_sink, "attn_sink", numel=NUM_HEADS)
+        raise ValueError(f"attn_sink [{num_heads}] float32 is required for this kernel specialization")
+    return _require_f32_1d(attn_sink, "attn_sink", numel=num_heads)
 
 
 def _resolve_f32_scalar(
@@ -317,6 +322,7 @@ def flydsl_sparse_mla_prefill(
         kv_u8 = kv.view(torch.uint8).reshape(-1)
         n_kv_rows = kv.shape[0]
         exe = _get_kernel(
+            num_q_heads=num_heads,
             head_dim=head_dim, v_dim=v_dim, num_regions=1, has_sink=False,
             r0_dtype="fp8", r0_fnuz=True, r1_dtype="fp8", r1_fnuz=True,
             qk_split=False, block_n=block_n, block_h=16, split_kv=False, packed=False, scale_mode="none",
@@ -351,11 +357,12 @@ def flydsl_sparse_mla_prefill(
     max_blocks = block_table.shape[1]
     has_sink = attn_sink is not None
     q_req_t = _resolve_q_req(q_req, num_queries=num_queries, single_request=single_request, device=q.device)
-    sink_t = _resolve_sink(attn_sink, has_sink=has_sink, device=q.device)
+    sink_t = _resolve_sink(attn_sink, has_sink=has_sink, device=q.device, num_heads=num_heads)
     q_sc_t = _resolve_f32_scalar(q_scale, "q_scale", device=q.device)
     kv_sc_t = _resolve_f32_scalar(kv_scale, "kv_scale", device=q.device)
 
     exe = _get_kernel(
+        num_q_heads=num_heads,
         head_dim=head_dim, v_dim=v_dim, num_regions=1, has_sink=has_sink,
         r0_dtype="fp8", r0_fnuz=True, r1_dtype="fp8", r1_fnuz=True,
         qk_split=not is_glm, block_n=block_n, block_h=16, split_kv=False, packed=True,
@@ -490,7 +497,7 @@ def flydsl_sparse_mla_prefill_2region(
 
     has_sink = attn_sink is not None
     q_req_t = _resolve_q_req(q_req, num_queries=num_queries, single_request=single_request, device=q.device)
-    sink_t = _resolve_sink(attn_sink, has_sink=has_sink, device=q.device)
+    sink_t = _resolve_sink(attn_sink, has_sink=has_sink, device=q.device, num_heads=num_heads)
     q_flat = _flat_bf16(q, "q")
     out_flat = _flat_bf16(out, "out")
 
@@ -499,6 +506,7 @@ def flydsl_sparse_mla_prefill_2region(
     q_sc_t = _stub_f32_one(q.device)
     kv_sc_t = _stub_f32_one(q.device)
     exe = _get_kernel(
+        num_q_heads=num_heads,
         head_dim=head_dim, v_dim=v_dim, num_regions=2, has_sink=has_sink,
         r0_dtype="fp8", r0_fnuz=main_is_fnuz, r1_dtype="fp8", r1_fnuz=extra_is_fnuz,
         qk_split=True, block_n=32, block_h=16, split_kv=False, packed=True,

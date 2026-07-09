@@ -5,9 +5,20 @@
 
 Single-region, native fp8 MFMA (``mfma_f32_16x16x32_fp8_fp8``) attention over a
 CSR-gathered subset of MLA-latent KV rows. One CTA per query token; 8 warps
-(512 threads) process all 128 Q heads of that token, matching the MLA-V2 decode
+(512 threads) process all Q heads of that token, matching the MLA-V2 decode
 template (``mla_fwd_decode_m16x8_fp8_fp8.py``) from which the LDS layout,
 software V-transpose, fp8 MFMA chains, and online softmax are ported.
+
+Head count (``num_q_heads``) is a build parameter: DSv4 "pro" = 128 (TP8) and
+DSv4 "flash" = 8 (TP8) both use the SAME single-CTA-per-token machinery.  Heads
+map to the MFMA **N** axis (16 per warp); the KV fp8 gather and software
+V-transpose are head-count-independent and always run on all 8 warps, so the op
+is memory/LDS-bound and the only head-count wiring is the per-CTA q/out byte
+stride + num_records (which also masks the surplus output rows produced by
+warps that own head columns >= ``num_q_heads`` when ``num_q_heads`` < 128).
+Token-packing along N is invalid here (each token has its own sparse KV set, so
+the shared K/V MFMA operand cannot be reused across tokens), and one-token-per-
+warp would need 8 independent KV LDS buffers (~135 KB > the 64 KB cap).
 
 Phase A scope (see docs/sparse-mla-prefill/01,02):
   - HEAD_DIM = 512, V_DIM = 512, NUM_REGIONS = 1, HAS_SINK = False.
@@ -265,8 +276,16 @@ def kn_sparse_mla_prefill(
     # --- parameters ---
     softmax_scale: fx.Float32,
     num_kv_rows: fx.Int32,
+    num_qo_heads: fx.Int32,
 ):
-    """Sparse MLA prefill: one CTA per query token, 8 warps over 128 heads."""
+    """Sparse MLA prefill: one CTA per query token, 8 warps over ``num_qo_heads``.
+
+    ``num_qo_heads`` (<= 128) only sizes the per-CTA q/out byte stride and the
+    num_records OOB clamp; the 8-warp cooperative KV load and software
+    V-transpose are head-count-independent, and output rows for warps that own
+    head indices >= ``num_qo_heads`` are masked by the num_records-bounded
+    output buffer resource (see the flash/pro head-count note in the builder).
+    """
     # ---- fastmath flags ----
     fm_no_inf = (
         arith.FastMathFlags.nnan
@@ -333,22 +352,28 @@ def kn_sparse_mla_prefill(
     # in-resource offsets below then stay query-local int32 (< 128*512*2 B).
     # The multiply MUST be i64: at q_idx ~ 32k, q_idx * 131072 exceeds 2^31.
     q_idx_i64 = ArithValue(arith.index_cast(T.i64, _raw(_idx(q_idx))))
-    q_byte_base = _raw(q_idx_i64 * (NUM_QO_HEADS * QK_HEAD_DIM * 2))
-    o_byte_base = _raw(q_idx_i64 * (NUM_QO_HEADS * V_HEAD_DIM * 2))
+    # Per-CTA q/out stride scales with the runtime head count (flash=8, pro=128),
+    # so the multiply must stay i64: at q_idx ~ 32k, q_idx * 128*512*2 > 2^31.
+    nqh_i64 = ArithValue(_i32(num_qo_heads)).extui(T.i64)
+    q_cta_bytes = nqh_i64 * (QK_HEAD_DIM * 2)
+    o_cta_bytes = nqh_i64 * (V_HEAD_DIM * 2)
+    q_byte_base = _raw(q_idx_i64 * q_cta_bytes)
+    o_byte_base = _raw(q_idx_i64 * o_cta_bytes)
     # num_records bounds each per-CTA buffer to exactly this query's bytes: with
     # the base advanced ~4 GiB for the last CTA, an over-claimed (4 GiB) size
     # would let a stray voffset resolve into unmapped memory past the tensor end
-    # and fault; the accurate size masks it instead (all real offsets are < size).
-    Q_CTA_BYTES = NUM_QO_HEADS * QK_HEAD_DIM * 2
-    O_CTA_BYTES = NUM_QO_HEADS * V_HEAD_DIM * 2
+    # and fault; the accurate size masks it instead (all real offsets are <
+    # size).  It ALSO drops the bogus output rows produced by warps that own
+    # head indices >= num_qo_heads when num_qo_heads < 128 (flash): those store
+    # byte offsets land at/after q_cta_bytes/o_cta_bytes and are masked.
     query_rsrc = buffer_ops.create_buffer_resource(
-        query, base_byte_offset=q_byte_base, num_records_bytes=Q_CTA_BYTES
+        query, base_byte_offset=q_byte_base, num_records_bytes=_raw(q_cta_bytes)
     )
     kv_rsrc = buffer_ops.create_buffer_resource(kv_buffer)
     indices_rsrc = buffer_ops.create_buffer_resource(indices)
     indptr_rsrc = buffer_ops.create_buffer_resource(indptr)
     final_output_rsrc = buffer_ops.create_buffer_resource(
-        final_output, base_byte_offset=o_byte_base, num_records_bytes=O_CTA_BYTES
+        final_output, base_byte_offset=o_byte_base, num_records_bytes=_raw(o_cta_bytes)
     )
 
     # ---- KV thread-to-data mapping (V2: warp w -> rows {w*2, w*2+1, w*2+16, w*2+17}) ----
@@ -864,6 +889,7 @@ def launch_sparse_mla_prefill(
     softmax_scale: fx.Float32,
     num_queries: fx.Int32,
     num_kv_rows: fx.Int32,
+    num_qo_heads: fx.Int32,
     stream: fx.Stream = fx.Stream(None),
 ):
     grid_x = arith.index_cast(T.index, _raw(num_queries))
@@ -875,6 +901,7 @@ def launch_sparse_mla_prefill(
         final_output,
         softmax_scale,
         num_kv_rows,
+        num_qo_heads,
     ).launch(
         grid=(grid_x, 1, 1),
         block=(NUM_THREADS, 1, 1),
@@ -901,6 +928,7 @@ def launch_sparse_mla_prefill(
 # ===========================================================================
 def compile_sparse_mla_prefill_paged(
     *,
+    num_q_heads: int = 128,
     num_regions: int = 1,
     has_sink: bool = False,
     r0_convert: bool = False,
@@ -935,6 +963,12 @@ def compile_sparse_mla_prefill_paged(
                  launch args (GLM).  DSv4 UE8M0 scales stay in the cache bytes.
     """
     NREG = int(num_regions)
+    NUM_Q_HEADS = int(num_q_heads)
+    if not (1 <= NUM_Q_HEADS <= NUM_QO_HEADS):
+        raise NotImplementedError(
+            f"num_q_heads must be in [1, {NUM_QO_HEADS}] (one CTA per token, "
+            f"<= 8 warps x 16 head-columns), got {NUM_Q_HEADS}"
+        )
     HAS_SINK = bool(has_sink)
     R0_CONVERT = bool(r0_convert)
     R0_OCP = bool(r0_is_ocp)
@@ -1123,10 +1157,14 @@ def compile_sparse_mla_prefill_paged(
         q_idx = gpu.block_idx.x
         # i64 multiply: at q_idx ~ 32k, q_idx * (128*head_dim*2) exceeds 2^31.
         q_idx_i64 = ArithValue(arith.index_cast(T.i64, _raw(_idx(q_idx))))
-        q_byte_base = _raw(q_idx_i64 * (NUM_QO_HEADS * QK_HEAD_DIM * 2))
-        o_byte_base = _raw(q_idx_i64 * (NUM_QO_HEADS * V_HEAD_DIM * 2))
-        Q_CTA_BYTES = NUM_QO_HEADS * QK_HEAD_DIM * 2
-        O_CTA_BYTES = NUM_QO_HEADS * V_HEAD_DIM * 2
+        # Per-CTA q/out stride scales with the (compile-time) head count:
+        # flash=8, pro=128.  Sizing num_records by NUM_Q_HEADS also drops the
+        # bogus output rows from warps that own head indices >= NUM_Q_HEADS
+        # (they still do the head-independent KV load + V-transpose).
+        q_byte_base = _raw(q_idx_i64 * (NUM_Q_HEADS * QK_HEAD_DIM * 2))
+        o_byte_base = _raw(q_idx_i64 * (NUM_Q_HEADS * V_HEAD_DIM * 2))
+        Q_CTA_BYTES = NUM_Q_HEADS * QK_HEAD_DIM * 2
+        O_CTA_BYTES = NUM_Q_HEADS * V_HEAD_DIM * 2
         query_rsrc = buffer_ops.create_buffer_resource(
             query, base_byte_offset=q_byte_base, num_records_bytes=Q_CTA_BYTES
         )
@@ -2116,8 +2154,18 @@ def compile_sparse_mla_prefill(
         single-region flat fp8 cache, ``scale_mode='per_tensor'`` (runtime
         ``q_scale`` / ``kv_scale`` f32 [1] launch args), no sink.
     """
-    if num_q_heads != NUM_QO_HEADS:
-        raise NotImplementedError(f"requires num_q_heads={NUM_QO_HEADS}, got {num_q_heads}")
+    # num_q_heads is the Q/O heads per query token (all sharing this token's
+    # sparse KV): DSv4 "pro" = 128 (TP8), DSv4 "flash" = 8 (TP8).  Any count in
+    # [1, 128] is supported by the single-CTA-per-token design (heads are the
+    # MFMA N axis; warps that own head columns >= num_q_heads still perform the
+    # head-independent cooperative KV load + V-transpose and have their surplus
+    # output masked by the num_records-bounded output buffer).  Counts < 16
+    # under-fill one warp's 16-wide MFMA N tile (see the head-packing note in
+    # the module docstring / final report).
+    if not (1 <= int(num_q_heads) <= NUM_QO_HEADS):
+        raise NotImplementedError(
+            f"num_q_heads must be in [1, {NUM_QO_HEADS}], got {num_q_heads}"
+        )
     if v_dim != V_HEAD_DIM:
         raise NotImplementedError(f"requires v_dim={V_HEAD_DIM}, got {v_dim}")
     if head_dim not in (512, 576):
@@ -2153,7 +2201,8 @@ def compile_sparse_mla_prefill(
             stream: fx.Stream = fx.Stream(None),
         ):
             launch_sparse_mla_prefill(
-                query, kv_buffer, indices, indptr, final_output, sm, num_queries, num_kv_rows, stream
+                query, kv_buffer, indices, indptr, final_output, sm, num_queries,
+                num_kv_rows, fx.Int32(int(num_q_heads)), stream
             )
 
         return launch_flat
@@ -2171,6 +2220,7 @@ def compile_sparse_mla_prefill(
     # rows are read straight to LDS (no per-block convert).
     r0_convert = (scale_mode == "ue8m0") or (not region0_is_fnuz)
     return compile_sparse_mla_prefill_paged(
+        num_q_heads=int(num_q_heads),
         num_regions=num_regions,
         has_sink=has_sink,
         r0_convert=r0_convert,
