@@ -977,13 +977,307 @@ def test_glm576_edge_empty_invalid():
     assert cos_mean > 0.98, f"cosine too low: {cos_mean}"
 
 
+def test_glm576_flash_h8():
+    """GLM-576 flat fp8 cache at the flash head count (num_q_heads=8, TP8).
+
+    Mirrors ``test_glm576_paged_basic`` but with H=8: q=[sq,8,576], out=[sq,8,512],
+    flat fnuz fp8 ``glm_flat576`` cache, ``scale_mode='per_tensor'``, vs
+    ``ref_prefill_glm``.  Same single-CTA-per-token design as pro (H=128); the
+    surplus head columns from warps owning indices >= 8 are masked by the
+    num_records-bounded output buffer.  Per-head numerics are head-count
+    independent, so the tight flash gate (cos>0.999) applies."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    device = "cuda"
+    block_size = 64
+    scale = default_scale_glm()
+    num_tokens = 600
+    kv = gen_kv_glm(num_tokens, seed=71)
+    cache = pack_glm_fp8_cache(kv, block_size)  # kv_scale=1.0
+    rows = [[5, 200, 7, 400, 63, 64, 599, 128], [0, 1, 2, 3], [300, 301, 302, 303, 304]]
+    sq = len(rows)
+    q = gen_q_glm(sq, FLASH_H, seed=72)
+    indices, indptr = _ragged_from_rows(rows, device)
+    block_table = _identity_block_table(num_tokens, block_size, device)
+
+    out = torch.empty(sq, FLASH_H, GLM_V_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill(
+        q, cache, indices, indptr, out,
+        block_table=block_table, block_size=block_size, packed=True,
+        scale_mode="per_tensor",
+    )
+    ref = ref_prefill_glm(q, cache, rows, scale, block_size)
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[glm576_flash_h8 H={FLASH_H}] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert out.shape == (sq, FLASH_H, GLM_V_DIM)
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
+# ===========================================================================
+# DSv4 "flash" head count: num_q_heads = 8 (TP8) instead of "pro" 128.  Same
+# single-CTA-per-token design (heads are the MFMA N axis; the 8-warp cooperative
+# KV load + software V-transpose are head-count-independent, and the surplus
+# output rows from warps that own head columns >= 8 are masked by the
+# num_records-bounded output buffer).  Per-head numerics are identical to pro,
+# so the fp8-rounded f32 oracle gate stays tight (cos > 0.999).  Odd query
+# counts exercise multiple CTAs; multi-tile rows exercise the online-softmax
+# tile loop; empty / all-invalid rows exercise the zero-output masking.
+# ===========================================================================
+FLASH_H = 8
+
+
+def test_flash_basic():
+    """Flat (Phase A) fp8 cache, H=8, odd query count (5 CTAs)."""
+    sq, topk, skv = 5, 256, 1024
+    scale = 1.0 / math.sqrt(512)
+    q_in, kv_fp8, kv_ref, q_ref, indices = _build_inputs(sq, topk, skv, H=FLASH_H, seed=11)
+    indptr = torch.arange(sq + 1, dtype=torch.int32, device=q_in.device) * topk
+    out = _run_csr(q_in, kv_fp8, indices, indptr, scale, sq, H=FLASH_H)
+    ref = reference_prefill(q_ref, kv_ref, indices.long(), scale, 512)
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[flash_basic H={FLASH_H}] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert out.shape == (sq, FLASH_H, 512)
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
+def test_flash_empty_invalid():
+    """Flat H=8: q0 normal, q1 empty (kv_len=0), q2 all-invalid, q3 normal."""
+    topk, skv = 128, 512
+    scale = 1.0 / math.sqrt(512)
+    q_in, kv_fp8, kv_ref, q_ref, indices = _build_inputs(4, topk, skv, H=FLASH_H, seed=12)
+    idx0 = indices[0]
+    idx3 = indices[3]
+    invalid_blk = torch.full((topk,), -1, dtype=torch.int32, device=q_in.device)
+    flat = torch.cat([idx0, invalid_blk, idx3]).contiguous()
+    # lengths [topk, 0, topk, topk] -> q1 empty, q2 all-invalid
+    indptr = torch.tensor([0, topk, topk, 2 * topk, 3 * topk], dtype=torch.int32, device=q_in.device)
+
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    out = torch.full((4, FLASH_H, 512), 3.0, dtype=torch.bfloat16, device=q_in.device)
+    kv3d = kv_fp8.reshape(skv, 1, 512)
+    flydsl_sparse_mla_prefill(q_in, kv3d, flat, indptr, out)
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert out[1].abs().max().item() == 0.0, "empty query row must be zero"
+    assert out[2].abs().max().item() == 0.0, "all-invalid query row must be zero"
+
+    dense = torch.stack([idx0, idx3]).long()
+    ref = reference_prefill(torch.stack([q_ref[0], q_ref[3]]), kv_ref, dense, scale, 512)
+    got = torch.stack([out[0], out[3]])
+    cos_mean, cos_min, max_abs = _metrics(got, ref)
+    print(f"[flash_empty_invalid H={FLASH_H}] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
+def test_flash_packed_single_region():
+    """Packed DSv4 fp8_ds_mla single-region, H=8, incl. a multi-tile query."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    device = "cuda"
+    block_size = 64
+    scale = PACKED_HEAD_DIM ** -0.5
+    num_tokens = 500
+    kv = _gen_kv(num_tokens, seed=13)
+    cache = _pack_fp8_ds_mla_cache(kv, block_size, is_extra=False)
+    g = torch.Generator(device=device).manual_seed(14)
+    rows = [
+        torch.randint(0, num_tokens, (70,), generator=g, device=device).tolist(),  # 3 tiles
+        [0, 1, 2, 3, 4],
+        torch.randint(0, num_tokens, (33,), generator=g, device=device).tolist(),  # 2 tiles
+    ]
+    sq = len(rows)
+    q = _gen_q(sq, FLASH_H, seed=15)
+    indices, indptr = _ragged_from_rows(rows, device)
+    block_table = _identity_block_table(num_tokens, block_size, device)
+
+    out = torch.empty(sq, FLASH_H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill(
+        q, cache, indices, indptr, out,
+        block_table=block_table, block_size=block_size, packed=True,
+    )
+    ref = _ref_prefill_packed(q, [(cache, rows, False)], scale, None, block_size)
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[flash_packed_single H={FLASH_H}] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert out.shape == (sq, FLASH_H, PACKED_HEAD_DIM)
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
+def test_flash_2region():
+    """Two-region (SWA fnuz + compressed OCP) with attn_sink [8], H=8."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_2region
+
+    device = "cuda"
+    block_size = 64
+    scale = PACKED_HEAD_DIM ** -0.5
+    main_tokens, extra_tokens = 400, 300
+    main_kv = _gen_kv(main_tokens, seed=51)
+    extra_kv = _gen_kv(extra_tokens, seed=52)
+    main_cache = _pack_fp8_ds_mla_cache(main_kv, block_size, is_extra=False)   # fnuz
+    extra_cache = _pack_fp8_ds_mla_cache(extra_kv, block_size, is_extra=True)  # OCP
+    main_rows = [[5, 200, 7, 64], [0, 1, 2, 3, 4]]
+    extra_rows = [[10, 11, 12], [50, 51, 52, 53, 100, 299]]
+    sq = len(main_rows)
+    q = _gen_q(sq, FLASH_H, seed=53)
+    main_indices, main_indptr = _ragged_from_rows(main_rows, device)
+    extra_indices, extra_indptr = _ragged_from_rows(extra_rows, device)
+    main_bt = _identity_block_table(main_tokens, block_size, device)
+    extra_bt = _identity_block_table(extra_tokens, block_size, device)
+    sink = (torch.randn(FLASH_H, dtype=torch.float32, device=device) * 0.4)
+
+    out = torch.empty(sq, FLASH_H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill_2region(
+        q, out,
+        main_cache, main_indices, main_indptr, main_bt,
+        extra_cache, extra_indices, extra_indptr, extra_bt,
+        block_size=block_size, attn_sink=sink,
+    )
+    ref = _ref_prefill_packed(
+        q, [(main_cache, main_rows, False), (extra_cache, extra_rows, True)], scale, sink, block_size
+    )
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[flash_2region H={FLASH_H}] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert out.shape == (sq, FLASH_H, PACKED_HEAD_DIM)
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
+def test_flash_2region_multitile():
+    """Flash H=8 where BOTH regions span multiple tiles (>32 entries each)."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_2region
+
+    device = "cuda"
+    block_size = 64
+    scale = PACKED_HEAD_DIM ** -0.5
+    main_tokens, extra_tokens = 500, 400
+    main_kv = _gen_kv(main_tokens, seed=61)
+    extra_kv = _gen_kv(extra_tokens, seed=62)
+    main_cache = _pack_fp8_ds_mla_cache(main_kv, block_size, is_extra=False)
+    extra_cache = _pack_fp8_ds_mla_cache(extra_kv, block_size, is_extra=True)
+    g = torch.Generator(device=device).manual_seed(63)
+    main_rows = [
+        torch.randint(0, main_tokens, (70,), generator=g, device=device).tolist(),
+        torch.randint(0, main_tokens, (33,), generator=g, device=device).tolist(),
+    ]
+    extra_rows = [
+        torch.randint(0, extra_tokens, (40,), generator=g, device=device).tolist(),
+        torch.randint(0, extra_tokens, (95,), generator=g, device=device).tolist(),
+    ]
+    sq = len(main_rows)
+    q = _gen_q(sq, FLASH_H, seed=64)
+    main_indices, main_indptr = _ragged_from_rows(main_rows, device)
+    extra_indices, extra_indptr = _ragged_from_rows(extra_rows, device)
+    main_bt = _identity_block_table(main_tokens, block_size, device)
+    extra_bt = _identity_block_table(extra_tokens, block_size, device)
+
+    out = torch.empty(sq, FLASH_H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill_2region(
+        q, out,
+        main_cache, main_indices, main_indptr, main_bt,
+        extra_cache, extra_indices, extra_indptr, extra_bt,
+        block_size=block_size,
+    )
+    ref = _ref_prefill_packed(
+        q, [(main_cache, main_rows, False), (extra_cache, extra_rows, True)], scale, None, block_size
+    )
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[flash_2region_multitile H={FLASH_H}] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
+def test_flash_output_oob_canary():
+    """Permanent canary for the flash (H=8) surplus-head output-masking contract.
+
+    Every CTA runs 8 warps x 16 head-columns regardless of ``num_q_heads``; for
+    H=8 only warp 0's columns 0-7 are valid heads.  Columns 8-127 are surplus and
+    MUST be dropped by the num_records-bounded output buffer (kernel sizes
+    ``num_records = o_cta_bytes = H*V_DIM*2 = 8192`` for H=8; see
+    ``kernels/sparse_mla_prefill.py`` lines ~359-377).  If num_records were
+    mistakenly sized for 128 heads, the LAST CTA's surplus store rows (byte
+    offsets in ``[H*V_DIM*2, 128*V_DIM*2)`` above its per-CTA base) would spill
+    PAST the true ``[sq,8,512]`` out region.
+
+    Design: allocate an output buffer LARGER than ``[sq,8,512]``, fill it with a
+    recognizable sentinel, pass the front ``[sq,8,512]`` slice as ``out``, run
+    flash H=8 with sq>=5 (the last CTA carries the highest surplus byte offsets),
+    then assert:
+      (a) the ``[sq,8,512]`` region matches the oracle (cos>0.999) AND was
+          actually written (not left at the sentinel) -- so the test is
+          non-vacuous and cannot pass on a no-op kernel;
+      (b) every element of the sentinel TAIL past ``sq*8*512`` is byte-for-byte
+          untouched (0 dirty elements).
+
+    Coverage note: this catches a last-CTA / tail over-write (num_records sized
+    too large).  It does NOT separately catch per-neighbor-query corruption where
+    an earlier CTA's surplus rows overwrite a LATER query's valid region inside
+    the contiguous out (those addresses stay within ``[0, sq*8*512)``, so the
+    tail check can't see them); the cos>0.999 oracle gate on region (a) is the
+    guard for that failure mode.
+    """
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    device = "cuda"
+    sq, topk, skv = 5, 256, 1024  # sq>=5: last CTA (q=4) has the highest offsets
+    scale = 1.0 / math.sqrt(512)
+    q_in, kv_fp8, kv_ref, q_ref, indices = _build_inputs(sq, topk, skv, H=FLASH_H, seed=17)
+    indptr = torch.arange(sq + 1, dtype=torch.int32, device=device) * topk
+
+    out_elems = sq * FLASH_H * 512
+    # Pad >= a full mis-sized 128-head CTA overspill from the last CTA
+    # ((128-8)*512 elems past the true end); 128*512 gives margin.
+    pad_elems = 128 * 512
+    sentinel = 12345.0
+    big = torch.full((out_elems + pad_elems,), sentinel, dtype=torch.bfloat16, device=device)
+    sentinel_b = big[-1].clone()  # exact bf16-rounded sentinel value
+    out = big[:out_elems].view(sq, FLASH_H, 512)  # contiguous prefix -> shares storage
+
+    kv3d = kv_fp8.reshape(skv, 1, 512)
+    flydsl_sparse_mla_prefill(q_in, kv3d, indices.reshape(-1), indptr, out)
+
+    # (b) sentinel TAIL past the out region must be byte-for-byte untouched.
+    tail = big[out_elems:]
+    dirty = int((tail != sentinel_b).sum().item())
+
+    # (a) the out region was actually written (non-vacuous) and is correct.
+    ref = reference_prefill(q_ref, kv_ref, indices.long(), scale, 512)
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    written = int((out != sentinel_b).sum().item())
+    print(
+        f"[flash_oob_canary H={FLASH_H}] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} "
+        f"max_abs={max_abs:.4f} tail_dirty={dirty}/{tail.numel()} written={written}/{out.numel()}"
+    )
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert written == out.numel(), (
+        f"vacuous: out region not fully written ({written}/{out.numel()} != sentinel)"
+    )
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+    assert dirty == 0, (
+        f"surplus-head over-write regression: {dirty} sentinel tail elements were clobbered"
+    )
+
+
 def _main():
+    # A standalone run that cannot exercise a single real test MUST fail loudly:
+    # returning 0 here would let CI/callers read "no failures" as "passed" when
+    # nothing actually ran.  (The pytest path is unaffected -- it collects the
+    # test_* functions directly and has no skip markers, so real failures still
+    # surface there.)
     if not _HAS_FLYDSL:
-        print("[SKIP] flydsl not importable")
-        return 0
+        print(
+            "NOT RUN (requires the flydsl runtime, which is unavailable) "
+            "-- this is NOT a pass",
+            file=sys.stderr,
+        )
+        return 2
     if not _is_gfx942():
-        print("[SKIP] not a gfx942 device")
-        return 0
+        print(
+            "NOT RUN (requires gfx942) -- this is NOT a pass",
+            file=sys.stderr,
+        )
+        return 2
     # Phase A
     test_basic()
     test_all_invalid()
@@ -1004,6 +1298,14 @@ def _main():
     test_glm576_q_scale()
     test_glm576_two_tile()
     test_glm576_edge_empty_invalid()
+    test_glm576_flash_h8()
+    # DSv4 "flash" head count (num_q_heads=8, TP8) -- pro path above is H=128
+    test_flash_basic()
+    test_flash_empty_invalid()
+    test_flash_packed_single_region()
+    test_flash_2region()
+    test_flash_2region_multitile()
+    test_flash_output_oob_canary()
     print("ALL TESTS PASSED")
     return 0
 
