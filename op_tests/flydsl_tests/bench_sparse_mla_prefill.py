@@ -52,6 +52,8 @@ if os.path.isdir(os.path.join(_AITER_ROOT, "aiter")) and _AITER_ROOT not in sys.
 _flydsl_root = os.path.join(_DEV, "FlyDSL")
 
 from op_tests.flydsl_tests.sparse_mla_prefill_ref import (  # noqa: E402
+    FLAT512_HEAD_DIM,
+    FLAT512_V_DIM,
     GLM_HEAD_DIM,
     GLM_V_DIM,
     H_PROD,
@@ -59,14 +61,18 @@ from op_tests.flydsl_tests.sparse_mla_prefill_ref import (  # noqa: E402
     PACKED_HEAD_DIM,
     ROPE_HEAD_DIM,
     default_scale,
+    default_scale_flat512,
     default_scale_glm,
     gen_kv,
+    gen_kv_flat512,
     gen_kv_glm,
     gen_q,
+    gen_q_flat512,
     gen_q_glm,
     gen_ragged_rows,
     identity_block_table,
     merge_two_region_csrs,
+    pack_flat512_cache,
     pack_fp8_ds_mla_cache,
     pack_glm_fp8_cache,
     ragged_from_rows,
@@ -352,7 +358,11 @@ def build_b2_inputs(
     block_size: int,
     seed: int,
     device: str = "cuda",
+    num_heads: int = H_PROD,
 ) -> BenchInputsB2:
+    # num_heads defaults to H_PROD (DSv4 pro=128) so existing callers are
+    # unchanged; pass num_heads=8 for the DSv4 "flash" head count.  The KV
+    # workload (tokens/topk/CSR/block_size) is identical regardless of H.
     main_kv = gen_kv(main_tokens, seed=seed)
     extra_kv = gen_kv(extra_tokens, seed=seed + 1)
     main_cache = pack_fp8_ds_mla_cache(main_kv, block_size, is_extra=False)
@@ -361,9 +371,9 @@ def build_b2_inputs(
     extra_rows = gen_ragged_rows(T, topk_extra, extra_tokens, seed=seed + 3)
     main_indices, main_indptr = ragged_from_rows(main_rows, torch.device(device))
     extra_indices, extra_indptr = ragged_from_rows(extra_rows, torch.device(device))
-    q = gen_q(T, H_PROD, seed=seed + 4)
-    sink = torch.randn(H_PROD, dtype=torch.float32, device=device) * 0.3
-    out = torch.empty(T, H_PROD, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    q = gen_q(T, num_heads, seed=seed + 4)
+    sink = torch.randn(num_heads, dtype=torch.float32, device=device) * 0.3
+    out = torch.empty(T, num_heads, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
     main_slots = main_cache.shape[0] * main_cache.shape[1]
     merged_indices, merged_indptr = merge_two_region_csrs(main_rows, extra_rows, main_slots)
     return BenchInputsB2(
@@ -835,6 +845,254 @@ def bench_triton_decode_kernel_b2(inp: BenchInputsB2, warmup: int, iters: int) -
     )
 
 
+def _attn_only_ms(r: TimingResult) -> float:
+    """Attention-kernel-only device time (ms/iter) out of an e2e result.
+
+    Picks the softmax-attention kernel out of the per-kernel breakdown by name:
+    the Triton prefill attn kernel short-name contains "prefill"/"attn"; the
+    dequant kernels contain "dequant".  For a fused FlyDSL result the whole
+    kernel *is* the attention op, so its total is returned.
+    """
+    hits = {
+        k: v
+        for k, v in r.stages_ms.items()
+        if ("attn" in k or "prefill" in k) and "dequant" not in k
+    }
+    if hits:
+        return sum(hits.values())
+    return r.total_ms
+
+
+def _b2_cosine(inp: BenchInputsB2) -> float:
+    """FlyDSL 2-region vs Triton dequant+prefill output cosine on identical KV.
+
+    Sanity gate that the FlyDSL config under test (e.g. flash H=8) is not
+    silently broken.  FlyDSL fuses fp8 dequant while Triton dequants to bf16
+    first, so a small divergence is expected; >0.99 means they agree.
+    """
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_2region
+
+    fly_out = torch.empty_like(inp.out)
+    flydsl_sparse_mla_prefill_2region(
+        inp.q, fly_out,
+        inp.main_cache, inp.main_indices, inp.main_indptr, inp.main_bt,
+        inp.extra_cache, inp.extra_indices, inp.extra_indptr, inp.extra_bt,
+        block_size=inp.block_size, attn_sink=inp.sink,
+        main_is_fnuz=_is_gfx942_fnuz(), extra_is_fnuz=False,
+    )
+    main_slots = inp.main_cache.shape[0] * inp.main_cache.shape[1]
+    kv_main = dequant_cache_to_bf16(
+        inp.main_cache, inp.block_size, is_extra=False, slots=inp.main_unique_slots
+    )
+    kv_extra = dequant_cache_to_bf16(
+        inp.extra_cache, inp.block_size, is_extra=True, slots=inp.extra_unique_slots
+    )
+    kv_all = torch.cat([kv_main[:main_slots], kv_extra], dim=0)
+    tri_out = rocm_sparse_attn_prefill_ragged_triton(
+        q=inp.q, kv=kv_all, indices=inp.merged_indices, indptr=inp.merged_indptr,
+        scale=inp.scale, attn_sink=inp.sink,
+        nope_head_dim=NOPE_HEAD_DIM, rope_head_dim=ROPE_HEAD_DIM,
+    )
+    return _cosine(fly_out, tri_out)
+
+
+# ---------------------------------------------------------------------------
+# DSv4 flat512 (512-byte OCP fp8 cache) two-region path — same logical workload
+# as the packed-584 B2 case, but the deployment SM10x flat512 layout.  Reuses
+# the BenchInputsB2 container (q/out are both [T,H,512]; scale is 1/sqrt(512),
+# identical to default_scale()).  Only the cache packing, the FlyDSL entry, and
+# the (production-analogue) dequant differ from the packed path.
+# ---------------------------------------------------------------------------
+def _flat512_effective_bf16(rows: torch.Tensor) -> torch.Tensor:
+    """Dequant flat512 OCP-fp8 rows to the bf16 the gfx942 kernel effectively sees.
+
+    Mirrors the kernel's ``_load_flat_convert`` (see sparse_mla_prefill_ref.
+    _flat512_row_lds): decode the OCP E4M3 bytes *as fnuz* (gfx942 MFMA is
+    fnuz-only), ×2 for the OCP->fnuz bias, flush the OCP -0.0/NaN byte to 0, then
+    re-encode fnuz.  Producing the kernel-effective KV (not a naive OCP cast) is
+    what lets the Triton bf16 baseline agree with the fused FlyDSL kernel; it is
+    strictly *more* elementwise work than a plain cast, so it never flatters the
+    dequant cost in FlyDSL's favour.
+    """
+    u8 = rows if rows.dtype == torch.uint8 else rows.view(torch.uint8)
+    fnuz_dec = u8.view(torch.float8_e4m3fnuz).to(torch.float32) * 2.0
+    fnuz_dec = torch.where(torch.isnan(fnuz_dec), torch.zeros_like(fnuz_dec), fnuz_dec)
+    return fnuz_dec.to(torch.float8_e4m3fnuz).to(torch.bfloat16)
+
+
+def dequant_flat512_to_bf16(
+    cache: torch.Tensor,
+    *,
+    slots: torch.Tensor | None = None,
+    timer: StageTimer | None = None,
+    stage: str = "dequant",
+) -> torch.Tensor:
+    """Dequant a flat512 OCP-fp8 cache to bf16 [num_slots, 512].
+
+    If ``slots`` is given, only the referenced (unique) physical slots are
+    dequantized — the flat512 analogue of the packed path's CSR-slot dequant.
+    """
+    nb, bs, d = cache.shape
+    assert d == FLAT512_HEAD_DIM
+    num_slots = nb * bs
+    flat = cache.reshape(num_slots, d)
+    out = torch.zeros(num_slots, d, dtype=torch.bfloat16, device=cache.device)
+    if timer is not None:
+        timer.begin(stage)
+    if slots is not None:
+        sl = slots.to(device=cache.device, dtype=torch.long).unique()
+        if sl.numel() > 0:
+            out.index_copy_(0, sl, _flat512_effective_bf16(flat.index_select(0, sl)))
+    else:
+        out.copy_(_flat512_effective_bf16(flat))
+    if timer is not None:
+        timer.end()
+    return out
+
+
+def build_b2_inputs_flat512(
+    T: int,
+    topk_main: int,
+    topk_extra: int,
+    main_tokens: int,
+    extra_tokens: int,
+    block_size: int,
+    seed: int,
+    device: str = "cuda",
+    num_heads: int = H_PROD,
+) -> BenchInputsB2:
+    """Same logical B2 workload as build_b2_inputs, but flat512 OCP-fp8 caches."""
+    main_kv = gen_kv_flat512(main_tokens, seed=seed)
+    extra_kv = gen_kv_flat512(extra_tokens, seed=seed + 1)
+    main_cache = pack_flat512_cache(main_kv, block_size)
+    extra_cache = pack_flat512_cache(extra_kv, block_size)
+    main_rows = gen_ragged_rows(T, topk_main, main_tokens, seed=seed + 2)
+    extra_rows = gen_ragged_rows(T, topk_extra, extra_tokens, seed=seed + 3)
+    main_indices, main_indptr = ragged_from_rows(main_rows, torch.device(device))
+    extra_indices, extra_indptr = ragged_from_rows(extra_rows, torch.device(device))
+    q = gen_q_flat512(T, num_heads, seed=seed + 4)
+    sink = torch.randn(num_heads, dtype=torch.float32, device=device) * 0.3
+    out = torch.empty(T, num_heads, FLAT512_V_DIM, dtype=torch.bfloat16, device=device)
+    main_slots = main_cache.shape[0] * main_cache.shape[1]
+    merged_indices, merged_indptr = merge_two_region_csrs(main_rows, extra_rows, main_slots)
+    return BenchInputsB2(
+        q=q,
+        main_cache=main_cache,
+        main_indices=main_indices,
+        main_indptr=main_indptr,
+        main_bt=identity_block_table(main_tokens, block_size, torch.device(device)),
+        extra_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_indptr=extra_indptr,
+        extra_bt=identity_block_table(extra_tokens, block_size, torch.device(device)),
+        block_size=block_size,
+        sink=sink,
+        scale=default_scale_flat512(),
+        out=out,
+        main_rows=main_rows,
+        extra_rows=extra_rows,
+        merged_indices=merged_indices,
+        merged_indptr=merged_indptr,
+        main_unique_slots=main_indices.unique(),
+        extra_unique_slots=extra_indices.unique(),
+    )
+
+
+def bench_flydsl_flat512_b2(inp: BenchInputsB2, warmup: int, iters: int) -> TimingResult:
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_flat512_2region
+
+    def run_once():
+        timer = StageTimer()
+        timer.begin("flydsl_kernel")
+        flydsl_sparse_mla_prefill_flat512_2region(
+            inp.q,
+            inp.out,
+            inp.main_cache,
+            inp.main_indices,
+            inp.main_indptr,
+            inp.main_bt,
+            inp.extra_cache,
+            inp.extra_indices,
+            inp.extra_indptr,
+            inp.extra_bt,
+            block_size=inp.block_size,
+            attn_sink=inp.sink,
+            validate_regions=False,
+        )
+        return timer.finish()
+
+    run_once()
+    med, stages = _median_ms(run_once, warmup, iters)
+    return TimingResult("flydsl_flat512_b2_e2e", med, stages, notes="native flat512 2-region OCP fp8, fused")
+
+
+def bench_triton_prefill_e2e_flat512(
+    inp: BenchInputsB2, warmup: int, iters: int, *, csr_dequant: bool
+) -> TimingResult:
+    """Production-like flat512 baseline: dequant both flat512 caches -> merged CSR bf16 prefill."""
+    main_slots = inp.main_cache.shape[0] * inp.main_cache.shape[1]
+    main_slots_arg = inp.main_unique_slots if csr_dequant else None
+    extra_slots_arg = inp.extra_unique_slots if csr_dequant else None
+
+    def run_once():
+        timer = StageTimer()
+        kv_main = dequant_flat512_to_bf16(
+            inp.main_cache, slots=main_slots_arg, timer=timer, stage="dequant"
+        )
+        kv_extra = dequant_flat512_to_bf16(
+            inp.extra_cache, slots=extra_slots_arg, timer=timer, stage="dequant_extra"
+        )
+        kv_all = torch.cat([kv_main[:main_slots], kv_extra], dim=0)
+        timer.begin("triton_prefill")
+        rocm_sparse_attn_prefill_ragged_triton(
+            q=inp.q,
+            kv=kv_all,
+            indices=inp.merged_indices,
+            indptr=inp.merged_indptr,
+            scale=inp.scale,
+            attn_sink=inp.sink,
+            nope_head_dim=NOPE_HEAD_DIM,
+            rope_head_dim=ROPE_HEAD_DIM,
+        )
+        return timer.finish()
+
+    run_once()
+    med, stages = _median_ms(run_once, warmup, iters)
+    return TimingResult(
+        "triton_prefill_e2e_flat512",
+        med,
+        stages,
+        notes=(
+            "flat512 CSR-slot dequant×2 + bf16 prefill; CSR merge pre-built (not timed)"
+            if csr_dequant
+            else "flat512 full-cache dequant×2 + bf16 prefill (pessimistic)"
+        ),
+    )
+
+
+def _flat512_b2_cosine(inp: BenchInputsB2) -> float:
+    """FlyDSL flat512 2-region vs Triton dequant+prefill output cosine on identical KV."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_flat512_2region
+
+    fly_out = torch.empty_like(inp.out)
+    flydsl_sparse_mla_prefill_flat512_2region(
+        inp.q, fly_out,
+        inp.main_cache, inp.main_indices, inp.main_indptr, inp.main_bt,
+        inp.extra_cache, inp.extra_indices, inp.extra_indptr, inp.extra_bt,
+        block_size=inp.block_size, attn_sink=inp.sink, validate_regions=False,
+    )
+    main_slots = inp.main_cache.shape[0] * inp.main_cache.shape[1]
+    kv_main = dequant_flat512_to_bf16(inp.main_cache, slots=inp.main_unique_slots)
+    kv_extra = dequant_flat512_to_bf16(inp.extra_cache, slots=inp.extra_unique_slots)
+    kv_all = torch.cat([kv_main[:main_slots], kv_extra], dim=0)
+    tri_out = rocm_sparse_attn_prefill_ragged_triton(
+        q=inp.q, kv=kv_all, indices=inp.merged_indices, indptr=inp.merged_indptr,
+        scale=inp.scale, attn_sink=inp.sink,
+        nope_head_dim=NOPE_HEAD_DIM, rope_head_dim=ROPE_HEAD_DIM,
+    )
+    return _cosine(fly_out, tri_out)
+
+
 def _print_result(r: TimingResult, baseline_ms: float | None) -> None:
     # stages are per-kernel device times (descending); keep that order, not sorted by name.
     stage_str = ", ".join(f"{k}={v:.3f}ms" for k, v in r.stages_ms.items())
@@ -852,16 +1110,17 @@ def run_bench(args: argparse.Namespace, T: int) -> None:
     topk_main = args.topk_main
     topk_extra = args.topk_extra
     csr_dequant = not args.full_cache_dequant
+    num_heads = args.num_heads
 
     print(
-        f"sparse_mla_prefill bench  gfx942  T={T}  block_size={args.block_size}  "
+        f"sparse_mla_prefill bench  gfx942  T={T}  H={num_heads}  block_size={args.block_size}  "
         f"warmup={args.warmup} iters={args.iters}  metric=gpu_kernel_ms (device self-time)  "
         f"triton_dequant={'csr_slots' if csr_dequant else 'full_cache'}"
     )
     print()
 
     print(
-        f"=== B2 two-region (topk_main={topk_main}, topk_extra={topk_extra}, "
+        f"=== B2 two-region (H={num_heads}, topk_main={topk_main}, topk_extra={topk_extra}, "
         f"main_tokens={args.main_tokens}, extra_tokens={args.extra_tokens}) ==="
     )
     b2 = build_b2_inputs(
@@ -872,7 +1131,15 @@ def run_bench(args: argparse.Namespace, T: int) -> None:
         args.extra_tokens,
         args.block_size,
         args.seed + 100,
+        num_heads=num_heads,
     )
+    if not args.skip_correctness:
+        try:
+            cos = _b2_cosine(b2)
+            tag = "WARNING: diverges" if cos < 0.99 else "ok"
+            print(f"correctness  flydsl_b2 vs triton_prefill cosine={cos:.4f}  [{tag}]")
+        except Exception as exc:
+            print(f"correctness  check skipped: {exc}")
     fly_b2 = bench_flydsl_b2(b2, args.warmup, args.iters)
     _print_result(fly_b2, None)
     if not args.skip_triton:
@@ -880,11 +1147,115 @@ def run_bench(args: argparse.Namespace, T: int) -> None:
         _print_result(triton_e2e_b2, fly_b2.total_ms)
         triton_dec = bench_triton_decode_kernel_b2(b2, args.warmup, args.iters)
         _print_result(triton_dec, fly_b2.total_ms)
+        fly_attn = _attn_only_ms(fly_b2)
+        tri_attn = _attn_only_ms(triton_e2e_b2)
+        e2e_ratio = triton_e2e_b2.total_ms / fly_b2.total_ms if fly_b2.total_ms else 0.0
+        attn_ratio = tri_attn / fly_attn if fly_attn else 0.0
+        print()
+        print(
+            f"SUMMARY H={num_heads} T={T}: "
+            f"flydsl_e2e={fly_b2.total_ms:.3f}ms  triton_e2e={triton_e2e_b2.total_ms:.3f}ms  "
+            f"e2e_ratio={e2e_ratio:.2f}x || "
+            f"flydsl_attn={fly_attn:.3f}ms  triton_attn={tri_attn:.3f}ms  "
+            f"attn_ratio={attn_ratio:.2f}x  (ratio = triton/flydsl, >1 => flydsl faster)"
+        )
     print()
     print("All times are summed GPU kernel device self-time per iter (host overhead ignored).")
     print("Compare triton_prefill_e2e_* against flydsl_*_e2e for fair E2E; the per-kernel")
     print("breakdown shows where device time goes. triton_decode_kernel_* is a decode")
     print("subgraph reference only (not the prefill path this kernel replaces).")
+    print()
+
+
+def _median_spread(xs: list[float]) -> tuple[float, float, float]:
+    import statistics
+
+    return statistics.median(xs), min(xs), max(xs)
+
+
+def run_bench_flat512(args: argparse.Namespace, T: int) -> None:
+    """DSv4 flat512 (512B OCP fp8) two-region: fused FlyDSL vs Triton dequant+prefill.
+
+    Mirrors run_bench's B2 comparison exactly (same e2e vs attn-only split) but on
+    the deployment flat512 cache layout.  Repeats the profiled measurement
+    ``args.repeats`` times and reports median + [min, max] of the summed device
+    self-time per iter, so the timing carries a spread (each repeat is itself a
+    warmup>=5 / iters>=50 profiled window).
+    """
+    topk_main = args.topk_main
+    topk_extra = args.topk_extra
+    csr_dequant = not args.full_cache_dequant
+    num_heads = args.num_heads
+
+    print(
+        f"sparse_mla_prefill bench  gfx942  layout=flat512  T={T}  H={num_heads}  "
+        f"block_size={args.block_size}  warmup={args.warmup} iters={args.iters} "
+        f"repeats={args.repeats}  metric=gpu_kernel_ms (device self-time)  "
+        f"triton_dequant={'csr_slots' if csr_dequant else 'full_cache'}"
+    )
+    print()
+    print(
+        f"=== flat512 two-region (H={num_heads}, topk_main={topk_main}, topk_extra={topk_extra}, "
+        f"main_tokens={args.main_tokens}, extra_tokens={args.extra_tokens}) ==="
+    )
+    b2 = build_b2_inputs_flat512(
+        T, topk_main, topk_extra, args.main_tokens, args.extra_tokens,
+        args.block_size, args.seed + 100, num_heads=num_heads,
+    )
+    if not args.skip_correctness:
+        try:
+            cos = _flat512_b2_cosine(b2)
+            tag = "WARNING: diverges" if cos < 0.999 else "ok"
+            print(f"correctness  flydsl_flat512 vs triton_prefill cosine={cos:.5f}  [{tag}]")
+        except Exception as exc:
+            print(f"correctness  check skipped: {exc}")
+
+    fly_e2e: list[float] = []
+    fly_attn: list[float] = []
+    tri_e2e: list[float] = []
+    tri_attn: list[float] = []
+    last_fly: TimingResult | None = None
+    last_tri: TimingResult | None = None
+    for _ in range(max(1, args.repeats)):
+        rf = bench_flydsl_flat512_b2(b2, args.warmup, args.iters)
+        fly_e2e.append(rf.total_ms)
+        fly_attn.append(_attn_only_ms(rf))
+        last_fly = rf
+        if not args.skip_triton:
+            rt = bench_triton_prefill_e2e_flat512(b2, args.warmup, args.iters, csr_dequant=csr_dequant)
+            tri_e2e.append(rt.total_ms)
+            tri_attn.append(_attn_only_ms(rt))
+            last_tri = rt
+
+    if last_fly is not None:
+        _print_result(last_fly, None)
+    if last_tri is not None:
+        _print_result(last_tri, fly_e2e[-1])
+
+    fe_med, fe_lo, fe_hi = _median_spread(fly_e2e)
+    fa_med, fa_lo, fa_hi = _median_spread(fly_attn)
+    print()
+    if not args.skip_triton and tri_e2e:
+        te_med, te_lo, te_hi = _median_spread(tri_e2e)
+        ta_med, ta_lo, ta_hi = _median_spread(tri_attn)
+        e2e_ratio = te_med / fe_med if fe_med else 0.0
+        attn_ratio = ta_med / fa_med if fa_med else 0.0
+        print(
+            f"SUMMARY flat512 H={num_heads} T={T}: "
+            f"flydsl_e2e={fe_med:.3f}ms[{fe_lo:.3f},{fe_hi:.3f}]  "
+            f"triton_e2e={te_med:.3f}ms[{te_lo:.3f},{te_hi:.3f}]  e2e_ratio={e2e_ratio:.2f}x || "
+            f"flydsl_attn={fa_med:.3f}ms[{fa_lo:.3f},{fa_hi:.3f}]  "
+            f"triton_attn={ta_med:.3f}ms[{ta_lo:.3f},{ta_hi:.3f}]  attn_ratio={attn_ratio:.2f}x  "
+            f"(ratio = triton/flydsl, >1 => flydsl faster)"
+        )
+    else:
+        print(
+            f"SUMMARY flat512 H={num_heads} T={T}: "
+            f"flydsl_e2e={fe_med:.3f}ms[{fe_lo:.3f},{fe_hi:.3f}]  "
+            f"flydsl_attn={fa_med:.3f}ms[{fa_lo:.3f},{fa_hi:.3f}]  (triton skipped)"
+        )
+    print()
+    print("All times are summed GPU kernel device self-time per iter (host overhead ignored).")
     print()
 
 
@@ -1019,6 +1390,31 @@ def main() -> None:
         default=DSV4_TOPK_EXTRA,
         help="B2 extra-region CSR length per query (DSv4 default: 128)",
     )
+    parser.add_argument(
+        "--num-heads",
+        type=int,
+        default=H_PROD,
+        help="Query head count for the B2 (dsv4) run. DSv4 pro=128 (default), flash=8.",
+    )
+    parser.add_argument(
+        "--layout",
+        choices=("packed", "flat512"),
+        default="packed",
+        help="dsv4 B2 cache layout: packed (584B fp8_ds_mla, default) or "
+        "flat512 (512B OCP fp8, SM10x deployment layout).",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="flat512 layout: number of profiled measurement windows to report "
+        "median+spread over (each is a full warmup/iters window).",
+    )
+    parser.add_argument(
+        "--skip-correctness",
+        action="store_true",
+        help="Skip the flydsl-vs-triton cosine sanity check before timing (B2 only).",
+    )
     parser.add_argument("--num-tokens", type=int, default=65536, help="glm/dsv32 cache slots")
     parser.add_argument("--main-tokens", type=int, default=65536, help="B2 SWA cache slots")
     parser.add_argument("--extra-tokens", type=int, default=32768, help="B2 compressed cache slots")
@@ -1041,7 +1437,12 @@ def main() -> None:
         args.topk = GLM_TOPK
     elif not is_glm:
         parser.error("--topk is only used with --preset glm/dsv32; use --topk-main/--topk-extra")
-    bench_fn = run_bench_glm if is_glm else run_bench
+    if is_glm:
+        bench_fn = run_bench_glm
+    elif args.layout == "flat512":
+        bench_fn = run_bench_flat512
+    else:
+        bench_fn = run_bench
 
     if args.T_sweep is not None:
         Ts = _parse_T_sweep(args.T_sweep if args.T_sweep else None)
