@@ -1,5 +1,7 @@
 # CK GEMM MoE 2-Stages Codegen or asm 1-stage Tune
 
+For agent-assisted MoE tuning support, obtain `MOE_TUNING_AGENT_GUIDE.md` from the AITER tuning support branch and place it in your aiter checkout (see **How to use this guide** in that file).
+
 1. Install aiter:
 `cd $aiter_path`
 `python3 setup.py develop`
@@ -140,7 +142,7 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 - **Default**: `False`
 - **Description**: Run pre-tune and post-tune production benchmark, print compare results, and keep a compare candidate CSV.
   - Pre-tune reads shapes from `-i/--untune_file`.
-  - Post-tune uses configs written to `<tune_file>.candidate.csv` during the compare run.
+  - Post-tune uses configs written to a `*.candidate.csv` under `/tmp/aiter_compare/` during the compare run (exact path printed at runtime).
   - The final tuned CSV is only updated when `--update_improved` is also set.
   - Shapes with no valid pre-run baseline can still update when the post-tune benchmark passes.
 

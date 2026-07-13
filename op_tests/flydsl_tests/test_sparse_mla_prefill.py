@@ -1259,6 +1259,267 @@ def test_flash_output_oob_canary():
     )
 
 
+# ===========================================================================
+# DSv4 512-flat (vLLM FlashInfer SM10x): flat OCP E4M3 fp8 cache, head_dim=512
+# (RoPE folded in), single shared per-tensor scale, one or two regions, V=512.
+# Oracle helpers live in sparse_mla_prefill_ref.py (shared with the bench).
+# ===========================================================================
+from op_tests.flydsl_tests.sparse_mla_prefill_ref import (  # noqa: E402
+    FLAT512_HEAD_DIM,
+    FLAT512_V_DIM,
+    default_scale_flat512,
+    gen_kv_flat512,
+    gen_q_flat512,
+    pack_flat512_cache,
+    ref_prefill_flat512,
+)
+
+
+def test_flat512_single_basic():
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_flat512
+
+    device = "cuda"
+    block_size = 64
+    H = 128
+    scale = default_scale_flat512()
+    num_tokens = 600
+    kv = gen_kv_flat512(num_tokens, seed=71)
+    cache = pack_flat512_cache(kv, block_size)  # kv_scale=1.0, OCP
+    rows = [[5, 200, 7, 400, 63, 64, 599, 128], [0, 1, 2, 3], [300, 301, 302, 303, 304]]
+    sq = len(rows)
+    q = gen_q_flat512(sq, H, seed=72)
+    indices, indptr = _ragged_from_rows(rows, device)
+    block_table = _identity_block_table(num_tokens, block_size, device)
+
+    out = torch.empty(sq, H, FLAT512_V_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill_flat512(
+        q, cache, indices, indptr, out, block_table=block_table, block_size=block_size,
+    )
+    ref = ref_prefill_flat512(q, [(cache, rows)], scale, block_size)
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[flat512_single_basic] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert out.shape[-1] == FLAT512_V_DIM
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
+def test_flat512_single_per_tensor_scale():
+    """Non-unity per-tensor kv_scale + q_scale folded into QK scale + output."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_flat512
+
+    device = "cuda"
+    block_size = 32
+    H = 128
+    scale = default_scale_flat512()
+    kv_scale = 2.0
+    q_scale = 1.5
+    num_tokens = 300
+    kv = gen_kv_flat512(num_tokens, seed=81, scale=0.25)
+    cache = pack_flat512_cache(kv, block_size, kv_scale=kv_scale)
+    rows = [[5, 200, 7, 64, 63, 31, 32, 33], [10, 11, 12, 13, 14, 15, 16]]
+    sq = len(rows)
+    q = gen_q_flat512(sq, H, seed=82, scale=0.25)
+    indices, indptr = _ragged_from_rows(rows, device)
+    block_table = _identity_block_table(num_tokens, block_size, device)
+
+    out = torch.empty(sq, H, FLAT512_V_DIM, dtype=torch.bfloat16, device=device)
+    q_scale_t = torch.tensor([q_scale], dtype=torch.float32, device=device)
+    kv_scale_t = torch.tensor([kv_scale], dtype=torch.float32, device=device)
+    flydsl_sparse_mla_prefill_flat512(
+        q, cache, indices, indptr, out, block_table=block_table, block_size=block_size,
+        q_scale=q_scale_t, kv_scale=kv_scale_t,
+    )
+    ref = ref_prefill_flat512(q, [(cache, rows)], scale, block_size, q_scale=q_scale, kv_scale=kv_scale)
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[flat512_pertensor] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
+def test_flat512_two_tile():
+    """Exactly two tiles per query (BLOCK_N=32 -> 33..64 entries)."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_flat512
+
+    device = "cuda"
+    block_size = 64
+    H = 128
+    scale = default_scale_flat512()
+    num_tokens = 700
+    kv = gen_kv_flat512(num_tokens, seed=171)
+    cache = pack_flat512_cache(kv, block_size)
+    g = torch.Generator(device=device).manual_seed(172)
+    rows = [
+        torch.randint(0, num_tokens, (33,), generator=g, device=device).tolist(),
+        torch.randint(0, num_tokens, (64,), generator=g, device=device).tolist(),
+        torch.randint(0, num_tokens, (40,), generator=g, device=device).tolist(),
+    ]
+    sq = len(rows)
+    q = gen_q_flat512(sq, H, seed=173)
+    indices, indptr = _ragged_from_rows(rows, device)
+    block_table = _identity_block_table(num_tokens, block_size, device)
+
+    out = torch.empty(sq, H, FLAT512_V_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill_flat512(
+        q, cache, indices, indptr, out, block_table=block_table, block_size=block_size,
+    )
+    ref = ref_prefill_flat512(q, [(cache, rows)], scale, block_size)
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[flat512_two_tile] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
+def test_flat512_edge_empty_invalid():
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_flat512
+
+    device = "cuda"
+    block_size = 64
+    H = 128
+    scale = default_scale_flat512()
+    num_tokens = 200
+    kv = gen_kv_flat512(num_tokens, seed=91)
+    cache = pack_flat512_cache(kv, block_size)
+    rows_full = [[5, 7, 9, 64, 65], [], [-1, -1, -1], [10, -1, 11, 199, 5000]]
+    sq = len(rows_full)
+    q = gen_q_flat512(sq, H, seed=92)
+    indices, indptr = _ragged_from_rows(rows_full, device)
+    block_table = _identity_block_table(num_tokens, block_size, device)
+
+    out = torch.full((sq, H, FLAT512_V_DIM), 7.0, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill_flat512(
+        q, cache, indices, indptr, out, block_table=block_table, block_size=block_size,
+    )
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert out[1].abs().max().item() == 0.0, "empty query must be zero"
+    assert out[2].abs().max().item() == 0.0, "all-invalid query must be zero"
+    rows_valid = [[s for s in r if 0 <= s < num_tokens] for r in rows_full]
+    ref = ref_prefill_flat512(q, [(cache, rows_valid)], scale, block_size)
+    cos_mean, cos_min, max_abs = _metrics(out[[0, 3]], ref[[0, 3]])
+    print(f"[flat512_edge] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
+def test_flat512_2region():
+    """Two-region (SWA + compressed), both OCP flat512 with shared per-tensor scale."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_flat512_2region
+
+    device = "cuda"
+    block_size = 64
+    scale = default_scale_flat512()
+    main_tokens, extra_tokens = 400, 300
+    main_kv = gen_kv_flat512(main_tokens, seed=51)
+    extra_kv = gen_kv_flat512(extra_tokens, seed=52)
+    main_cache = pack_flat512_cache(main_kv, block_size)
+    extra_cache = pack_flat512_cache(extra_kv, block_size)
+    main_rows = [[5, 200, 7, 64], [0, 1, 2, 3, 4]]
+    extra_rows = [[10, 11, 12], [50, 51, 52, 53, 100, 299]]
+    sq = len(main_rows)
+    H = 128
+    q = gen_q_flat512(sq, H, seed=53)
+    main_indices, main_indptr = _ragged_from_rows(main_rows, device)
+    extra_indices, extra_indptr = _ragged_from_rows(extra_rows, device)
+    main_bt = _identity_block_table(main_tokens, block_size, device)
+    extra_bt = _identity_block_table(extra_tokens, block_size, device)
+
+    out = torch.empty(sq, H, FLAT512_V_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill_flat512_2region(
+        q, out,
+        main_cache, main_indices, main_indptr, main_bt,
+        extra_cache, extra_indices, extra_indptr, extra_bt,
+        block_size=block_size,
+    )
+    ref = ref_prefill_flat512(
+        q, [(main_cache, main_rows), (extra_cache, extra_rows)], scale, block_size
+    )
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[flat512_2region] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
+def test_flat512_2region_multitile():
+    """Two-region flat512 where BOTH regions span multiple tiles (>32 entries)."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_flat512_2region
+
+    device = "cuda"
+    block_size = 64
+    scale = default_scale_flat512()
+    main_tokens, extra_tokens = 500, 400
+    main_kv = gen_kv_flat512(main_tokens, seed=61)
+    extra_kv = gen_kv_flat512(extra_tokens, seed=62)
+    main_cache = pack_flat512_cache(main_kv, block_size)
+    extra_cache = pack_flat512_cache(extra_kv, block_size)
+    g = torch.Generator(device=device).manual_seed(63)
+    main_rows = [
+        torch.randint(0, main_tokens, (70,), generator=g, device=device).tolist(),
+        torch.randint(0, main_tokens, (33,), generator=g, device=device).tolist(),
+    ]
+    extra_rows = [
+        torch.randint(0, extra_tokens, (40,), generator=g, device=device).tolist(),
+        torch.randint(0, extra_tokens, (95,), generator=g, device=device).tolist(),
+    ]
+    sq = len(main_rows)
+    H = 128
+    q = gen_q_flat512(sq, H, seed=64)
+    main_indices, main_indptr = _ragged_from_rows(main_rows, device)
+    extra_indices, extra_indptr = _ragged_from_rows(extra_rows, device)
+    main_bt = _identity_block_table(main_tokens, block_size, device)
+    extra_bt = _identity_block_table(extra_tokens, block_size, device)
+
+    out = torch.empty(sq, H, FLAT512_V_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill_flat512_2region(
+        q, out,
+        main_cache, main_indices, main_indptr, main_bt,
+        extra_cache, extra_indices, extra_indptr, extra_bt,
+        block_size=block_size,
+    )
+    ref = ref_prefill_flat512(
+        q, [(main_cache, main_rows), (extra_cache, extra_rows)], scale, block_size
+    )
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[flat512_2region_multitile] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
+def test_flat512_flash_h8():
+    """DSv4 512-flat at the flash head count (num_q_heads=8, TP8), two-region."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_flat512_2region
+
+    device = "cuda"
+    block_size = 64
+    scale = default_scale_flat512()
+    main_tokens, extra_tokens = 400, 300
+    main_kv = gen_kv_flat512(main_tokens, seed=51)
+    extra_kv = gen_kv_flat512(extra_tokens, seed=52)
+    main_cache = pack_flat512_cache(main_kv, block_size)
+    extra_cache = pack_flat512_cache(extra_kv, block_size)
+    main_rows = [[5, 200, 7, 64], [0, 1, 2, 3, 4]]
+    extra_rows = [[10, 11, 12], [50, 51, 52, 53, 100, 299]]
+    sq = len(main_rows)
+    q = gen_q_flat512(sq, FLASH_H, seed=53)
+    main_indices, main_indptr = _ragged_from_rows(main_rows, device)
+    extra_indices, extra_indptr = _ragged_from_rows(extra_rows, device)
+    main_bt = _identity_block_table(main_tokens, block_size, device)
+    extra_bt = _identity_block_table(extra_tokens, block_size, device)
+
+    out = torch.empty(sq, FLASH_H, FLAT512_V_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill_flat512_2region(
+        q, out,
+        main_cache, main_indices, main_indptr, main_bt,
+        extra_cache, extra_indices, extra_indptr, extra_bt,
+        block_size=block_size,
+    )
+    ref = ref_prefill_flat512(
+        q, [(main_cache, main_rows), (extra_cache, extra_rows)], scale, block_size
+    )
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(f"[flat512_flash_h8] cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}")
+    assert out.shape == (sq, FLASH_H, FLAT512_V_DIM)
+    assert not torch.isnan(out).any(), "NaN in output"
+    assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
+
+
 def _main():
     # A standalone run that cannot exercise a single real test MUST fail loudly:
     # returning 0 here would let CI/callers read "no failures" as "passed" when
@@ -1306,6 +1567,14 @@ def _main():
     test_flash_2region()
     test_flash_2region_multitile()
     test_flash_output_oob_canary()
+    # DSv4 512-flat (vLLM FlashInfer SM10x): flat OCP fp8, per-tensor scale
+    test_flat512_single_basic()
+    test_flat512_single_per_tensor_scale()
+    test_flat512_two_tile()
+    test_flat512_edge_empty_invalid()
+    test_flat512_2region()
+    test_flat512_2region_multitile()
+    test_flat512_flash_h8()
     print("ALL TESTS PASSED")
     return 0
 

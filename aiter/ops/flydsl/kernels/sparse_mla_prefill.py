@@ -977,17 +977,49 @@ def compile_sparse_mla_prefill_paged(
     ROPE_BF16 = bool(rope_bf16)
 
     # ---- head-dim-dependent constants (shadow the module 512 defaults) ----
+    # ``GLM_FLAT`` (glm_flat576) and ``FLAT512`` (DSv4 512-flat FlashInfer layout)
+    # are both *flat* fp8 rows (no 8B UE8M0 scale region, no 128B bf16 RoPE tail:
+    # the whole ``head_dim`` is fp8 and RoPE is folded in).  ``FLAT`` gates the
+    # shared flat load / row-stride machinery; the two differ only in head_dim
+    # (576 vs 512), region count (GLM single-region only), and fp8 flavour
+    # (glm_flat576 is native fnuz -> DMA; flat512 is OCP e4m3fn -> convert load).
     GLM_FLAT = cache_layout == "glm_flat576"
+    FLAT512 = cache_layout == "flat512"
+    FLAT = GLM_FLAT or FLAT512
     USE_PT_SCALE = scale_mode == "per_tensor"
-    if cache_layout not in ("fp8_ds_mla", "glm_flat576"):
+    # Phase 2 lever: load the flat512 OCP rows via buffer_load_to_lds DMA + a
+    # cheap integer 0x80(-0.0)->0 flush, instead of the register-staged convert
+    # (decode->x2->flush->re-encode).  DMA reads the OCP bytes as fnuz (= 0.5x
+    # the OCP value); the OCP->fnuz x2 is folded once into the per-tensor kv
+    # scale (FLAT_OCP_SCALE below), keeping both pools in the same 0.5x domain.
+    # Toggle to False to fall back to the validated Phase-1 convert path.
+    FLAT512_DMA = True
+    # Phase 2 round 2: route the flat512 DMA path through the DSv4 double-buffered
+    # prefetch pipeline (region0/SWA gather of tile n+1 overlaps tile n compute),
+    # flushing each prefetched OCP tile's 0x80 bytes at the consuming iteration.
+    FLAT_DMA_PIPE = FLAT512 and FLAT512_DMA
+    if cache_layout not in ("fp8_ds_mla", "glm_flat576", "flat512"):
         raise NotImplementedError(f"unknown cache_layout {cache_layout!r}")
     if GLM_FLAT and NREG != 1:
         raise NotImplementedError("glm_flat576 is single-region only")
-    if GLM_FLAT and not USE_PT_SCALE:
-        raise NotImplementedError("glm_flat576 requires scale_mode='per_tensor'")
-    # bf16 RoPE split-dot is DSv4-only (448 fp8 NoPE + 64 bf16 RoPE). GLM stores
-    # the whole 576 row as fp8, so its rope is genuinely fp8 (no bf16 tail).
-    if ROPE_BF16 and (GLM_FLAT or int(head_dim) != 512):
+    if FLAT and not USE_PT_SCALE:
+        raise NotImplementedError(f"{cache_layout} requires scale_mode='per_tensor'")
+    if FLAT512 and int(head_dim) != 512:
+        raise NotImplementedError("flat512 requires head_dim=512")
+    if FLAT512 and NREG not in (1, 2):
+        raise NotImplementedError("flat512 supports num_regions in {1, 2}")
+    # flat512 matches the vLLM FlashInfer SM10x DSv4 512-flat contract: both the
+    # SWA (region0) and compressed (region1) pools are OCP E4M3 (float8_e4m3fn)
+    # with a single shared per-tensor scale.  gfx942 MFMA is fnuz-only, so OCP
+    # rows go through the convert load (decode-as-fnuz, x2 OCP bias, NaN flush,
+    # re-encode fnuz).  A native-fnuz flat512 (DMA fast path) is not a real
+    # deployment target and is gated off here for Phase 1.
+    if FLAT512 and (not r0_is_ocp or (NREG == 2 and not r1_is_ocp)):
+        raise NotImplementedError("flat512 requires OCP (float8_e4m3fn) pools")
+    # bf16 RoPE split-dot is DSv4-only (448 fp8 NoPE + 64 bf16 RoPE). Flat rows
+    # store the whole head_dim as fp8, so their rope is genuinely fp8 (no bf16
+    # tail); reject rope_bf16 for any flat layout.
+    if ROPE_BF16 and (FLAT or int(head_dim) != 512):
         raise NotImplementedError(
             "rope_bf16 requires the DSv4 fp8_ds_mla layout (head_dim=512, 448 NoPE + 64 RoPE)"
         )
@@ -1063,8 +1095,8 @@ def compile_sparse_mla_prefill_paged(
     # Flat (GLM) rows have no scale region and store rope as fp8, so the row
     # stride equals head_dim bytes; DSv4 packed rows are 584 B with a 576 B
     # data sub-region.
-    PK_TOKEN_BYTES = QK_HEAD_DIM if GLM_FLAT else 576
-    PK_CACHE_ROW = QK_HEAD_DIM if GLM_FLAT else 584
+    PK_TOKEN_BYTES = QK_HEAD_DIM if FLAT else 576
+    PK_CACHE_ROW = QK_HEAD_DIM if FLAT else 584
 
     base_scale = (QK_HEAD_DIM ** -0.5) if softmax_scale is None else float(softmax_scale)
     SOFTMAX_SCALE = fx.Float32(base_scale)
@@ -1200,6 +1232,12 @@ def compile_sparse_mla_prefill_paged(
             )
             q_sc = _fmax(q_sc, fx.Float32(1e-30))
             q_sc_inv = _f32(rocdl.rcp(T.f32, _raw(q_sc)))
+            # flat512 DMA lever: OCP rows land in LDS as 0.5x their value (fnuz
+            # decode of OCP bytes); fold the OCP->fnuz x2 into the kv scale once
+            # so both the QK softmax scale and the output scale get it.  The
+            # convert path bakes the x2 into LDS instead, so no fold there.
+            if const_expr(FLAT512 and FLAT512_DMA):
+                kv_sc = _fmul(kv_sc, fx.Float32(2.0))
             qk_softmax_scale = _fmul(_fmul(softmax_scale, q_sc), kv_sc)
         else:
             qk_softmax_scale = softmax_scale
@@ -1334,6 +1372,32 @@ def compile_sparse_mla_prefill_paged(
                 w = rocdl.cvt_pk_fp8_f32(T.i32, _raw(bf[2]), _raw(bf[3]), w, 1)
                 _ptr_store(w, _lds_ptr_from_i32(dst_addr), alignment=4)
 
+        # ---- Split RoPE load for the double-buffered prefetch pipeline --------
+        # ``_load_rope_block`` couples the bf16 load with the fp8 convert+store,
+        # so its buffer_load latency is exposed.  For prefetch we split it: issue
+        # the bf16 pair load early (``_rope_issue``, no wait) so its latency hides
+        # behind the current tile's NoPE MFMAs, then convert+store into the NEXT
+        # KV buffer (``_rope_convert_store``) late.  Non-ROPE_BF16 fp8 rope only
+        # (prefetch is gated off for ROPE_BF16, which repurposes P_LDS_KV_1).
+        def _rope_issue(cache_rsrc, token_base_i32):
+            is_oob = ArithValue(token_base_i32) == -1
+            safe_tb = ArithValue(_raw(is_oob)).select(_raw(c_zero_i32), _i32(token_base_i32))
+            byte_off = ArithValue(_raw(safe_tb)) + PK_NOPE_BYTES + ArithValue(kv_ld_col_base) * 2
+            return buffer_ops.buffer_load(
+                cache_rsrc, _i32(byte_off.with_signedness(False) // 4), vec_width=2, dtype=T.i32
+            )
+
+        def _rope_convert_store(pair, p_lds_kv_warp, token_base_i32):
+            dst_addr = _i32(ArithValue(p_lds_kv_warp) + PK_ROPE_BLOCK * KV_BLOCK_BYTES + _i32(lane_idx) * 4)
+            is_oob = ArithValue(token_base_i32) == -1
+            if is_oob:
+                _ptr_store(c_zero_i32, _lds_ptr_from_i32(dst_addr), alignment=4)
+            else:
+                bf = Vec(Vec(pair).bitcast(fx.BFloat16)).to(fx.Float32)  # 4 f32
+                w = rocdl.cvt_pk_fp8_f32(T.i32, _raw(bf[0]), _raw(bf[1]), c_zero_i32, 0)
+                w = rocdl.cvt_pk_fp8_f32(T.i32, _raw(bf[2]), _raw(bf[3]), w, 1)
+                _ptr_store(w, _lds_ptr_from_i32(dst_addr), alignment=4)
+
         # ---- GLM flat fp8 load: whole row is fp8 (latent+rope), row stride =
         # head_dim bytes; DMA all KV_NUM_BLOCKS 64-col blocks straight to LDS.
         # The per-tensor scale is folded in the softmax/output, not here.
@@ -1350,6 +1414,98 @@ def compile_sparse_mla_prefill_paged(
                     rocdl.buffer_load_to_lds(
                         cache_rsrc, _lds_ptr_from_i32(lds_base_i32), voff, offset=blk * KV_NUM_COLS
                     )
+
+        # ---- flat OCP convert load (flat512): whole ``head_dim``-wide fp8 row
+        # is OCP e4m3fn.  gfx942 MFMA is fnuz-only, so decode-as-fnuz (= 0.5x the
+        # OCP value for every normal/subnormal code), multiply by ``sc`` = 2^bias
+        # (bias_f32=1.0 => the OCP->fnuz x2 correction, recovering the OCP value
+        # in the fnuz domain; same mantissa bits, so no double rounding), flush
+        # the OCP -0.0 (byte 0x80, which fnuz decodes as NaN) to 0, and re-encode
+        # fnuz into LDS.  No per-block scale region (flat); the shared per-tensor
+        # kv_scale is folded into the softmax/output via USE_PT_SCALE.
+        def _load_flat_convert(cache_rsrc, p_lds_kv_warp, token_base_i32, ocp_bias):
+            # ``ocp_bias`` is the compile-time OCP->fnuz exponent correction (1 for
+            # OCP e4m3fn, 0 for native fnuz); fold it as the constant scale 2^bias.
+            sc = fx.Float32(float(2.0 ** ocp_bias))
+            for blk in range_constexpr(KV_NUM_BLOCKS):
+                dst_addr = _i32(ArithValue(p_lds_kv_warp) + blk * KV_BLOCK_BYTES + _i32(lane_idx) * 4)
+                is_oob = ArithValue(token_base_i32) == -1
+                if is_oob:
+                    _ptr_store(c_zero_i32, _lds_ptr_from_i32(dst_addr), alignment=4)
+                else:
+                    byte_off = ArithValue(token_base_i32) + kv_ld_col_base + blk * KV_NUM_COLS
+                    word = buffer_ops.buffer_load(
+                        cache_rsrc, _i32(byte_off.with_signedness(False) // 4), vec_width=1, dtype=T.i32
+                    )
+                    f01 = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(word), 0))
+                    f23 = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(word), 1))
+                    f0 = _flush_nan(_fmul(f01[0], sc))
+                    f1 = _flush_nan(_fmul(f01[1], sc))
+                    f2 = _flush_nan(_fmul(f23[0], sc))
+                    f3 = _flush_nan(_fmul(f23[1], sc))
+                    w = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f0), _raw(f1), c_zero_i32, 0)
+                    w = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f2), _raw(f3), w, 1)
+                    _ptr_store(w, _lds_ptr_from_i32(dst_addr), alignment=4)
+
+        # ---- integer NaN flush: zero any of the 4 fp8 bytes equal to 0x80 -----
+        # OCP -0.0 is byte 0x80, which gfx942 fnuz decode treats as NaN; the
+        # convert path uses _flush_nan in f32, the DMA path flushes in-LDS here.
+        def _flush80_dword(dw_raw):
+            dw = ArithValue(_raw(dw_raw)).with_signedness(False)
+            res = ArithValue(_raw(c_zero_i32)).with_signedness(False)
+            for k in range_constexpr(4):
+                sh = 8 * k
+                byte = (dw >> sh) & 0xFF
+                is80 = _raw(byte == 0x80)
+                kept = ArithValue(is80).select(_raw(c_zero_i32), _raw(byte))
+                res = res | (ArithValue(_raw(kept)).with_signedness(False) << sh)
+            return _raw(res)
+
+        # ---- in-LDS flush of one warp's flat tile: zero OCP -0.0 (0x80) bytes.
+        # Reads the KV_NUM_BLOCKS dwords this lane owns (same addresses the flat
+        # DMA wrote: p_lds_kv_warp + blk*KV_BLOCK_BYTES + lane*4), flushes, writes
+        # back.  Caller must have ensured the DMA (vmem) completed (vmcnt=0) and
+        # must issue a workgroup barrier afterwards for cross-warp visibility.
+        def _flush_flat_tile(p_lds_kv_warp):
+            addrs = []
+            dws = []
+            for blk in range_constexpr(KV_NUM_BLOCKS):
+                addr = _i32(ArithValue(p_lds_kv_warp) + blk * KV_BLOCK_BYTES + _i32(lane_idx) * 4)
+                addrs.append(addr)
+                dws.append(_ptr_load(T.i32, _lds_ptr_from_i32(addr), alignment=4, volatile_=True))
+            rocdl.s_waitcnt(_encode_waitcnt(lgkmcnt=0))  # ds_read results ready
+            for blk in range_constexpr(KV_NUM_BLOCKS):
+                _ptr_store(_flush80_dword(dws[blk]), _lds_ptr_from_i32(addrs[blk]), alignment=4, volatile_=True)
+
+        # ---- flat OCP DMA load: buffer_load_to_lds the raw OCP bytes (read as
+        # fnuz = 0.5x the OCP value), then flush the OCP -0.0 (0x80) bytes to 0.
+        # The OCP->fnuz x2 is folded once into the per-tensor kv scale.
+        def _load_flat_dma_flush(cache_rsrc, p_lds_kv_warp, token_base_i32):
+            _load_flat_dma(cache_rsrc, p_lds_kv_warp, token_base_i32)
+            rocdl.s_waitcnt(_encode_waitcnt(vmcnt=0))  # DMA (vmem->LDS) complete
+            _flush_flat_tile(p_lds_kv_warp)
+
+        # ---- Phase-2 round-2 prefetch flush: a flat512 tile prefetched into
+        # ``p_lds_kv_base`` by the double-buffered pipeline is raw OCP bytes; the
+        # caller's leading _barrier(vmcnt=0) guarantees the prefetch DMA landed,
+        # so flush 0x80->0 here (per warp) then a workgroup barrier makes the
+        # flushed tile visible cross-warp before the MFMA reads it.  No-op unless
+        # the flat512 DMA-prefetch pipeline is active.
+        def _flush_prefetched(p_lds_kv_base):
+            if const_expr(FLAT_DMA_PIPE):
+                _flush_flat_tile(_kv_warp_lds_base(p_lds_kv_base))
+                _barrier(lgkmcnt=0)
+
+        # ---- flat region load helper: pick DMA (native fnuz), DMA+flush (OCP
+        # via the Phase-2 DMA lever), or convert (OCP fallback) --------------
+        def _load_region_flat(cache_rsrc, p_lds_kv_warp, token_base_i32, is_ocp):
+            if const_expr(is_ocp):
+                if const_expr(FLAT512_DMA):
+                    _load_flat_dma_flush(cache_rsrc, p_lds_kv_warp, token_base_i32)
+                else:
+                    _load_flat_convert(cache_rsrc, p_lds_kv_warp, token_base_i32, 1)
+            else:
+                _load_flat_dma(cache_rsrc, p_lds_kv_warp, token_base_i32)
 
         def _prefetch_flat_tile_asm(cache_rsrc, p_lds_kv_warp, token_base_i32, block_idx_const):
             lds_adjust = block_idx_const * KV_BLOCK_BYTES - block_idx_const * KV_NUM_COLS
@@ -1635,12 +1791,26 @@ def compile_sparse_mla_prefill_paged(
             q_rope_b=None,
         ):
             k_base_i32 = _i32(ArithValue(p_lds_kv_base) + k_lds_lane_offset)
-            do_prefetch = GLM_FLAT and p_lds_kv_next_warp is not None
+            # Double-buffered prefetch of the NEXT KV tile into ``p_lds_kv_next_warp``.
+            # GLM: the whole row is fp8 -> every block is a straight DMA.
+            # DSv4 fp8_ds_mla (DMA path): blocks 0..PK_NOPE_BLOCKS-1 are NoPE DMA
+            # (reuse the flat inline-asm DMA), and block PK_ROPE_BLOCK is the bf16
+            # RoPE tail -> issue its load up front (latency hidden by the NoPE
+            # MFMAs) and convert+store it into the next buffer at its block turn.
+            do_prefetch = p_lds_kv_next_warp is not None
+            # FLAT rows (glm_flat576 / flat512) are all-fp8: every block is a
+            # straight DMA (no bf16 RoPE tail split).  flat512 OCP tiles are
+            # flushed at the consuming iteration (_flush_prefetched).
+            pf_dsv4 = do_prefetch and not FLAT
+            rope_pair_next = _rope_issue(prefetch_cache_rsrc, token_base_next) if const_expr(pf_dsv4) else None
 
             def _maybe_prefetch(block_idx):
                 if const_expr(not do_prefetch):
                     return
-                _prefetch_flat_tile_asm(prefetch_cache_rsrc, p_lds_kv_next_warp, token_base_next, block_idx)
+                if const_expr(FLAT or block_idx < PK_NOPE_BLOCKS):
+                    _prefetch_flat_tile_asm(prefetch_cache_rsrc, p_lds_kv_next_warp, token_base_next, block_idx)
+                else:
+                    _rope_convert_store(rope_pair_next, p_lds_kv_next_warp, token_base_next)
 
             _maybe_prefetch(0)
             P_COMP_SUBS = BLOCK_N // MFMA_N
@@ -1837,13 +2007,17 @@ def compile_sparse_mla_prefill_paged(
         q_rope_packs = _load_q_rope_bf16(q_idx) if const_expr(ROPE_BF16) else None
 
         # ---- region-0 attend body (single-region: const-fixed resources) ----
-        def _attend_region0(kv_tile_start_i32, rm_in, rse_in, oaccu_in, is_first):
+        # ``next_warp``/``tb_next`` (B2 DMA pipeline only): prefetch the next
+        # region0 tile into that buffer during this tile's GEMM1 (mirrors the
+        # single-region pipeline).  Default None => no prefetch.
+        def _attend_region0(kv_tile_start_i32, rm_in, rse_in, oaccu_in, is_first,
+                            next_warp=None, tb_next=None):
             tb, sb = _row_addrs(
                 main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size, main_max_blocks,
                 kv_tile_start_i32, main_end,
             )
-            if const_expr(GLM_FLAT):
-                _load_flat_dma(main_cache_rsrc, p_lds_kv_0_warp, tb)
+            if const_expr(FLAT):
+                _load_region_flat(main_cache_rsrc, p_lds_kv_0_warp, tb, R0_OCP)
             else:
                 if const_expr(R0_CONVERT):
                     _load_nope_convert(
@@ -1858,6 +2032,8 @@ def compile_sparse_mla_prefill_paged(
             rm_n, rse_n, p_pack, rescale = _process_tile_gemm1(
                 main_indices_rsrc, main_num_rows, p_lds_kv_0_base, kv_tile_start_i32, main_end,
                 q_nope_packs, rm_in, rse_in, is_first, q_rope_b=q_rope_packs,
+                p_lds_kv_next_warp=next_warp, prefetch_cache_rsrc=main_cache_rsrc,
+                token_base_next=tb_next,
             )
             if const_expr(is_first):
                 oaccu_n = _gemm2_first_iter(p_pack, _vt_base_i32())
@@ -1889,11 +2065,14 @@ def compile_sparse_mla_prefill_paged(
                     extra_indices_rsrc, extra_bt_rsrc, extra_num_rows, extra_block_size,
                     extra_max_blocks, kv_ts, extra_end,
                 )
-                _load_nope_convert(
-                    extra_cache_rsrc, p_lds_kv_0_warp, tb, sb,
-                    fx.Float32(1.0) if R1_OCP else fx.Float32(0.0),
-                )
-                _load_rope_block(extra_cache_rsrc, p_lds_kv_0_warp, tb)
+                if const_expr(FLAT):
+                    _load_region_flat(extra_cache_rsrc, p_lds_kv_0_warp, tb, R1_OCP)
+                else:
+                    _load_nope_convert(
+                        extra_cache_rsrc, p_lds_kv_0_warp, tb, sb,
+                        fx.Float32(1.0) if R1_OCP else fx.Float32(0.0),
+                    )
+                    _load_rope_block(extra_cache_rsrc, p_lds_kv_0_warp, tb)
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
                 rm_n, rse_n, pp, rescale = _process_tile_gemm1(
@@ -1906,14 +2085,17 @@ def compile_sparse_mla_prefill_paged(
                     main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size,
                     main_max_blocks, kv_ts, main_end,
                 )
-                if const_expr(R0_CONVERT):
+                if const_expr(FLAT):
+                    _load_region_flat(main_cache_rsrc, p_lds_kv_0_warp, tb, R0_OCP)
+                elif const_expr(R0_CONVERT):
                     _load_nope_convert(
                         main_cache_rsrc, p_lds_kv_0_warp, tb, sb,
                         fx.Float32(1.0) if R0_OCP else fx.Float32(0.0),
                     )
+                    _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb)
                 else:
                     _load_nope_dma(main_cache_rsrc, p_lds_kv_0_warp, tb)
-                _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb)
+                    _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb)
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
                 rm_n, rse_n, pp, rescale = _process_tile_gemm1(
@@ -1922,12 +2104,89 @@ def compile_sparse_mla_prefill_paged(
                 )
             return rm_n, rse_n, pp, rescale
 
-        if const_expr(NREG == 1 and GLM_FLAT):
+        # ---- region-select load + GEMM1 with region0 DMA prefetch (B2) --------
+        # Same flattened region0||region1 tile space as ``_load_gemm1_select``,
+        # but region0 tiles are already resident in ``curr_base`` (prefetched by
+        # the prior tile) so they skip the sync load and instead prefetch region0
+        # tile g+1 into ``next_warp`` during GEMM1.  Region1 (compressed/convert)
+        # stays single-buffered in KV buffer 0 (convert isn't a plain DMA).  At
+        # the region0->region1 boundary the region0 prefetch of the (nonexistent)
+        # next region0 tile resolves OOB -> zero-fill, harmless since region1
+        # sync-loads buffer 0 before use.
+        def _load_gemm1_select_pf(global_t_i32, rm_in, rse_in, curr_base, next_warp):
+            is_r1 = _raw(ArithValue(global_t_i32) >= ArithValue(n0_tiles))
+            rm_n = c_neg_large
+            rse_n = c_zero_f32
+            pp = fx.Int64(0)
+            rescale = c_one_f32
+            if is_r1:
+                local = _raw(ArithValue(global_t_i32) - ArithValue(n0_tiles))
+                kv_ts = _raw(ArithValue(extra_start) + ArithValue(local) * BLOCK_N)
+                tb, sb = _row_addrs(
+                    extra_indices_rsrc, extra_bt_rsrc, extra_num_rows, extra_block_size,
+                    extra_max_blocks, kv_ts, extra_end,
+                )
+                if const_expr(FLAT):
+                    # region1 (compressed) is single-buffered into KV buffer 0.
+                    # A prior region0 tile may have prefetched (OOB zeros) into
+                    # buffer 0; barrier first so region1's DMA store wins.
+                    _barrier(vmcnt=0, lgkmcnt=0)
+                    _load_region_flat(extra_cache_rsrc, p_lds_kv_0_warp, tb, R1_OCP)
+                else:
+                    _load_nope_convert(
+                        extra_cache_rsrc, p_lds_kv_0_warp, tb, sb,
+                        fx.Float32(1.0) if R1_OCP else fx.Float32(0.0),
+                    )
+                    _load_rope_block(extra_cache_rsrc, p_lds_kv_0_warp, tb)
+                _barrier(vmcnt=0, lgkmcnt=0)
+                rocdl.sched_barrier(0)
+                rm_n, rse_n, pp, rescale = _process_tile_gemm1(
+                    extra_indices_rsrc, extra_num_rows, p_lds_kv_0_base, kv_ts, extra_end,
+                    q_nope_packs, rm_in, rse_in, False, q_rope_b=q_rope_packs,
+                )
+            else:
+                kv_ts = _raw(ArithValue(main_start) + ArithValue(global_t_i32) * BLOCK_N)
+                kv_next = _raw(ArithValue(kv_ts) + BLOCK_N)
+                tb_next, _sb_next = _row_addrs(
+                    main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size,
+                    main_max_blocks, kv_next, main_end,
+                )
+                _barrier(vmcnt=0, lgkmcnt=0)
+                # flat512: flush the OCP tile the previous region0 tile prefetched
+                # into curr_base (raw DMA) before the MFMA reads it.
+                _flush_prefetched(curr_base)
+                rocdl.sched_barrier(0)
+                rm_n, rse_n, pp, rescale = _process_tile_gemm1(
+                    main_indices_rsrc, main_num_rows, curr_base, kv_ts, main_end,
+                    q_nope_packs, rm_in, rse_in, False, q_rope_b=q_rope_packs,
+                    p_lds_kv_next_warp=next_warp, prefetch_cache_rsrc=main_cache_rsrc,
+                    token_base_next=tb_next,
+                )
+            return rm_n, rse_n, pp, rescale
+
+        # Double-buffered prefetch pipeline: enabled for GLM flat (all-fp8 DMA)
+        # and for the DSv4 fp8_ds_mla DMA path (fnuz region0, no UE8M0 convert,
+        # no ROPE_BF16 -- which repurposes P_LDS_KV_1).  It ping-pongs KV tiles
+        # between the two KV LDS buffers so the scattered gather of tile n+1
+        # overlaps the GEMM1/softmax/V-transpose/GEMM2 compute of tile n.  The
+        # non-prefetch ``_attend_region0`` loop below handles the convert path.
+        PIPELINE_PREFETCH = (NREG == 1) and (not ROPE_BF16) and (GLM_FLAT or (not R0_CONVERT) or FLAT_DMA_PIPE)
+
+        def _preload_kv0(p_warp, tb):
+            if const_expr(FLAT_DMA_PIPE):
+                _load_flat_dma_flush(main_cache_rsrc, p_warp, tb)
+            elif const_expr(GLM_FLAT):
+                _load_flat_dma(main_cache_rsrc, p_warp, tb)
+            else:
+                _load_nope_dma(main_cache_rsrc, p_warp, tb)
+                _load_rope_block(main_cache_rsrc, p_warp, tb)
+
+        if const_expr(PIPELINE_PREFETCH):
             tb_first, _sb_first = _row_addrs(
                 main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size, main_max_blocks,
                 main_start, main_end,
             )
-            _load_flat_dma(main_cache_rsrc, p_lds_kv_0_warp, tb_first)
+            _preload_kv0(p_lds_kv_0_warp, tb_first)
             has_multi = ArithValue(n0_tiles) > 1
 
             def _multi_tile_path_glm():
@@ -1964,6 +2223,7 @@ def compile_sparse_mla_prefill_paged(
                     curr_base = ArithValue(is_odd).select(p_lds_kv_1_base, p_lds_kv_0_base)
                     next_warp = ArithValue(is_odd).select(p_lds_kv_0_warp, p_lds_kv_1_warp)
                     _barrier(vmcnt=0, lgkmcnt=0)
+                    _flush_prefetched(curr_base)  # flat512: flush prefetched OCP tile
                     rocdl.sched_barrier(0)
                     rm_n, rse_n, pp, rescale = _process_tile_gemm1(
                         main_indices_rsrc, main_num_rows, curr_base, kv_ts, main_end,
@@ -1983,6 +2243,7 @@ def compile_sparse_mla_prefill_paged(
                 last_is_odd = (ArithValue(last_tile_i32) & 1) != 0
                 last_curr_base = ArithValue(last_is_odd).select(p_lds_kv_1_base, p_lds_kv_0_base)
                 _barrier(vmcnt=0, lgkmcnt=0)
+                _flush_prefetched(last_curr_base)  # flat512: flush prefetched OCP tile
                 rocdl.sched_barrier(0)
                 rm_l, rse_l, pp_l, rescale_l = _process_tile_gemm1(
                     main_indices_rsrc, main_num_rows, last_curr_base, kv_last_start, main_end,
@@ -2043,9 +2304,58 @@ def compile_sparse_mla_prefill_paged(
                     _single_tile_path()
 
             _dispatch()
+        elif const_expr(((not R0_CONVERT) or FLAT_DMA_PIPE) and (not ROPE_BF16)):
+            # B2 with DMA region0 (fnuz, no UE8M0 convert, no ROPE_BF16): run the
+            # region0 tiles through the double-buffered prefetch pipeline (ping-
+            # pong KV buffers, gather of tile n+1 overlaps compute of tile n);
+            # region1 (compressed/convert) stays single-buffered.  First tile is
+            # region0 tile 0; it prefetches region0 tile 1 into KV buffer 1.
+            tb_tile1, _sb_tile1 = _row_addrs(
+                main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size, main_max_blocks,
+                _raw(ArithValue(main_start) + BLOCK_N), main_end,
+            )
+            rm_first, rse_first, oaccu_first = _attend_region0(
+                main_start, c_neg_large, c_zero_f32, None, True,
+                next_warp=p_lds_kv_1_warp, tb_next=tb_tile1,
+            )
+            has_multi = ArithValue(total_tiles) > 1
+
+            def _multi_tile_path2_pf():
+                init_args = [rm_first, rse_first] + oaccu_first
+                for tile_iv, state in range(_idx(1), _idx(total_tiles), _idx(1), init=init_args):
+                    tile_i32 = ArithValue(fx.Int32(tile_iv))
+                    is_odd = (tile_i32 & 1) != 0
+                    curr_base = ArithValue(is_odd).select(p_lds_kv_1_base, p_lds_kv_0_base)
+                    next_warp = ArithValue(is_odd).select(p_lds_kv_0_warp, p_lds_kv_1_warp)
+                    rm_c = state[0]
+                    rse_c = state[1]
+                    oaccu_c = [state[2 + i] for i in range(NUM_PV_ITERS * 2)]
+                    rm_n, rse_n, pp, rescale = _load_gemm1_select_pf(
+                        _raw(tile_i32), rm_c, rse_c, curr_base, next_warp
+                    )
+                    oaccu_n = _gemm2_with_rescale(pp, rescale, oaccu_c, _vt_base_i32())
+                    results = yield [rm_n, rse_n] + oaccu_n
+                rm_final = results[0]
+                rse_final = results[1]
+                oaccu_final = [results[2 + i] for i in range(NUM_PV_ITERS * 2)]
+                _normalize_and_store(oaccu_final, rm_final, rse_final, row_base)
+
+            def _single_tile_path2_pf():
+                _normalize_and_store(oaccu_first, rm_first, rse_first, row_base)
+
+            @flyc.jit
+            def _dispatch2_pf():
+                if has_multi:
+                    _multi_tile_path2_pf()
+                else:
+                    _single_tile_path2_pf()
+
+            _dispatch2_pf()
         else:
-            # B2: single yield-loop over the flattened region0||region1 tile
-            # space. The first tile (g==0) is region0 tile 0 (region0/SWA is the
+            # B2 with region0 convert/UE8M0/ROPE_BF16: single-buffered (convert
+            # isn't a plain DMA; ROPE_BF16 repurposes KV buffer 1).
+            # Single yield-loop over the flattened region0||region1 tile space.
+            # The first tile (g==0) is region0 tile 0 (region0/SWA is the
             # always-present sliding window) and initialises the shared softmax
             # state via GEMM2-first; the loop selects the region per tile.
             rm_first, rse_first, oaccu_first = _attend_region0(
@@ -2214,6 +2524,15 @@ def compile_sparse_mla_prefill(
             raise NotImplementedError("glm_flat576: head_dim=576, single-region, no sink")
         if scale_mode != "per_tensor":
             raise NotImplementedError("glm_flat576 requires scale_mode='per_tensor'")
+    elif cache_layout == "flat512":
+        # DSv4 512-flat (vLLM FlashInfer SM10x): 512-wide OCP E4M3 fp8 row (RoPE
+        # folded in), single shared per-tensor scale, one or two regions.
+        if head_dim != 512:
+            raise NotImplementedError("flat512 requires head_dim=512")
+        if scale_mode != "per_tensor":
+            raise NotImplementedError("flat512 requires scale_mode='per_tensor'")
+        if region0_is_fnuz or (num_regions == 2 and region1_is_fnuz):
+            raise NotImplementedError("flat512 pools are OCP (float8_e4m3fn); pass is_fnuz=False")
     elif head_dim != 512:
         raise NotImplementedError("fp8_ds_mla cache_layout requires head_dim=512")
     # region0 (SWA) is fnuz; UE8M0 != 1 forces the convert load path. GLM flat

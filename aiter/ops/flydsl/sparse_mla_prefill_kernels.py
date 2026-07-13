@@ -21,7 +21,12 @@ from flydsl.expr.typing import Stream
 from .kernels.sparse_mla_prefill import compile_sparse_mla_prefill
 from .kernels.tensor_shim import _run_compiled
 
-__all__ = ["flydsl_sparse_mla_prefill", "flydsl_sparse_mla_prefill_2region"]
+__all__ = [
+    "flydsl_sparse_mla_prefill",
+    "flydsl_sparse_mla_prefill_2region",
+    "flydsl_sparse_mla_prefill_flat512",
+    "flydsl_sparse_mla_prefill_flat512_2region",
+]
 
 NUM_HEADS = 128
 HEAD_DIM = 512  # DSv4 (448 nope + 64 rope)
@@ -30,6 +35,7 @@ V_DIM = 512
 SUPPORTED_HEAD_DIMS = (HEAD_DIM, GLM_HEAD_DIM)
 DEFAULT_SOFTMAX_SCALE = HEAD_DIM**-0.5
 GLM_CACHE_ROW = GLM_HEAD_DIM  # flat fp8 row stride (bytes) for glm_flat576
+FLAT512_CACHE_ROW = HEAD_DIM  # flat fp8 row stride (bytes) for the DSv4 512-flat layout
 
 # Launch stubs for kernel parameters that stay in the ABI but are unused when
 # ``single_request=True`` or ``has_sink=False`` at compile time.  Created once.
@@ -218,6 +224,30 @@ def _glm_cache_u8(cache: torch.Tensor, block_size: int) -> tuple[torch.Tensor, i
         raise ValueError("glm cache must be contiguous")
     if cache.element_size() != 1:
         raise ValueError("glm cache must be a 1-byte dtype (fp8 or uint8)")
+    num_rows = num_blocks * block_size
+    cache_u8 = cache.view(torch.uint8).reshape(-1)
+    return cache_u8, num_rows, num_blocks
+
+
+def _flat512_cache_u8(cache: torch.Tensor, block_size: int) -> tuple[torch.Tensor, int, int]:
+    """DSv4 512-flat fp8 cache ``[num_blocks, block_size, 512]`` (fp8 or uint8).
+
+    Matches vLLM's FlashInfer SM10x DSv4 512-flat layout: the whole 512-wide row
+    is OCP E4M3 (``torch.float8_e4m3fn``) with RoPE folded into dims [448:512];
+    a single per-tensor scale lives outside the cache (folded in the kernel).
+    """
+    if cache.dim() != 3 or cache.shape[-1] != FLAT512_CACHE_ROW:
+        raise ValueError(
+            f"flat512 cache must be [num_blocks, block_size, {FLAT512_CACHE_ROW}], "
+            f"got {tuple(cache.shape)}"
+        )
+    num_blocks, blk, _ = cache.shape
+    if blk != block_size:
+        raise ValueError(f"cache block_size {blk} != block_size arg {block_size}")
+    if not cache.is_contiguous():
+        raise ValueError("flat512 cache must be contiguous")
+    if cache.element_size() != 1:
+        raise ValueError("flat512 cache must be a 1-byte dtype (fp8 or uint8)")
     num_rows = num_blocks * block_size
     cache_u8 = cache.view(torch.uint8).reshape(-1)
     return cache_u8, num_rows, num_blocks
@@ -513,6 +543,203 @@ def flydsl_sparse_mla_prefill_2region(
         scale_mode=main_scale_mode,
         softmax_scale=DEFAULT_SOFTMAX_SCALE, single_request=single_request,
         cache_layout="fp8_ds_mla", rope_bf16=rope_bf16,
+    )
+    with torch.cuda.device(q.device.index):
+        _run_compiled(
+            exe,
+            q_flat,
+            m_cache_u8,
+            m_idx,
+            m_iptr,
+            m_bt,
+            e_cache_u8,
+            e_idx,
+            e_iptr,
+            e_bt,
+            q_req_t,
+            sink_t,
+            out_flat,
+            q_sc_t,
+            kv_sc_t,
+            int(num_queries),
+            int(m_rows),
+            int(e_rows),
+            int(block_size),
+            int(e_block_size),
+            int(m_max_blocks),
+            int(e_max_blocks),
+            _fx_stream(q.device, stream),
+        )
+
+
+def flydsl_sparse_mla_prefill_flat512(
+    q: torch.Tensor,  # [num_queries, H, 512] bf16 contiguous
+    cache: torch.Tensor,  # [num_blocks, block_size, 512] OCP fp8 (float8_e4m3fn) or uint8
+    indices: torch.Tensor,  # flat int32 CSR values, contiguous
+    indptr: torch.Tensor,  # [num_queries + 1] int32, contiguous
+    out: torch.Tensor,  # [num_queries, H, 512] bf16 contiguous (in place)
+    *,
+    block_table: torch.Tensor,  # [num_reqs, max_blocks] int32 contiguous
+    block_size: int,
+    q_scale: torch.Tensor | float | None = None,  # f32 [1], per-tensor
+    kv_scale: torch.Tensor | float | None = None,  # f32 [1], per-tensor
+    q_req: torch.Tensor | None = None,
+    num_kv_rows: int | None = None,
+    single_request: bool = True,
+    stream: torch.cuda.Stream | None = None,
+) -> None:
+    """Single-region DSv4 512-flat sparse MLA prefill (vLLM FlashInfer SM10x layout).
+
+    The cache is a flat ``[num_blocks, block_size, 512]`` OCP E4M3 (float8_e4m3fn)
+    tensor: the whole 512-wide row is fp8 with RoPE folded into dims [448:512]
+    (no bf16 tail, no per-block scale region).  A single shared per-tensor
+    ``q_scale`` / ``kv_scale`` (f32 [1], vLLM ``_flashinfer_fp8_*_scale``) is
+    folded into the QK softmax scale and the output.  Softmax scale is
+    ``1/sqrt(512)`` at compile time.
+    """
+    _require_cuda(q, cache, indices, indptr, out)
+    _check_gfx942(q.device)
+    num_queries, num_heads, head_dim, v_dim = _validate_qout(q, out)
+    if head_dim != HEAD_DIM:
+        raise NotImplementedError(f"flat512 requires head_dim={HEAD_DIM}, got {head_dim}")
+    _require_int32_1d(indptr, "indptr", numel=num_queries + 1)
+    indices_i32 = _require_int32_1d(indices, "indices")
+    q_flat = _flat_bf16(q, "q")
+    out_flat = _flat_bf16(out, "out")
+    cache_u8, default_rows, _ = _flat512_cache_u8(cache, block_size)
+    n_kv_rows = int(num_kv_rows) if num_kv_rows is not None else default_rows
+    if block_table.dim() != 2:
+        raise ValueError(f"block_table must be 2D [num_reqs, max_blocks], got {tuple(block_table.shape)}")
+    bt_flat = _require_int32_contiguous(block_table, "block_table").view(-1)
+    max_blocks = block_table.shape[1]
+    q_req_t = _resolve_q_req(q_req, num_queries=num_queries, single_request=single_request, device=q.device)
+    sink_t = _stub_sink(q.device, num_heads)
+    q_sc_t = _resolve_f32_scalar(q_scale, "q_scale", device=q.device)
+    kv_sc_t = _resolve_f32_scalar(kv_scale, "kv_scale", device=q.device)
+
+    exe = _get_kernel(
+        num_q_heads=num_heads,
+        head_dim=HEAD_DIM, v_dim=V_DIM, num_regions=1, has_sink=False,
+        r0_dtype="fp8", r0_fnuz=False, r1_dtype="fp8", r1_fnuz=False,
+        qk_split=False, block_n=32, block_h=16, split_kv=False, packed=True,
+        scale_mode="per_tensor", softmax_scale=DEFAULT_SOFTMAX_SCALE,
+        single_request=single_request, cache_layout="flat512",
+    )
+    with torch.cuda.device(q.device.index):
+        _run_compiled(
+            exe,
+            q_flat,
+            cache_u8,
+            indices_i32,
+            indptr,
+            bt_flat,
+            cache_u8,
+            indices_i32,
+            indptr,
+            bt_flat,
+            q_req_t,
+            sink_t,
+            out_flat,
+            q_sc_t,
+            kv_sc_t,
+            int(num_queries),
+            int(n_kv_rows),
+            int(n_kv_rows),
+            int(block_size),
+            int(block_size),
+            int(max_blocks),
+            int(max_blocks),
+            _fx_stream(q.device, stream),
+        )
+
+
+def flydsl_sparse_mla_prefill_flat512_2region(
+    q: torch.Tensor,
+    out: torch.Tensor,
+    main_cache: torch.Tensor,
+    main_indices: torch.Tensor,
+    main_indptr: torch.Tensor,
+    main_block_table: torch.Tensor,
+    extra_cache: torch.Tensor,
+    extra_indices: torch.Tensor,
+    extra_indptr: torch.Tensor,
+    extra_block_table: torch.Tensor,
+    *,
+    block_size: int,
+    extra_block_size: int | None = None,
+    q_scale: torch.Tensor | float | None = None,
+    kv_scale: torch.Tensor | float | None = None,
+    attn_sink: torch.Tensor | None = None,
+    main_num_rows: int | None = None,
+    extra_num_rows: int | None = None,
+    q_req: torch.Tensor | None = None,
+    single_request: bool = True,
+    validate_regions: bool = True,
+    stream: torch.cuda.Stream | None = None,
+) -> None:
+    """Two-region DSv4 512-flat sparse MLA prefill (vLLM FlashInfer SM10x layout).
+
+    ``main_*`` is region0 (SWA sliding window, always non-empty per query) and
+    ``extra_*`` is region1 (compressed top-k).  Both pools are flat
+    ``[num_blocks, block_size, 512]`` OCP E4M3 (float8_e4m3fn) caches sharing a
+    single per-tensor ``q_scale`` / ``kv_scale`` (matching vLLM's single
+    ``_flashinfer_fp8_kv_scale`` for both pools), a shared online softmax, and
+    RoPE folded into the 512 as fp8.  region0 must be non-empty for every query
+    (the kernel seeds shared softmax state from region0 tile 0); this is enforced
+    host-side unless ``validate_regions=False``.
+    """
+    _require_cuda(q, out, main_cache, extra_cache, main_indices, main_indptr, extra_indices, extra_indptr)
+    _check_gfx942(q.device)
+    num_queries, num_heads, head_dim, v_dim = _validate_qout(q, out)
+    if head_dim != HEAD_DIM:
+        raise NotImplementedError(f"flat512 requires head_dim={HEAD_DIM}, got {head_dim}")
+
+    e_block_size = block_size if extra_block_size is None else extra_block_size
+    m_cache_u8, m_default_rows, _ = _flat512_cache_u8(main_cache, block_size)
+    e_cache_u8, e_default_rows, _ = _flat512_cache_u8(extra_cache, e_block_size)
+    m_rows = int(main_num_rows) if main_num_rows is not None else m_default_rows
+    e_rows = int(extra_num_rows) if extra_num_rows is not None else e_default_rows
+
+    m_idx = _require_int32_1d(main_indices, "main_indices")
+    m_iptr = _require_int32_1d(main_indptr, "main_indptr", numel=num_queries + 1)
+    e_idx = _require_int32_1d(extra_indices, "extra_indices")
+    e_iptr = _require_int32_1d(extra_indptr, "extra_indptr", numel=num_queries + 1)
+
+    if m_idx.numel() == 0:
+        raise ValueError(
+            "flydsl_sparse_mla_prefill_flat512_2region: region0 (main_indices) must be non-empty; "
+            "the kernel seeds shared softmax state from region0 tile 0"
+        )
+    if validate_regions:
+        main_lens = m_iptr[1:] - m_iptr[:-1]
+        if bool((main_lens < 1).any().item()):
+            raise ValueError(
+                "flydsl_sparse_mla_prefill_flat512_2region requires every query's region0 (main) "
+                "segment to be non-empty; pass validate_regions=False to skip when guaranteed"
+            )
+
+    if main_block_table.dim() != 2 or extra_block_table.dim() != 2:
+        raise ValueError("main_block_table and extra_block_table must be 2D [num_reqs, max_blocks]")
+    m_bt = _require_int32_contiguous(main_block_table, "main_block_table").view(-1)
+    e_bt = _require_int32_contiguous(extra_block_table, "extra_block_table").view(-1)
+    m_max_blocks = main_block_table.shape[1]
+    e_max_blocks = extra_block_table.shape[1]
+
+    has_sink = attn_sink is not None
+    q_req_t = _resolve_q_req(q_req, num_queries=num_queries, single_request=single_request, device=q.device)
+    sink_t = _resolve_sink(attn_sink, has_sink=has_sink, device=q.device, num_heads=num_heads)
+    q_flat = _flat_bf16(q, "q")
+    out_flat = _flat_bf16(out, "out")
+    q_sc_t = _resolve_f32_scalar(q_scale, "q_scale", device=q.device)
+    kv_sc_t = _resolve_f32_scalar(kv_scale, "kv_scale", device=q.device)
+
+    exe = _get_kernel(
+        num_q_heads=num_heads,
+        head_dim=HEAD_DIM, v_dim=V_DIM, num_regions=2, has_sink=has_sink,
+        r0_dtype="fp8", r0_fnuz=False, r1_dtype="fp8", r1_fnuz=False,
+        qk_split=False, block_n=32, block_h=16, split_kv=False, packed=True,
+        scale_mode="per_tensor", softmax_scale=DEFAULT_SOFTMAX_SCALE,
+        single_request=single_request, cache_layout="flat512",
     )
     with torch.cuda.device(q.device.index):
         _run_compiled(

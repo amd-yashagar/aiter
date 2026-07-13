@@ -166,6 +166,109 @@ def _glm_cache_as_fp8(cache: torch.Tensor) -> torch.Tensor:
     raise TypeError(f"glm cache must be fnuz fp8 or uint8, got {cache.dtype}")
 
 
+# ---------------------------------------------------------------------------
+# DSv4 512-flat (vLLM FlashInfer SM10x) helpers: flat OCP E4M3 fp8 cache,
+# head_dim=512 (RoPE folded in), single shared per-tensor scale, V = full 512.
+# ---------------------------------------------------------------------------
+FLAT512_HEAD_DIM = 512
+FLAT512_V_DIM = 512
+
+
+def pack_flat512_cache(
+    kv: torch.Tensor,
+    block_size: int,
+    *,
+    kv_scale: float = 1.0,
+) -> torch.Tensor:
+    """Pack [num_tokens, 512] bf16 "true" KV into a flat OCP E4M3 fp8 cache.
+
+    Stores ``round_ocp(kv / kv_scale)`` as ``torch.float8_e4m3fn`` (matching
+    vLLM's 512-flat layout, RoPE assumed already folded into dims [448:512]).
+    Returns ``[num_blocks, block_size, 512]`` float8_e4m3fn.
+    """
+    assert kv.shape[-1] == FLAT512_HEAD_DIM
+    num_tokens = kv.shape[0]
+    num_blocks = (num_tokens + block_size - 1) // block_size
+    cache = torch.zeros((num_blocks, block_size, FLAT512_HEAD_DIM), dtype=_OCP, device=kv.device)
+    f = (kv.to(torch.float32) / float(kv_scale)).to(_OCP)
+    cache.view(num_blocks * block_size, FLAT512_HEAD_DIM)[:num_tokens] = f
+    return cache
+
+
+def gen_kv_flat512(num_tokens: int, seed: int, device: str = "cuda", scale: float = 0.125) -> torch.Tensor:
+    g = torch.Generator(device=device).manual_seed(seed)
+    return torch.randn(num_tokens, FLAT512_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * scale
+
+
+def gen_q_flat512(sq: int, h: int, seed: int, device: str = "cuda", scale: float = 0.125) -> torch.Tensor:
+    g = torch.Generator(device=device).manual_seed(seed)
+    return torch.randn(sq, h, FLAT512_HEAD_DIM, generator=g, dtype=torch.bfloat16, device=device) * scale
+
+
+def default_scale_flat512() -> float:
+    return FLAT512_HEAD_DIM ** -0.5
+
+
+def _flat512_row_lds(cache: torch.Tensor, slot: int) -> torch.Tensor:
+    """The exact f32 row the kernel materialises in LDS for one 512-flat slot.
+
+    Mirrors the kernel's ``_load_flat_convert``: the OCP E4M3 cache bytes are
+    decoded *as fnuz* (gfx942 MFMA is fnuz-only) -> 0.5x the OCP value, then
+    multiplied by 2 (the OCP->fnuz bias, same mantissa bits, no double round),
+    the OCP -0.0 (byte 0x80 -> fnuz NaN) is flushed to 0, and the result is
+    re-encoded fnuz.
+    """
+    flat = cache.reshape(-1, FLAT512_HEAD_DIM)
+    row = flat[int(slot)]
+    u8 = row if row.dtype == torch.uint8 else row.view(torch.uint8)
+    fnuz_dec = u8.view(_FNUZ).to(torch.float32)  # kernel decodes bytes as fnuz
+    scaled = fnuz_dec * 2.0  # OCP->fnuz x2 (bias=1)
+    scaled = torch.where(torch.isnan(scaled), torch.zeros_like(scaled), scaled)
+    return scaled.to(_FNUZ).to(torch.float32)  # re-encode fnuz (kernel LDS value)
+
+
+def ref_prefill_flat512(
+    q: torch.Tensor,
+    regions: list[tuple[torch.Tensor, list[list[int]]]],
+    scale: float,
+    block_size: int,
+    *,
+    q_scale: float = 1.0,
+    kv_scale: float = 1.0,
+    attn_sink: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """f32 oracle for the DSv4 512-flat OCP fp8 cache (one or two regions).
+
+    ``regions`` is a list of ``(cache, rows_list)`` where ``rows_list[qi]`` are
+    the valid slot ids for query qi in that region (caller pre-filters invalid
+    slots).  Reproduces the kernel's fp8 rounding exactly (see
+    ``_flat512_row_lds``).  q: [sq, H, 512] bf16 -> returns [sq, H, 512] bf16.
+    Both pools share ``q_scale`` / ``kv_scale`` (vLLM contract).
+    """
+    sq, H, D = q.shape
+    assert D == FLAT512_HEAD_DIM
+    q_eff = (q.to(torch.float32) / float(q_scale)).to(_FNUZ).to(torch.float32)
+    qk_scale = scale * float(q_scale) * float(kv_scale)
+    out = torch.zeros(sq, H, FLAT512_V_DIM, dtype=torch.float32, device=q.device)
+    for qi in range(sq):
+        row_kv = []
+        for cache, rows_list in regions:
+            for slot in rows_list[qi]:
+                row_kv.append(_flat512_row_lds(cache, int(slot)))
+        if not row_kv:
+            continue
+        kv = torch.stack(row_kv).to(q.device)  # [k, 512]
+        for h in range(H):
+            scores = torch.mv(kv, q_eff[qi, h]) * qk_scale
+            if attn_sink is not None:
+                scores_s = torch.cat([scores, attn_sink[h].float().reshape(1)])
+                probs = torch.softmax(scores_s, dim=0)[:-1]
+            else:
+                probs = torch.softmax(scores, dim=0)
+            out[qi, h] = torch.sum(probs[:, None] * kv[:, :FLAT512_V_DIM], dim=0) * float(kv_scale)
+    return out.to(torch.bfloat16)
+
+
 def ref_prefill_glm(
     q: torch.Tensor,
     cache: torch.Tensor,
