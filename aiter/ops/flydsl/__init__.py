@@ -52,6 +52,7 @@ if is_flydsl_available():
         KERNEL_VARIANTS as FP8_MQA_LOGITS_VARIANTS,
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
     )
+    from .kernels.minimax_block_score import flydsl_minimax_block_score
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
@@ -67,5 +68,6 @@ if is_flydsl_available():
         "flydsl_fp8_mqa_logits",
         "FP8_MQA_LOGITS_VARIANTS",
         "FP8_MQA_LOGITS_DEFAULT_VARIANT",
+        "flydsl_minimax_block_score",
         # "flydsl_gdr_decode",
     ]
