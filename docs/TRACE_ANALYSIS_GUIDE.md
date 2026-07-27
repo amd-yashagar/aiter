@@ -13,7 +13,7 @@ before they can open optimization tickets. This guide tells you exactly what to
 collect and how to format it, so handoff takes minutes rather than days.
 
 **What you produce:** one *ticket brief* per hot operation (ops consuming >2% of
-total compute time). Each brief contains five things the kernel devs need.
+total compute time). Each brief contains four things the kernel devs need.
 
 ---
 
@@ -82,10 +82,10 @@ raw trace and let the kernel dev team regenerate the report.
 
 ---
 
-## Section 2 — The five things to extract per hot op
+## Section 2 — The four things to extract per hot op
 
 Open the TraceLens Excel report. For each op in `ops_summary` that takes **>2% of
-total kernel time**, extract all five items below.
+total kernel time**, extract all four items below.
 
 ### Item 1: Performance fraction
 
@@ -161,57 +161,6 @@ If the same op appears with different input shapes (e.g. prefill attention has
 | ... |
 ```
 
-### Item 5: Roofline position
-
-Compute from the shapes and timing. The kernel dev uses this to gauge how much
-headroom exists and which direction to push.
-
-**MI355 hardware peaks (gfx950 / CDNA4):**
-
-| dtype | Peak compute | HBM3E BW | Ridge point |
-|---|---|---|---|
-| FP4 MFMA (E2M1) | ~5 200 TFLOPS/s | 8.8 TB/s | ~591 FLOP/Byte |
-| FP8 MFMA (E4M3) | ~2 600 TFLOPS/s | 8.8 TB/s | ~295 FLOP/Byte |
-| BF16 MFMA | ~1 300 TFLOPS/s | 8.8 TB/s | ~148 FLOP/Byte |
-
-**FLOPS formulas by operation type:**
-
-```
-Dense GEMM (linear layer):
-  FLOPS = 2 × M × N × K
-
-MoE FFN, 2-stage (compute per stage separately — they often differ in efficiency):
-  M_eff = M_tokens × topk          (routed token-expert pairs, not M_tokens)
-  Stage 1 FLOPS = 2 × M_eff × N_up × K_up
-  Stage 2 FLOPS = 2 × M_eff × N_down × K_down
-  FP4 weights: K_phys = K_logical/2 (packed); scale bytes = N × K_logical/32
-  Add scale tensor bytes to Bytes calculation
-
-Prefill attention (full sequence, non-causal):
-  FLOPS ≈ 4 × S_q × S_k × H × D_padded
-  ("4" approximates QK matmul + softmax + PV matmul + output)
-  If head_dim is padded (e.g. 72→128), use D_padded for kernel FLOPS
-  and D_logical for "useful" FLOPS — report both and note the padding waste
-
-Decode attention (paged KV cache):
-  Memory-bound at short context; compute-bound at long context
-  Report as memory-bound unless you know the average context length
-  KV cache read dominates Bytes; context length may be unknown from trace alone
-
-Quantisation kernel (e.g. dynamic_per_group_scaled_quant):
-  Bytes-only: Bytes_in + Bytes_out_packed + Bytes_scales
-  Always memory-bound (AI << any ridge point)
-```
-
-**Compute and report:**
-```
-AI (FLOP/Byte) = FLOPS / Bytes
-Bound          = "compute" if AI > Ridge, else "memory"
-Achieved       = FLOPS / (mean_us × 1e-6)  [TFLOPS/s]
-Efficiency     = Achieved / Peak × 100      [%]
-Headroom       = 100 - Efficiency           [%]
-```
-
 ---
 
 ## Section 3 — Output format: the ticket brief
@@ -226,10 +175,6 @@ Produce one brief per hot op using this template:
 **GPU kernel(s):**
 - `<exact_kernel_name>` — mean Aµs, calls N
 - `<second_kernel_if_any>` — mean Bµs, calls N
-
-**Roofline:**
-FLOPS = X TFLOPs, Bytes ≈ Y GB, AI ≈ Z FLOP/Byte → BOUND
-Achieved: W TFLOPS/s → E% of FP4/FP8/BF16 peak  (headroom: H%)
 
 **Input shapes and dtypes (from trace):**
 ```
@@ -300,7 +245,7 @@ Fill from trace + model config:
 | `topk` | top-k (from `Concrete Inputs`) |
 | `act_type` | typically `ActivationType.Silu` |
 | `dtype` | activation dtype (e.g. `torch.bfloat16`) |
-| `q_dtype_a` | activation quant dtype (same as dtype for BF16, or `torch.float8_...`) |
+| `q_dtype_a` | activation quant dtype (same as dtype for BF16, `torch.float8_...` for FP8, or `torch.float4_e2m1fn_x2` for FP4 activations / w4a4) |
 | `q_dtype_w` | weight quant dtype (e.g. `torch.float4_e2m1fn_x2` for FP4) |
 | `q_type` | `QuantType.per_1x32` for MX-FP4 block scales |
 | `use_g1u1` | always `1` (gate-up fused; only supported config) |
@@ -309,14 +254,14 @@ Fill from trace + model config:
 **Example (from this model, Qwen3-VL w4a4):**
 ```csv
 token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1
-256,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
-512,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
-1024,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
-2048,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
-4096,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
-8192,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
-16384,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
-32768,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
+256,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
+512,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
+1024,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
+2048,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
+4096,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
+8192,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
+16384,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
+32768,4096,3072,128,8,ActivationType.Silu,torch.bfloat16,torch.float4_e2m1fn_x2,torch.float4_e2m1fn_x2,QuantType.per_1x32,1,0
 ```
 
 Save as `<model>_untuned_fmoe.csv` and attach to the ticket. The kernel dev team
@@ -407,7 +352,7 @@ vLLM serving config:
 - [ ] Eager trace used (not compiled-only)
 - [ ] TraceLens report generated and unencrypted
 - [ ] All ops > 2% of total compute time have a ticket brief
-- [ ] Each brief has all five items: %, kernel name, shapes, timing, roofline
+- [ ] Each brief has all four items: %, kernel name, shapes, timing
 - [ ] head_dim verified via softmax_scale (if attention op present)
 - [ ] FP4 physical vs logical K both reported (if FP4 op present)
 - [ ] block_size noted from serving config (if decode attention present)
