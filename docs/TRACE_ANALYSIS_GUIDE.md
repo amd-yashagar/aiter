@@ -78,11 +78,44 @@ TraceLens_generate_perf_report_pytorch_inference \
     --topk_ops 80
 ```
 
-**Platform note (as of TraceLens v0.1.0.dev):** MI355 / gfx950 is not yet in the
-arch JSON list. Use `MI325X` for MI355 — kernel names and timing are unaffected;
-only the roofline peak numbers will be slightly conservative (MI355 is faster on
-FP4/FP8 than MI325X). Adding `MI355X.json` to
-`TraceLens/Agent/Analysis/utils/arch/` is a one-file fix.
+**MI355X / gfx950 platform support:**
+
+TraceLens v0.1.0.dev does not yet include an MI355X arch spec. Install it with the
+one-liner below; once present, TraceLens reports correct TFLOPS/s and efficiency %
+for gfx950 in the `GEMM` sheet automatically — no manual roofline computation
+needed for GEMM ops.
+
+```bash
+cat > "$(python -c "import TraceLens, os; \
+    print(os.path.join(os.path.dirname(TraceLens.__file__), \
+    'Agent/Analysis/utils/arch/MI355X.json'))")" << 'EOF'
+{
+    "name": "MI355X",
+    "mem_bw_gbps": 6198,
+    "memory_gb": 288,
+    "max_achievable_tflops": {
+        "matrix_fp16": 1236,
+        "matrix_bf16": 1236,
+        "matrix_fp32": 157,
+        "matrix_fp64": 79,
+        "matrix_fp8": 2470,
+        "matrix_fp4": 4940,
+        "matrix_int8": 2470,
+        "vector_fp16": 157,
+        "vector_bf16": 157,
+        "vector_fp32": 157,
+        "vector_fp64": 79
+    }
+}
+EOF
+```
+
+These are empirically measured peaks for MI355X (CDNA4) — slightly below the
+official AMD datasheet values and therefore more realistic for kernel benchmarking.
+Official spec: BF16 matrix = 1300 TFLOPS/s, FP8 = 2600 TFLOPS/s,
+FP4 = 5200 TFLOPS/s, HBM3E BW = 8.8 TB/s.
+
+Remove this step once MI355X is merged into TraceLens upstream.
 
 **Important:** share the `.xlsx` unencrypted. DRM-protected Excel files (produced
 by some corporate tools) cannot be opened programmatically. If in doubt, share the
@@ -195,6 +228,18 @@ elementwise` (SiLU, GELU, fused bias+activation, residual add) · `Quantization`
 For a **custom or fused** op, also describe the maths — a reference implementation
 (PyTorch, NumPy, or pseudocode) is the fastest way to convey it.
 
+### Check what aiter already has before requesting
+
+Often the slow op in a trace is a torch or Triton fallback while an aiter kernel
+already exists but is not selected — so check before filing. `aiter/ops/` (wrappers
+are named by dtype, e.g. `gemm_op_a4w4.py`) and `op_tests/` are the places to start;
+an existing op test also gives you a quick way to measure a candidate.
+
+Report what you found in the brief: an exact replacement (name it, with a measured
+time if you ran it), a similar kernel that would need extending (name it and say what
+is missing), or nothing comparable. Say so even when the answer is nothing — it saves
+the kernel team the same search.
+
 ### Brief template
 
 Produce one brief per hot op:
@@ -203,6 +248,9 @@ Produce one brief per hot op:
 ## Op: <aiter_op_name / vLLM_op_name>
 
 **Operation type:** <category above; describe the maths if custom/fused>
+
+**Existing aiter kernel?** <exact replacement / similar kernel that needs extending /
+nothing comparable — with names and any measured time>
 
 **% of total compute:** X% (Y.Y ms total, Z calls) — and W% of end-to-end latency
 
@@ -344,7 +392,7 @@ Fill from trace + model config:
 |---|---|
 | `token` | M_tokens values from trace (one row per distinct M: 256, 512, 1024, 2048, 4096, 8192, 16384, 32768) |
 | `model_dim` | hidden dimension (e.g. 4096); from model `config.json` |
-| `inter_dim` | MoE FFN intermediate width per expert (e.g. 3072); from model config |
+| `inter_dim` | MoE FFN intermediate width per expert (e.g. 3072); `moe_intermediate_size` in HF `config.json` — the field name differs |
 | `expert` | num_experts (from `Concrete Inputs` in trace) |
 | `topk` | top-k (from `Concrete Inputs`) |
 | `act_type` | typically `ActivationType.Silu` |
@@ -480,7 +528,10 @@ so state which one the date gates.
 - [ ] TraceLens report generated and unencrypted
 - [ ] All ops > 2% of total compute time have a ticket brief
 - [ ] Each brief has all four trace items: %, kernel name, shapes, timing
+- [ ] For GEMM ops: copy `TFLOPS/s_mean` and `Compute Spec` from the TraceLens `GEMM` sheet into the brief (no manual calculation needed once MI355X.json is installed)
+- [ ] For attention and MoE ops: include kernel time; compute efficiency manually or leave it to the kernel team
 - [ ] Operation type classified (maths or reference implementation if custom/fused)
+- [ ] Checked whether aiter already has an exact or similar kernel; outcome recorded
 - [ ] Data types complete: inputs, output, accumulation, scale dtype + granularity
       + block size
 - [ ] Model context filled in (layer/block, prefill vs decode, graph capture,
