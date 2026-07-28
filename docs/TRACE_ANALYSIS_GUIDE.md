@@ -228,6 +228,18 @@ elementwise` (SiLU, GELU, fused bias+activation, residual add) · `Quantization`
 For a **custom or fused** op, also describe the maths — a reference implementation
 (PyTorch, NumPy, or pseudocode) is the fastest way to convey it.
 
+### Check what aiter already has before requesting
+
+Often the slow op in a trace is a torch or Triton fallback while an aiter kernel
+already exists but is not selected — so check before filing. `aiter/ops/` (wrappers
+are named by dtype, e.g. `gemm_op_a4w4.py`) and `op_tests/` are the places to start;
+an existing op test also gives you a quick way to measure a candidate.
+
+Report what you found in the brief: an exact replacement (name it, with a measured
+time if you ran it), a similar kernel that would need extending (name it and say what
+is missing), or nothing comparable. Say so even when the answer is nothing — it saves
+the kernel team the same search.
+
 ### Brief template
 
 Produce one brief per hot op:
@@ -236,6 +248,9 @@ Produce one brief per hot op:
 ## Op: <aiter_op_name / vLLM_op_name>
 
 **Operation type:** <category above; describe the maths if custom/fused>
+
+**Existing aiter kernel?** <exact replacement / similar kernel that needs extending /
+nothing comparable — with names and any measured time>
 
 **% of total compute:** X% (Y.Y ms total, Z calls) — and W% of end-to-end latency
 
@@ -516,6 +531,7 @@ so state which one the date gates.
 - [ ] For GEMM ops: copy `TFLOPS/s_mean` and `Compute Spec` from the TraceLens `GEMM` sheet into the brief (no manual calculation needed once MI355X.json is installed)
 - [ ] For attention and MoE ops: include kernel time; compute efficiency manually or leave it to the kernel team
 - [ ] Operation type classified (maths or reference implementation if custom/fused)
+- [ ] Checked whether aiter already has an exact or similar kernel; outcome recorded
 - [ ] Data types complete: inputs, output, accumulation, scale dtype + granularity
       + block size
 - [ ] Model context filled in (layer/block, prefill vs decode, graph capture,
