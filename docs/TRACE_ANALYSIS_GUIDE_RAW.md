@@ -2,7 +2,7 @@
 ## (Raw-trace edition — no TraceLens required)
 
 **Audience:** anyone who generates GPU traces and needs to hand off an actionable
-kernel optimization request to the kernel team (AITER, Triton, Composable Kernel,
+kernel optimization request to the kernel team (AITER, Triton, FlyDSL, Composable Kernel,
 ASM, hipBLASLt).
 
 > **Why this guide exists alongside
