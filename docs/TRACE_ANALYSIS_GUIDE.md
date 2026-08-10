@@ -7,31 +7,119 @@ ASM, hipBLASLt).
 ## Purpose
 
 Kernel requests often arrive as "low performance compared to competitor, please
-fix". Without shapes, data types, profiling data, and model context the kernel team
-cannot triage, scope, or start work. This guide tells you exactly what to collect
-from your trace and what context to attach, so a request is actionable on arrival.
+fix". Without shapes, data types, timing, and model context the kernel team cannot
+triage, scope, or start work.
 
-**What you produce:** one *ticket brief* per hot operation. Each brief has:
+This guide is a checklist of **what information the kernel team needs**, and it is
+deliberately tool-independent. No single profiling flow works across models and ROCm
+versions: report generators skip operations they cannot parse, eager mode does not
+always expose shapes, and new models routinely break the tooling. What matters is
+the information, not how you obtained it — Section 1 covers the usual routes,
+including what to do when they fail.
 
-- **four items extracted from the trace** (Section 2) — performance fraction, GPU
-  kernel names, shapes/dtypes/scalars, per-call timing
-- **request context** (Section 3) — operation type, model context, data-type
-  details, performance target, fusion opportunities, and a reproducer
+**What you produce:** one *ticket brief* per hot operation — template in Section 3.
 
-**Which ops to include:** every op above ~2% of total kernel time. Also include a
-group of several small related kernels when together they are a meaningful share
-(>5%) of end-to-end time — the kernel team prioritizes by end-to-end impact, so
-give both the per-op share and the end-to-end share.
+### Must-have vs nice-to-have
+
+Uplift plans are written under time pressure. Send the must-haves; add nice-to-haves
+only when they are cheap. A request with every must-have and no nice-to-have is
+actionable; the reverse is not.
+
+| Must-have | Nice-to-have |
+|---|---|
+| Operation identity and what it computes (maths or reference implementation if custom/fused) | Exact mangled GPU kernel name — copy it if you have it, don't go hunting |
+| Input shapes, dtypes, and scalar arguments, including accumulation dtype and scale granularity | Input strides / layout |
+| Phase: prefill or decode | Roofline or efficiency numbers |
+| Per-call time, call count, and share **within that phase** | Reproducer script — a pointer to an existing benchmark is enough |
+| Hardware, ROCm and framework versions, container image | Fusion opportunities |
+| A concrete target, or the baseline you are measured against | Whether aiter already has a similar kernel |
+| Point of contact | Model code link, rocprofv3 counters |
+| The raw trace, and any logs the numbers came from | |
+
+If a must-have is genuinely unobtainable, say so and say what you tried. That is
+useful in itself — it tells the kernel team which tooling gap to close.
+
+**Do not hold a ticket back for analysis you have no time for.** If you attach the raw
+trace and the run configuration, the kernel team can derive the per-phase split,
+reconcile ops a report skipped, and decode shapes on their side. A ticket with the raw
+material and honest gaps is worth more than a polished one that arrives a week later.
+
+### Which ops to include: threshold per phase, not per run
+
+Profiles are usually captured with a very short output length (say 50 tokens) even
+when the target workload is thousands. The profile then lands at 90/10 or 95/05
+prefill-to-decode, while the real benchmark is closer to 30/70 or 20/80. A threshold
+applied across the whole run therefore hides nearly every decode kernel — precisely
+the kernels that dominate the workload you care about.
+
+So:
+
+- Apply the **~2% threshold within a single prefill step and within a single decode
+  step**, separately — not against total run time.
+- Produce **two hotlists, prefill and decode**, and label every brief with its phase.
+- State the profile's prefill/decode mix **and** the target workload's, so the kernel
+  team can weight the two lists.
+- Also flag a group of small related kernels when together they are a meaningful
+  share of a step.
+
+The trace itself distinguishes the phases through step and iteration boundaries, even
+when a report does not surface that split. Deriving it is worth the effort; without
+it, decode work is invisible.
 
 ---
 
-## Section 1 — Prerequisites and tools
+## Section 1 — How to get the data
 
-### What you need
+There is no one flow that works everywhere. Start with the cheap route, verify it
+actually covered your hot ops, and fall back to logging when it did not.
 
-- An **eager-mode trace** (`.json.gz`) — see below
-- **TraceLens** installed in your Python venv
-- Python packages: `openpyxl`, `pandas`
+| Route | Use it for | Limitation |
+|---|---|---|
+| Eager-mode PyTorch trace | The baseline — kernel names, timing, phase boundaries | Does not always expose shapes |
+| Report generator (e.g. TraceLens) | Fast aggregation, per-op summaries, GEMM efficiency | **Silently skips ops it cannot parse** |
+| Framework-side logging | Shapes the trace/report does not show | Needs a code change and a re-run |
+| rocprofv3 counters | Hardware-level questions | Nice-to-have, not required |
+
+### Verify the report covered your hot ops
+
+A report generator that cannot read an operation's input dimensions may **drop the
+operation entirely** — including an op responsible for a large share of runtime — and
+note the omission in a single line that is easy to miss. Treat the report's op list
+as incomplete until you have checked it.
+
+Reconcile the report against the kernel-level totals in the raw trace: if the ops you
+can see do not account for the step time, the difference is skipped work. Those ops are
+frequently the interesting ones, so a missing op should never become an implicit "not
+important".
+
+This is a rough sanity check, not an audit — compare summed op time against step time
+and see whether the two roughly agree. If they do not and you have no time to chase
+it, flag the gap and send the raw trace; the kernel team can pick it up from there.
+
+### When shapes are missing: log them
+
+Missing shapes are normal on new models, and eager mode alone does not fix it. In the
+MiniMax-M3 case eager mode still did not reveal operation sizes; the dimensions had to
+come from a framework code change that logged every operation call, with the values
+read back out of the logs.
+
+Before instrumenting anything, check whether you can **derive** the shapes from what
+you already know: the model config plus the run configuration (batch size, input and
+output lengths, TP/EP degree) pins down most dimensions — Section 5 does exactly this
+for the MoE CSV. Derivation is cheap; logging is the fallback when it is ambiguous.
+
+When shapes are genuinely not available:
+
+1. Add logging at the call site in the framework (vLLM / SGLang) so each call prints
+   its tensor shapes, dtypes, and scalar arguments.
+2. Re-run the same workload and extract the dimensions from the log.
+3. Report those shapes in the brief, **attach the log**, and mark which values came
+   from logs rather than from the trace.
+
+This is more work than reading a report, and sometimes the only way to get a
+must-have. If it does not fit your window, say so in the ticket and send the trace and
+config — the kernel team would rather help instrument the call site than have you
+absorb it alone.
 
 ### Trace mode: always use eager mode
 
@@ -43,14 +131,22 @@ Record **two** traces for every profiling run:
 | Compiled | `False` (default) | E2E wall-clock comparison between compiled runs only |
 
 The compiled trace hides kernel launches inside CUDA graph replay events —
-individual shapes and kernel names are not accessible. The eager trace is the only
-format that contains what the kernel dev team needs. It runs slower per step but
-that does not affect the analysis.
+individual shapes and kernel names are not accessible. Eager mode is therefore
+necessary, but as described above it is **not always sufficient**: it exposes the
+kernels and usually the shapes, but on unfamiliar ops the shapes can still be
+missing, and then you need the logging route. Eager runs slower per step, which does
+not affect the analysis.
 
 **If you only have a compiled trace:** note this in your submission. The kernel dev
 team may ask for an eager re-run.
 
-### Finding and running TraceLens
+### Running TraceLens (convenient, not required)
+
+TraceLens aggregates a trace into per-op summaries quickly, which is why it is
+documented here. It works well when a model's ops are all well-known and basic; on
+new models with unusual ops it can skip them, so pair it with the reconciliation
+check above. The information in Section 2 is what matters — if you get it another
+way, that is equally fine.
 
 Check if TraceLens is already installed:
 ```bash
@@ -123,10 +219,15 @@ raw trace and let the kernel dev team regenerate the report.
 
 ---
 
-## Section 2 — The four things to extract per hot op
+## Section 2 — What to extract per hot op
 
-Open the TraceLens Excel report. For each op in `ops_summary` that takes **>2% of
-total kernel time**, extract all four items below.
+For every op above the threshold **within a prefill step or within a decode step**
+(see Purpose), extract the items below.
+
+The sheet and column names quoted here are TraceLens's, because that is the common
+route. They are pointers, not requirements — the same values from a log, a different
+tool, or a hand-read trace are just as good. What the kernel team needs is the
+information itself.
 
 ### Item 1: Performance fraction
 
@@ -143,6 +244,10 @@ Report **both** percentage and absolute ms:
 - Percentages are stable across runs with different trace window lengths
 - Absolute ms lets the kernel dev verify their microbenchmark reproduces the
   same latency seen in the trace
+
+A whole-run percentage is a starting point, not the ranking signal — convert it to a
+share within a prefill or decode step per Item 5, otherwise short-output profiles
+bury the decode kernels.
 
 Also note the `gpu_timeline` sheet for the overall GPU utilisation breakdown
 (computation_time, idle_time, exposed_comm_time) — this gives context.
@@ -210,6 +315,28 @@ If shapes are dynamic and vary between runs or inference steps, give the most
 common shapes plus the observed min/max range — a kernel tuned for one shape can
 regress on another.
 
+### Item 5: Phase and share within the phase
+
+Label the op **prefill** or **decode**, and give its share of a single step of that
+phase rather than of the whole run.
+
+Derive the phase from step and iteration boundaries in the trace: prefill steps
+process many tokens at once while decode steps process one token per sequence, so the
+token dimension in the shapes usually settles it. If a report does not expose the
+split, the raw trace still contains it.
+
+A rough attribution is enough: label the brief and give an approximate per-step share.
+Exact per-kernel bookkeeping is not expected.
+
+Record once per submission:
+
+- the profile's prefill/decode step counts and time split;
+- the target workload's expected split — e.g. output length 2048 in production versus
+  the 50 used for profiling.
+
+Without this, a decode kernel that dominates production looks negligible in the
+profile and gets dropped.
+
 ---
 
 ## Section 3 — Output format: the ticket brief
@@ -252,7 +379,10 @@ Produce one brief per hot op:
 **Existing aiter kernel?** <exact replacement / similar kernel that needs extending /
 nothing comparable — with names and any measured time>
 
-**% of total compute:** X% (Y.Y ms total, Z calls) — and W% of end-to-end latency
+**Phase:** <prefill / decode>
+
+**Share within one step of that phase:** X% (mean Y.Y ms per step, Z calls per step)
+— plus the share of total profiled time, if useful
 
 **GPU kernel(s):**
 - `<exact_kernel_name>` — mean Aµs, calls N
@@ -463,12 +593,13 @@ KV cache. Look for nearby ops like `aiter::fused_qk_norm_mrope_3d_cache_pts_quan
 and `page_size=16` (pos 25). Always check KV-cache-writing ops before falling back
 to the vLLM serving config (`--block-size`, default 16).
 
-**5. Decode ops may carry no usable shapes at all — log them and attach the log.**
-Even in an eager trace, decode-path ops often expose empty `()` tensor arguments,
-because the kernel reads the KV cache and its metadata from internal framework
-state rather than from explicit arguments (same root cause as gotcha 4). When
-`Input Dims` is empty or clearly incomplete for a decode op, the trace alone cannot
-tell the kernel team what the kernel was called with. Do this instead:
+**5. Missing shapes are common — log them at the call site and attach the log.**
+Decode ops are the usual offender: they often expose empty `()` tensor arguments
+because the kernel reads the KV cache and its metadata from internal framework state
+rather than from explicit arguments (same root cause as gotcha 4). New or unusual ops
+hit the same wall for a different reason — the tooling cannot parse them. Either way,
+when shapes are empty or clearly incomplete the trace alone cannot tell the kernel
+team what the kernel was called with. Do this instead:
 - add a log line at the call site, or enable the framework's debug logging, so that
   each call prints its tensor shapes, dtypes, and scalar arguments;
 - re-run the same workload and extract the shapes from the log;
@@ -524,31 +655,41 @@ so state which one the date gates.
 
 ### Checklist before submitting
 
-- [ ] Eager trace used (not compiled-only)
-- [ ] TraceLens report generated and unencrypted
-- [ ] All ops > 2% of total compute time have a ticket brief
-- [ ] Each brief has all four trace items: %, kernel name, shapes, timing
-- [ ] For GEMM ops: copy `TFLOPS/s_mean` and `Compute Spec` from the TraceLens `GEMM` sheet into the brief (no manual calculation needed once MI355X.json is installed)
-- [ ] For attention and MoE ops: include kernel time; compute efficiency manually or leave it to the kernel team
-- [ ] Operation type classified (maths or reference implementation if custom/fused)
-- [ ] Checked whether aiter already has an exact or similar kernel; outcome recorded
-- [ ] Data types complete: inputs, output, accumulation, scale dtype + granularity
-      + block size
-- [ ] Model context filled in (layer/block, prefill vs decode, graph capture,
-      architecture, framework)
-- [ ] Performance target and baseline stated — not just "make it faster"
-- [ ] Fusion opportunities noted (bias, activation, quantization, residual)
-- [ ] Reproducer attached, or an existing benchmark script + exact command given
-- [ ] Environment pinned (docker image, ROCm, framework version, aiter commit)
-- [ ] head_dim verified via softmax_scale (if attention op present)
-- [ ] FP4 physical vs logical K both reported (if FP4 op present)
-- [ ] block_size noted from serving config (if decode attention present)
-- [ ] Decode shapes logged, extracted, and the log file attached (if the trace shows
-      empty args for decode ops)
-- [ ] `dynamic_per_group_scaled_quant` checked as separate op (if w4a4 MoE present)
-- [ ] M_tokens AND M_inter both reported (if MoE present)
-- [ ] Tuned CSV existence checked; untuned CSV attached if absent (if MoE present)
-- [ ] Required metadata block filled in (contact, deadline, hardware, serving config)
+**Required** — this is the short list; everything else is a bonus.
+
+- [ ] Raw trace attached (eager mode; note it if you only have a compiled trace)
+- [ ] Threshold applied per prefill step and per decode step, with separate hotlists
+- [ ] Every brief labelled prefill or decode, with its approximate share of that step
+- [ ] Each brief has: op identity, shapes and dtypes (including accumulation dtype and
+      scale granularity), per-call timing and call count
+- [ ] Profile's prefill/decode split recorded, plus the target workload's split
+- [ ] A concrete target, or the baseline you are measured against
+- [ ] Environment pinned (hardware, container image, ROCm, framework version, aiter commit)
+- [ ] Contact, deadline, and definition of done
+- [ ] Shapes taken from logs marked as such, with the log attached
+- [ ] Any must-have you could not get: stated, along with what you tried
+
+**When applicable** — only if that op type is in your hotlist.
+
+- [ ] head_dim verified via softmax_scale (attention)
+- [ ] FP4 physical and logical K both reported (FP4 ops)
+- [ ] block_size noted from serving config (decode attention)
+- [ ] `dynamic_per_group_scaled_quant` checked as a separate op (w4a4 MoE)
+- [ ] M_tokens and M_inter both reported (MoE)
+- [ ] Tuned CSV existence checked; untuned CSV attached if absent (MoE)
+
+**If cheap** — genuinely optional; skip without guilt when time is short.
+
+- [ ] Report reconciled against raw-trace totals, or the gap flagged
+- [ ] Exact GPU kernel name copied
+- [ ] Operation type classified, with maths or a reference implementation if custom/fused
+- [ ] Whether aiter already has an exact or similar kernel
+- [ ] Model context detail (layer/block, graph capture, architecture)
+- [ ] Fusion opportunities (bias, activation, quantization, residual)
+- [ ] Reproducer, or an existing benchmark script and command
+- [ ] For GEMM ops, efficiency values copied from the report; for attention and MoE,
+      leave efficiency to the kernel team
+- [ ] Model code link, rocprofv3 counters
 
 ---
 
