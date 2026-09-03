@@ -3,11 +3,21 @@
 
 """FlyDSL dense absorb MLA prefill vs production baselines.
 
-Candidates (aiter-op-test style):
-  flydsl     — this kernel (absorb 576→512, any H, causal or not)
-  asm        — aiter.mla.mla_prefill_fwd (absorb; H in {16,128}; causal semantics)
-  triton     — aiter.ops.triton.attention.mla.mla_prefill_fwd (absorb; causal only)
-  fmha_decomp — decompress-shaped FMHA qh192/vh128 (ticket competitor attention)
+Timing contract (SILOTIGER-957 / e2e-homogeneous):
+  * Metadata and scratch are prepared **outside** ``run_perftest`` (serving does
+    this once per shape / graph capture).
+  * Timed region is **device attention work only** for every candidate:
+      flydsl  — ``kn_0`` (+ GPU split-combine when splits>1)
+      asm     — ``mla_prefill_fwd`` HIP launch
+      fmha    — ``flash_attn_varlen`` after decompress-shaped tensors
+  * Host pad/cat/tile-build are not timed. Inputs use ``sq % BLOCK_M == 0`` so
+    the FlyDSL path needs no runtime Q pad (aligned like a padded serving buf).
+
+Candidates:
+  flydsl      — dense absorb MFMA kernel (qk_dim→v_dim, any H, causal flag)
+  asm         — aiter.mla.mla_prefill_fwd (absorb; H in {16,128}; causal semantics)
+  triton      — aiter.ops.triton.attention.mla.mla_prefill_fwd (absorb; causal only)
+  fmha_decomp — flash_attn_varlen on qh192/vh128 (decompress-shaped MHA competitor)
 
 Torch absorb is the correctness reference only (not timed).
 """
@@ -22,7 +32,13 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl import flydsl_mla_prefill_fwd, flydsl_mla_prefill_supported
+from aiter.ops.flydsl import (
+    flydsl_mla_prefill_fwd,
+    flydsl_mla_prefill_supported,
+    prepare_mla_prefill_workspace,
+    run_mla_prefill_prepared,
+)
+from aiter.ops.flydsl.kernels.mla_prefill_dense import DEFAULT_BLOCK_M
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -32,7 +48,6 @@ KV_LORA = 512
 QK_ROPE = 64
 QK_DIM = KV_LORA + QK_ROPE  # 576
 V_DIM = KV_LORA  # 512
-# Ticket decompress path (AiterFlashAttnPrefillBackend context)
 QK_DECOMP = 128 + QK_ROPE  # 192
 V_DECOMP = 128
 ASM_HEADS = (16, 128)
@@ -77,6 +92,11 @@ def run_torch_absorb(q, kv_buffer, qo_indptr, kv_indptr, kv_indices, sm_scale, i
 
 
 def _make_inputs(batch, sq, skv, nhead, seed=0):
+    """Ticket-style inputs: ``sq`` already BM-aligned (no runtime pad in e2e)."""
+    if sq % DEFAULT_BLOCK_M:
+        raise ValueError(
+            f"e2e-fair bench requires sq %{DEFAULT_BLOCK_M}==0, got sq={sq}"
+        )
     g = torch.Generator(device="cuda")
     g.manual_seed(seed)
     page_size = 1
@@ -104,16 +124,8 @@ def _pad_heads(q: torch.Tensor, nhead_pad: int) -> torch.Tensor:
     return out
 
 
-def _kv_as_paged(kv_buffer, page_size=1):
-    # [num_page, page, 1, 576]
-    if kv_buffer.ndim == 4:
-        return kv_buffer
-    raise ValueError(kv_buffer.shape)
-
-
 def _triton_block_tables(kv_indptr, kv_indices, skv):
     batch = kv_indptr.numel() - 1
-    # page_size=1: one block id per token
     bt = torch.zeros(batch, skv, dtype=torch.int32, device=kv_indices.device)
     for b in range(batch):
         ks, ke = int(kv_indptr[b]), int(kv_indptr[b + 1])
@@ -132,7 +144,7 @@ def _record(ret, name, us, flops, nbytes, cos, err):
 
 @benchmark()
 def test_flydsl_mla_prefill(batch, sq, skv, nhead, is_causal, dtype):
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx(), "bench": "e2e_device"}
     if dtype != dtypes.bf16 or not flydsl_mla_prefill_supported():
         return ret
 
@@ -157,34 +169,54 @@ def test_flydsl_mla_prefill(batch, sq, skv, nhead, is_causal, dtype):
         + batch * nhead * sq * V_DECOMP
     ) * 2
 
-    # ---- flydsl (always) ----
+    # ---- flydsl: prepare once (metadata), time device-only ----
     o.zero_()
-    out_fd, us_fd = run_perftest(
-        lambda: flydsl_mla_prefill_fwd(
-            q,
-            kv_buffer,
-            o,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            sm_scale,
-            is_causal=is_causal,
-        )
+    # Correctness via convenience API once
+    out_check = flydsl_mla_prefill_fwd(
+        q,
+        kv_buffer,
+        o.clone(),
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        is_causal=is_causal,
     )
     err = checkAllclose(
-        ref.to(dtypes.fp32), out_fd.to(dtypes.fp32), rtol=2e-2, atol=2e-2, printLog=False
+        ref.to(dtypes.fp32),
+        out_check.to(dtypes.fp32),
+        rtol=2e-2,
+        atol=2e-2,
+        printLog=False,
     )
-    cos = _cos_diff(ref, out_fd)
-    _record(ret, "flydsl", us_fd, flops_absorb, nbytes_absorb, cos, err)
+    cos = _cos_diff(ref, out_check)
     assert cos < 1e-4, f"flydsl cos={cos}"
 
-    # ---- asm absorb (H pad to 16 if needed; causal-correct only) ----
+    ws = prepare_mla_prefill_workspace(
+        q,
+        kv_buffer,
+        o,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        is_causal=is_causal,
+    )
+    ret["flydsl_splits"] = int(ws.num_kv_splits)
+    ret["flydsl_ntiles"] = int(ws.ntiles)
+    run_mla_prefill_prepared(ws)  # warmup compile/launch
+    torch.cuda.synchronize()
+
+    out_fd, us_fd = run_perftest(lambda: run_mla_prefill_prepared(ws))
+    _record(ret, "flydsl", us_fd, flops_absorb, nbytes_absorb, cos, err)
+
+    # ---- asm absorb (head pad outside timer — same as serving pad-once) ----
     asm_h = 16 if nhead <= 16 else (128 if nhead <= 128 else None)
     if asm_h is not None and asm_h in ASM_HEADS:
         q_asm = _pad_heads(q, asm_h)
         o_asm = torch.empty(total_q, asm_h, V_DIM, dtype=dtypes.bf16, device="cuda")
-        kv_pages = kv_buffer.shape[0]
-        kv_4d = kv_buffer  # already [P,1,1,576]
+        kv_4d = kv_buffer
+        kv_last = torch.ones(batch, dtype=torch.int32, device="cuda")
 
         def _asm():
             return aiter.mla.mla_prefill_fwd(
@@ -194,11 +226,13 @@ def test_flydsl_mla_prefill(batch, sq, skv, nhead, is_causal, dtype):
                 qo_indptr,
                 kv_indptr,
                 kv_indices,
-                torch.ones(batch, dtype=torch.int32, device="cuda"),
+                kv_last,
                 sq,
                 sm_scale,
             )[0]
 
+        _asm()
+        torch.cuda.synchronize()
         out_asm, us_asm = run_perftest(_asm)
         out_asm_h = out_asm[:, :nhead]
         cos_asm = _cos_diff(ref, out_asm_h)
@@ -210,18 +244,16 @@ def test_flydsl_mla_prefill(batch, sq, skv, nhead, is_causal, dtype):
             printLog=False,
         )
         _record(ret, "asm", us_asm, flops_absorb, nbytes_absorb, cos_asm, err_asm)
-        # ASM shipped kernels match causal; non-causal is expected to diverge.
         if is_causal:
             assert cos_asm < 1e-4, f"asm causal cos={cos_asm}"
 
-    # ---- triton absorb (causal only) ----
+    # ---- triton absorb (causal only); tables built outside timer ----
     if is_causal:
         try:
             from aiter.ops.triton.attention.mla import mla_prefill_fwd as triton_mla_pfl
 
             block_tables, seqused_k = _triton_block_tables(kv_indptr, kv_indices, skv)
-            # Triton wants [blocks, block_size, kv_heads, dim]
-            kv_tr = kv_buffer  # [P,1,1,576]
+            kv_tr = kv_buffer
             o_tr = torch.empty_like(o)
 
             def _triton():
@@ -241,9 +273,11 @@ def test_flydsl_mla_prefill(batch, sq, skv, nhead, is_causal, dtype):
                     None,
                 )
 
+            _triton()
+            torch.cuda.synchronize()
             out_tr, us_tr = run_perftest(_triton)
-            cos_tr = _cos_diff(ref, out_tr if out_tr is not None else o_tr)
             out_cmp = out_tr if isinstance(out_tr, torch.Tensor) else o_tr
+            cos_tr = _cos_diff(ref, out_cmp)
             err_tr = checkAllclose(
                 ref.to(dtypes.fp32),
                 out_cmp.to(dtypes.fp32),
@@ -252,12 +286,10 @@ def test_flydsl_mla_prefill(batch, sq, skv, nhead, is_causal, dtype):
                 printLog=False,
             )
             _record(ret, "triton", us_tr, flops_absorb, nbytes_absorb, cos_tr, err_tr)
-        except Exception as exc:  # noqa: BLE001 — baseline optional
+        except Exception as exc:  # noqa: BLE001
             ret["triton skip"] = str(exc)[:80]
 
-    # ---- decompress-shaped FMHA (ticket attention competitor) ----
-    # Not the same math as absorb; times the FMHA the serving stack runs after
-    # decompress. Fair for "can we beat the production attention kernel".
+    # ---- decompress-shaped FMHA (ticket competitor; tensors ready outside) ----
     g = torch.Generator(device="cuda")
     g.manual_seed(1)
     q_d = torch.randn(
@@ -285,6 +317,8 @@ def test_flydsl_mla_prefill(batch, sq, skv, nhead, is_causal, dtype):
         )
 
     try:
+        _fmha()
+        torch.cuda.synchronize()
         _out_fmha, us_fmha = run_perftest(_fmha)
         _record(ret, "fmha_decomp", us_fmha, flops_decomp, nbytes_decomp, 0.0, 0.0)
         if us_fd > 0 and us_fmha > 0:
@@ -301,7 +335,12 @@ def test_flydsl_mla_prefill(batch, sq, skv, nhead, is_causal, dtype):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "E2E-homogeneous MLA prefill A/B (device work only). "
+            "sq must be a multiple of BLOCK_M=64."
+        )
+    )
     parser.add_argument("-d", "--dtype", nargs="*", default=["bf16"])
     parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1])
     parser.add_argument("--sq", type=int, nargs="*", default=[64, 256])
@@ -329,7 +368,7 @@ def main():
             test_flydsl_mla_prefill(batch, sq, skv, nhead, bool(causal), dtype_map[dt])
         )
     df = pd.DataFrame(rows)
-    aiter.logger.info("dense MLA prefill A/B:\n%s", df.to_markdown(index=False))
+    aiter.logger.info("dense MLA prefill A/B (e2e device):\n%s", df.to_markdown(index=False))
 
 
 if __name__ == "__main__":

@@ -48,6 +48,14 @@ _LAZY_IMPORTS = {
         ".mla_prefill_kernels",
         "flydsl_mla_prefill_supported",
     ),
+    "prepare_mla_prefill_workspace": (
+        ".mla_prefill_kernels",
+        "prepare_mla_prefill_workspace",
+    ),
+    "run_mla_prefill_prepared": (
+        ".mla_prefill_kernels",
+        "run_mla_prefill_prepared",
+    ),
     "flydsl_mla_reduce_v1": (".mla_reduce_kernels", "flydsl_mla_reduce_v1"),
     "flydsl_moe_stage1": (".moe_kernels", "flydsl_moe_stage1"),
     "flydsl_moe_stage2": (".moe_kernels", "flydsl_moe_stage2"),
@@ -83,6 +91,8 @@ __all__ = [
     "flydsl_hgemm",
     "flydsl_mla_prefill_fwd",
     "flydsl_mla_prefill_supported",
+    "prepare_mla_prefill_workspace",
+    "run_mla_prefill_prepared",
     "flydsl_mla_reduce_v1",
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
