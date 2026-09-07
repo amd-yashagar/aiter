@@ -173,6 +173,26 @@ def test_fmha_gfx942_block_n_forwarded():
     _assert_close(out_default, out_bn, "block_n forwarded")
 
 
+def test_fmha_gfx942_dualwave_swp_boundary():
+    sq, sk, h = 257, 511, 12
+    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, 192, 128)
+    scale = 1.0 / math.sqrt(192)
+    out_asm = _run_asm(q, k, v, cu_q, cu_k, sq, sk, scale, False)
+    out_fd = flash_attn_varlen_gfx942(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        sq,
+        sk,
+        softmax_scale=scale,
+        causal=False,
+        dualwave_swp=True,
+    )
+    _assert_close(out_asm, out_fd, "dualwave Sq=257 Sk=511")
+
+
 def run_case(sq: int, sk: int, h: int, causal: bool, *, bench: bool, seed: int = 0):
     d_qk, d_v = 192, 128
     q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, d_qk, d_v, seed=seed)
