@@ -1,27 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""High-level FlyDSL Flash Attention APIs (gfx1201 / RDNA4).
+"""High-level FlyDSL Flash Attention APIs.
 
-Wraps the FlyDSL `flash_attn_func_gfx1201` kernel with:
-  - Build cache keyed by (num_heads, head_dim, causal, dtype, waves_per_eu, daz).
-  - Automatic seq_len padding to the kernel's tile size (multiple of 128).
-  - BSHD ([B, S, H, D]) input/output convention to match upstream
-    flash-attention layout.
-  - Non-causal padding-ratio safety guard: padded K/V tokens contribute to
-    the softmax denominator and would scale outputs. Calls with
-    ``n_pad / seq_len_pad > 0.005`` (0.5%) and ``causal=False`` are rejected
-    with a ``ValueError``. The 0.5% threshold is the bf16 mantissa precision
-    floor plus 1 bit of margin; production Wan2.1 (S_real=32760, S_pad=32768,
-    ratio=0.024%) clears it by 20x. See option (d) in
-    ``2969_padded_softmax_rca.md``.
-
-The kernel implements self-attention only (Lq == Lk). Cross-attention
-(Lq != Lk) is rejected; callers should fall back to PyTorch SDPA.
+- ``flydsl_flash_attn_func``: gfx1201 / RDNA4 dense BSHD self-attention.
+  Wraps ``flash_attn_func_gfx1201`` with a build cache, seq_len padding to the
+  kernel tile (multiple of 128), and a non-causal pad-ratio guard (see
+  ``2969_padded_softmax_rca.md``). Self-attention only (Lq == Lk).
+- ``flydsl_flash_attn_varlen_func``: packed-THD varlen dispatcher used by
+  ``aiter.ops.mha.flash_attn_varlen_func``. gfx1250 (QK=192 V=128 bf16) is
+  production; gfx942 is opt-in via ``AITER_FMHA_FLYDSL_GFX942=1`` until it
+  beats ASM ``fmha_fwd_hd192x128``.
 """
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 import torch
@@ -29,11 +23,20 @@ import torch.nn.functional as F
 
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
 from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
+from .kernels.fmha_gfx942 import (
+    SUPPORTED_GFX as _GFX942,
+    flash_attn_varlen_gfx942,
+    validate_fmha_gfx942_tiles,
+)
 
 __all__ = [
     "flydsl_flash_attn_func",
     "flydsl_flash_attn_varlen_func",
 ]
+
+# gfx942 FlyDSL is behind ASM ``fmha_fwd_hd192x128`` until it wins. Opt in with
+# ``AITER_FMHA_FLYDSL_GFX942=1`` (same pattern as ``AITER_MLA_REDUCE_FLYDSL``).
+# Read at call time so tests can set the env after import.
 
 
 # Tile size baked into the gfx1201 kernel. Seq_len must be a multiple of this.
@@ -208,6 +211,47 @@ def flydsl_flash_attn_func(
     return o_p
 
 
+def _plain_varlen_mha_features(
+    dropout_p,
+    window_size,
+    block_table,
+    bias,
+    alibi_slopes,
+    sink,
+    deterministic,
+    return_attn_probs,
+) -> bool:
+    # FlyDSL handles only plain MHA. Any unsupported feature (bias, alibi, sink,
+    # dropout, sliding window, paging, probs/deterministic) falls through to
+    # CK/Triton/ASM instead of being silently dropped.
+    return (
+        dropout_p == 0.0
+        and tuple(window_size[:2]) == (-1, -1)
+        and block_table is None
+        and bias is None
+        and alibi_slopes is None
+        and sink is None
+        and not deterministic
+        and not return_attn_probs
+    )
+
+
+def _gfx942_varlen_supported(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    if q.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+        return False
+    if k.shape[-1] != q.shape[-1]:
+        return False
+    if q.shape[1] % k.shape[1] != 0:
+        return False
+    try:
+        validate_fmha_gfx942_tiles(q.shape[-1], v.shape[-1])
+    except ValueError:
+        return False
+    return True
+
+
 def flydsl_flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -232,43 +276,65 @@ def flydsl_flash_attn_varlen_func(
     """FlyDSL MHA forward, varlen THD layout.
 
     Returns the result if FlyDSL can handle this configuration,
-    otherwise returns None so the caller falls through to Triton/CK.
+    otherwise returns None so the caller falls through to Triton/CK/ASM.
     """
     from ...jit.utils.chip_info import get_gfx
 
-    # FlyDSL handles only plain MHA. Any unsupported feature (bias, alibi, sink,
-    # dropout, sliding window, paging, probs/deterministic) falls through to
-    # CK/Triton instead of being silently dropped.
-    supported = (
-        get_gfx() == "gfx1250"
+    if not _plain_varlen_mha_features(
+        dropout_p,
+        window_size,
+        block_table,
+        bias,
+        alibi_slopes,
+        sink,
+        deterministic,
+        return_attn_probs,
+    ):
+        return None
+
+    gfx = get_gfx()
+
+    # gfx1250 — varlen THD, D_qk=192 D_v=128, bf16
+    if (
+        gfx == "gfx1250"
         and q.shape[-1] == 192
         and v.shape[-1] == 128
         and q.dtype == torch.bfloat16
-        and dropout_p == 0.0
-        and tuple(window_size[:2]) == (-1, -1)
-        and block_table is None
-        and bias is None
-        and alibi_slopes is None
-        and sink is None
-        and not deterministic
-        and not return_attn_probs
-    )
-    if not supported:
-        return None
+    ):
+        if out is None:
+            out = torch.empty_like(q[:, :, : v.shape[-1]])
+        return flash_attn_varlen_d192_gfx1250(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            out=out,
+            return_lse=return_lse,
+        )
 
-    # gfx1250 — varlen THD, D_qk=192 D_v=128, bf16
-    if out is None:
-        out = torch.empty_like(q[:, :, : v.shape[-1]])
-    return flash_attn_varlen_d192_gfx1250(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        out=out,
-        return_lse=return_lse,
-    )
+    # gfx942 — general QK/V that tile; production stays on ASM until this wins.
+    if (
+        gfx in _GFX942
+        and os.environ.get("AITER_FMHA_FLYDSL_GFX942", "0") == "1"
+        and _gfx942_varlen_supported(q, k, v)
+    ):
+        return flash_attn_varlen_gfx942(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            return_lse=return_lse,
+            out=out,
+        )
+
+    return None

@@ -37,7 +37,12 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
     ),
+    "flash_attn_varlen_gfx942": (
+        ".kernels.fmha_gfx942",
+        "flash_attn_varlen_gfx942",
+    ),
     "flydsl_flash_attn_func": (".fmha_kernels", "flydsl_flash_attn_func"),
+    "flydsl_flash_attn_varlen_func": (".fmha_kernels", "flydsl_flash_attn_varlen_func"),
     "flydsl_fp8_mqa_logits": (
         ".kernels.mqa_logits.fp8_mqa_logits",
         "flydsl_fp8_mqa_logits",
@@ -86,7 +91,9 @@ __all__ = [
     "FP8_MQA_LOGITS_VARIANTS",
     "GateMode",
     "compute_varqlen_windows",
+    "flash_attn_varlen_gfx942",
     "flydsl_flash_attn_func",
+    "flydsl_flash_attn_varlen_func",
     "flydsl_fp8_mqa_logits",
     "flydsl_hgemm",
     "flydsl_mla_prefill_fwd",
