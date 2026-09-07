@@ -114,7 +114,6 @@ def build_fmha_varlen_gfx942_module(
     unsafe_fp_math=True,
     fast_fp_math=True,
     daz=True,
-    dualwave_swp=False,
 ):
     """Build a packed-THD varlen FMHA launcher for gfx942.
 
@@ -139,34 +138,18 @@ def build_fmha_varlen_gfx942_module(
         head_dim_qk, head_dim_v, block_m=block_m, block_n=block_n
     )
 
-    DUALWAVE_SWP = bool(dualwave_swp)
-    if DUALWAVE_SWP and (
-        dtype_str != "bf16"
-        or int(num_heads) != 12
-        or int(num_kv_heads) != 12
-        or int(head_dim_qk) != 192
-        or int(head_dim_v) != 128
-        or bool(causal)
-        or int(block_n) != 64
-    ):
-        raise ValueError(
-            "dualwave_swp requires non-causal packed bf16 H=Hkv=12 "
-            "QK=192 V=128 BLOCK_N=64"
-        )
-
     HEAD_DIM_QK = int(head_dim_qk)
     HEAD_DIM_V = int(head_dim_v)
-    BLOCK_M = 256 if DUALWAVE_SWP else int(block_m)
+    BLOCK_M = int(block_m)
     BLOCK_N = int(block_n)
     RETURN_LSE = bool(return_lse)
     CAUSAL = bool(causal)
     NUM_HEADS_Q = int(num_heads)
     NUM_HEADS_KV = int(num_kv_heads)
     GQA_GROUP_SIZE = NUM_HEADS_Q // NUM_HEADS_KV
-    flat_work_group_size = 512 if DUALWAVE_SWP else BLOCK_SIZE
-    NUM_WAVES = flat_work_group_size // WARP_SIZE
+    flat_work_group_size = BLOCK_SIZE
+    NUM_WAVES = BLOCK_SIZE // WARP_SIZE
     ROWS_PER_WAVE = BLOCK_M // NUM_WAVES
-    WAVES_PER_GROUP = 4
 
     REDUCE_MODE = "xor"
 
@@ -185,16 +168,11 @@ def build_fmha_varlen_gfx942_module(
     STRIDE_TOKEN_O = NUM_HEADS_Q * HEAD_DIM_V
 
     K_PLANES = HEAD_DIM_QK // 32
-    K_BUFFER_COUNT = 3 if DUALWAVE_SWP else K_STAGE_COUNT
-    # Plane 0/1/2 are staged by the preceding VALU phase. Three in-matrix
-    # handoffs publish planes 3..5; the fourth rendezvous closes the phase.
-    PHASE_BARRIERS = K_PLANES - 2
     V_D64_TILES = HEAD_DIM_V // 64
     V_KGROUP_STRIDE = (HEAD_DIM_V // 8) * 72
     V_HALF_TILE_SIZE = 4 * V_KGROUP_STRIDE
 
     LDS_K_TILE_SIZE = k_lds_elems(HEAD_DIM_QK)
-    LDS_K_GROUP_SIZE = K_PLANE_ELEMS * K_BUFFER_COUNT
     LDS_V_TILE_SIZE = v_lds_elems(HEAD_DIM_V, BLOCK_N)
 
     k_allocator = SmemAllocator(
@@ -202,16 +180,15 @@ def build_fmha_varlen_gfx942_module(
         arch=gpu_arch,
         global_sym_name="fmha_varlen_gfx942_k_smem",
     )
-    LDS_GROUPS = 2 if DUALWAVE_SWP else 1
-    k_allocator.ptr = LDS_K_GROUP_SIZE * 2 * LDS_GROUPS
+    k_allocator.ptr = LDS_K_TILE_SIZE * 2
     v_allocator = SmemAllocator(
         None,
         arch=gpu_arch,
         global_sym_name="fmha_varlen_gfx942_v_smem",
     )
-    v_allocator.ptr = LDS_V_TILE_SIZE * 2 * LDS_GROUPS
+    v_allocator.ptr = LDS_V_TILE_SIZE * 2
 
-    @flyc.kernel(known_block_size=[flat_work_group_size, 1, 1])
+    @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def fmha_varlen_gfx942_kernel(
         Q: fx.Tensor,
         K: fx.Tensor,
@@ -265,13 +242,13 @@ def build_fmha_varlen_gfx942_module(
             k_allocator.get_base(),
             0,
             elem_type,
-            shape=(LDS_K_GROUP_SIZE * LDS_GROUPS,),
+            shape=(LDS_K_TILE_SIZE,),
         ).get()
         lds_v = SmemPtr(
             v_allocator.get_base(),
             0,
             elem_type,
-            shape=(LDS_V_TILE_SIZE * LDS_GROUPS,),
+            shape=(LDS_V_TILE_SIZE,),
         ).get()
 
         # ---- Thread / block indices ----
@@ -283,13 +260,6 @@ def build_fmha_varlen_gfx942_module(
         lane = tid % WARP_SIZE
         lane_mod_32 = lane % 32
         lane_div_32 = lane // 32  # 0/1
-        if const_expr(DUALWAVE_SWP):
-            wave_group = wave_id // fx.Index(WAVES_PER_GROUP)
-            wave_in_group = wave_id % fx.Index(WAVES_PER_GROUP)
-        else:
-            # Compile-time constants preserve the original four-wave path.
-            wave_group = fx.Index(0)
-            wave_in_group = wave_id
 
         wave_q_offset = wave_id * ROWS_PER_WAVE
 
@@ -342,16 +312,12 @@ def build_fmha_varlen_gfx942_module(
             )
 
         def k_buf_base(buf_id):
-            group_base = wave_group * fx.Index(LDS_K_GROUP_SIZE)
             if const_expr(isinstance(buf_id, int)):
-                return group_base + fx.Index(buf_id * K_PLANE_ELEMS)
-            return group_base + buf_id * fx.Index(K_PLANE_ELEMS)
+                return fx.Index(buf_id * K_PLANE_ELEMS)
+            return buf_id * fx.Index(K_PLANE_ELEMS)
 
         def v_buf_base(buf_id):
-            return (
-                wave_group * fx.Index(LDS_V_TILE_SIZE)
-                + fx.Index(buf_id * LDS_V_TILE_SIZE)
-            )
+            return fx.Index(buf_id * LDS_V_TILE_SIZE)
 
         def _v_lds_elem_offset(n, d):
             """Padded native V layout, generalized from D=64 to HEAD_DIM_V."""
@@ -396,8 +362,7 @@ def build_fmha_varlen_gfx942_module(
         )
         _lds_ptr3_ty = ir.Type.parse("!llvm.ptr<3>")
         # wave_id is uniform within a wave; pin to SGPR for m0 addressing.
-        dma_wave_id = wave_in_group if DUALWAVE_SWP else wave_id
-        wave_id_u = fx.Index(rocdl.readfirstlane(T.i32, fx.Int32(dma_wave_id)))
+        wave_id_u = fx.Index(rocdl.readfirstlane(T.i32, fx.Int32(wave_id)))
 
         def _swizzle_a(x):
             """Runtime SwizzleA: swap bits 2 and 3 of the N-column index."""
@@ -484,7 +449,7 @@ def build_fmha_varlen_gfx942_module(
             # adjacent rows x four contiguous D values (two b64 loads).
             n_hdim = lane >> fx.Index(2)
             k_within = lane & fx.Index(3)
-            row_in_wave = dma_wave_id * fx.Index(8) + k_within * fx.Index(2)
+            row_in_wave = wave_id * fx.Index(8) + k_within * fx.Index(2)
             row0 = tile_start + fx.Index(n_half * 32) + row_in_wave
             row1 = row0 + fx.Index(1)
             for d64 in range_constexpr(V_D64_TILES):
@@ -511,7 +476,7 @@ def build_fmha_varlen_gfx942_module(
             v_base = v_buf_base(buf_id)
             n_hdim = lane >> fx.Index(2)
             k_within = lane & fx.Index(3)
-            k_in_half = dma_wave_id * fx.Index(8) + k_within * fx.Index(2)
+            k_in_half = wave_id * fx.Index(8) + k_within * fx.Index(2)
             k_pos = fx.Index(n_half * 32) + k_in_half
             for d64 in range_constexpr(V_D64_TILES):
                 load0, load1 = vecs[d64]
@@ -589,116 +554,6 @@ def build_fmha_varlen_gfx942_module(
                 return fx.Float32(ArithValue(peer_i32).bitcast(compute_type))
             return fx.Float32(v_f32).shuffle_xor(shuf_32_i32, width_i32)
 
-        def _phase_barrier():
-            """One compiler-fenced, LDS-visible full-workgroup rendezvous."""
-            rocdl.sched_barrier(0)
-            _lds_handoff_barrier()
-            rocdl.sched_barrier(0)
-
-        wave_group_i32 = rocdl.readfirstlane(T.i32, fx.Int32(wave_group))
-
-        def _wait_one_full_phase(wait_group):
-            """Conditionally hold one wave group for one complete phase."""
-            barriers = "\n".join("s_barrier" for _ in range(PHASE_BARRIERS))
-            llvm.inline_asm(
-                None,
-                [wave_group_i32],
-                (
-                    f"s_cmp_eq_u32 $0, {wait_group}\n"
-                    "s_cbranch_scc0 1f\n"
-                    f"{barriers}\n"
-                    "1:"
-                ),
-                "s,~{memory}",
-                has_side_effects=True,
-            )
-
-        def _phase_pad(count):
-            if const_expr(DUALWAVE_SWP):
-                for _ in range_constexpr(count):
-                    _phase_barrier()
-
-        v_slot = 0
-        v_base = v_buf_base(v_slot)
-        _steps = [
-            (dc, pks)
-            for dc in range(D_CHUNKS)
-            for pks in range(PV_K_STEPS)
-        ]
-
-        def _read_v_pack(step_idx, n_half):
-            dc, pks = _steps[step_idx]
-            d_pos = fx.Index(dc * D_CHUNK) + lane_mod_32
-            k_base_v = (
-                fx.Index((pks // 2) * 16)
-                + lane_div_32 * fx.Index(8)
-                + fx.Index((pks % 2) * 4)
-                + fx.Index(n_half * K_SUB_N)
-            )
-            v_idx = v_base + _v_lds_elem_offset(k_base_v, d_pos)
-            return Vec.load(v4f16_type, lds_v, [v_idx])
-
-        def _apply_pv(p_packs_lo, p_packs_hi, o_accs, corr_vec):
-            if const_expr(CAUSAL):
-                for n_half in range_constexpr(2):
-                    p_packs = p_packs_lo if n_half == 0 else p_packs_hi
-                    v_cur = _read_v_pack(0, n_half)
-                    for si in range_constexpr(len(_steps)):
-                        dc, pks = _steps[si]
-                        if const_expr(si + 1 < len(_steps)):
-                            v_nxt = _read_v_pack(si + 1, n_half)
-                        o_accs[dc] = mfma_acc(
-                            v_cur, p_packs[pks], o_accs[dc]
-                        )
-                        if const_expr(
-                            not DUALWAVE_SWP
-                            and n_half == 0
-                            and D_CHUNKS <= PV_K_STEPS
-                            and dc == 0
-                            and pks < D_CHUNKS - 1
-                        ):
-                            o_accs[pks + 1] = Vec(o_accs[pks + 1]) * corr_vec
-                        if const_expr(si + 1 < len(_steps)):
-                            v_cur = v_nxt
-
-                    for _ in range_constexpr(4):
-                        rocdl.sched_vmem(1)
-                        rocdl.sched_dsrd(2)
-                        rocdl.sched_mfma(4)
-                    rocdl.sched_barrier(0)
-            else:
-                v_lo_cur = _read_v_pack(0, 0)
-                v_hi_cur = _read_v_pack(0, 1)
-                for si in range_constexpr(len(_steps)):
-                    dc, pks = _steps[si]
-                    if const_expr(si + 1 < len(_steps)):
-                        v_lo_nxt = _read_v_pack(si + 1, 0)
-                        v_hi_nxt = _read_v_pack(si + 1, 1)
-                    o_accs[dc] = mfma_acc(
-                        v_lo_cur, p_packs_lo[pks], o_accs[dc]
-                    )
-                    o_accs[dc] = mfma_acc(
-                        v_hi_cur, p_packs_hi[pks], o_accs[dc]
-                    )
-                    if const_expr(
-                        not DUALWAVE_SWP
-                        and D_CHUNKS <= PV_K_STEPS
-                        and dc == 0
-                        and pks < D_CHUNKS - 1
-                    ):
-                        o_accs[pks + 1] = Vec(o_accs[pks + 1]) * corr_vec
-                    if const_expr(si + 1 < len(_steps)):
-                        v_lo_cur = v_lo_nxt
-                        v_hi_cur = v_hi_nxt
-
-                for pv_group in range_constexpr(8):
-                    if const_expr(pv_group % 2 == 0):
-                        rocdl.sched_vmem(1)
-                    rocdl.sched_dsrd(2)
-                    rocdl.sched_mfma(4)
-                rocdl.sched_barrier(0)
-            return o_accs
-
         # ---- KV loop upper bound ----
         _q_end = q_start + BLOCK_M
         _has_q = q_start < q_len
@@ -712,64 +567,21 @@ def build_fmha_varlen_gfx942_module(
         init_args = [c_neg_inf, c_zero_f]
         for _ in range_constexpr(D_CHUNKS):
             init_args.append(c_zero_v16f32)
-        if const_expr(DUALWAVE_SWP):
-            zero_p_pack = Vec.filled(4, 0.0, elem_dtype).ir_value()
-            for _ in range_constexpr(PV_K_STEPS * 2):
-                init_args.append(zero_p_pack)
 
         loop_results = init_args
         _kv_loop_start = fx.Index(0)
         _kv_loop_step = fx.Index(BLOCK_N)
-        if const_expr(DUALWAVE_SWP):
-            # The first delayed PV is algebraically zero. Initialize its private
-            # V tile as well, avoiding any dependence on undefined LDS bits.
-            zero_v4 = Vec.filled(4, 0.0, elem_dtype)
-            group_tid = wave_in_group * fx.Index(WARP_SIZE) + lane
-            for pass_id in range_constexpr(LDS_V_TILE_SIZE // (WAVES_PER_GROUP * WARP_SIZE * 4)):
-                zero_idx = (
-                    v_base
-                    + group_tid * fx.Index(4)
-                    + fx.Index(pass_id * WAVES_PER_GROUP * WARP_SIZE * 4)
-                )
-                Vec.store(zero_v4, lds_v, [zero_idx])
         # Prologue: K tile 0, D-plane 0 into ping stage 0.
         if kv_upper > fx.Index(0):
             coop_load_k(_kv_loop_start, plane=0, buf_id=0)
-            if const_expr(DUALWAVE_SWP):
-                coop_load_k(_kv_loop_start, plane=1, buf_id=1)
-                coop_load_k(_kv_loop_start, plane=2, buf_id=2)
             _waitcnt_vm_n(0)
             gpu.barrier()
-        if const_expr(DUALWAVE_SWP):
-            # Group 0 executes a complete matrix phase before group 1 starts.
-            # Four barriers, rather than the rejected one-plane skew, keep the
-            # phase displacement persistent across the whole KV loop.
-            rocdl.sched_barrier(0)
-            _wait_one_full_phase(1)
-            rocdl.sched_barrier(0)
         for kv_block_start, inner_iter_args in range(
             _kv_loop_start, kv_upper, _kv_loop_step, init=init_args
         ):
             m_running = inner_iter_args[0]
             l_running = inner_iter_args[1]
             o_accs = [inner_iter_args[2 + i] for i in range_constexpr(D_CHUNKS)]
-            if const_expr(DUALWAVE_SWP):
-                p_arg = 2 + D_CHUNKS
-                p_packs_lo_prev = [
-                    inner_iter_args[p_arg + i]
-                    for i in range_constexpr(PV_K_STEPS)
-                ]
-                p_packs_hi_prev = [
-                    inner_iter_args[p_arg + PV_K_STEPS + i]
-                    for i in range_constexpr(PV_K_STEPS)
-                ]
-                rocdl.s_setprio(1)
-                o_accs = _apply_pv(
-                    p_packs_lo_prev,
-                    p_packs_hi_prev,
-                    o_accs,
-                    Vec.from_elements([fx.Float32(1.0)], fx.Float32).broadcast_to(16),
-                )
 
             for kv_sub in range_constexpr(1):
                 kv_start = kv_block_start
@@ -781,26 +593,20 @@ def build_fmha_varlen_gfx942_module(
                 s_acc_lo = c_zero_v16f32
                 s_acc_hi = c_zero_v16f32
                 for plane in range_constexpr(K_PLANES):
-                    stage = plane % K_BUFFER_COUNT
+                    stage = plane % K_STAGE_COUNT
                     k_base = k_buf_base(stage)
-                    next_plane = plane + (2 if DUALWAVE_SWP else 1)
 
                     # While this plane feeds MFMA, copy the next 32-D plane to
                     # the other stage. The previous iteration's fence made the
                     # current stage visible.
-                    if const_expr(
-                        next_plane < K_PLANES
-                        and (not DUALWAVE_SWP or plane > 0)
-                    ):
+                    if const_expr(plane + 1 < K_PLANES):
                         coop_dma_k_plane(
                             kv_start,
-                            next_plane,
-                            next_plane % K_BUFFER_COUNT,
+                            plane + 1,
+                            (plane + 1) % K_STAGE_COUNT,
                         )
                         if const_expr(
-                            not DUALWAVE_SWP
-                            and not CAUSAL
-                            and plane + 2 == K_PLANES
+                            not CAUSAL and plane + 2 == K_PLANES
                         ):
                             # Start context V while plane 4 feeds MFMA. K plane
                             # 5 is older in the VMEM queue, so vmcnt(4) below
@@ -808,13 +614,13 @@ def build_fmha_varlen_gfx942_module(
                             _v_vecs_prefetch = coop_load_v_global(
                                 kv_start, n_half=0
                             )
-                    elif const_expr(not DUALWAVE_SWP):
+                    else:
                         # The second V half overlaps the final plane's MFMAs.
-                        if const_expr(not DUALWAVE_SWP and CAUSAL):
+                        if const_expr(CAUSAL):
                             _v_vecs_prefetch = coop_load_v_global(
                                 kv_start, n_half=0
                             )
-                        elif const_expr(not DUALWAVE_SWP):
+                        else:
                             _v_vecs_hi = coop_load_v_global(
                                 kv_start, n_half=1
                             )
@@ -858,49 +664,22 @@ def build_fmha_varlen_gfx942_module(
                     for _ in range_constexpr(2):
                         rocdl.sched_vmem(
                             4
-                            if (
-                                not DUALWAVE_SWP
-                                and not CAUSAL
-                                and plane + 2 == K_PLANES
-                            )
+                            if not CAUSAL and plane + 2 == K_PLANES
                             else 2
                         )
                         rocdl.sched_dsrd(3)
                         rocdl.sched_mfma(4)
                     rocdl.sched_barrier(0)
 
-                    if const_expr(
-                        next_plane < K_PLANES
-                        and (not DUALWAVE_SWP or plane > 0)
-                    ):
+                    if const_expr(plane + 1 < K_PLANES):
                         _waitcnt_vm_n(
                             4
-                            if (
-                                not DUALWAVE_SWP
-                                and not CAUSAL
-                                and plane + 2 == K_PLANES
-                            )
+                            if not CAUSAL and plane + 2 == K_PLANES
                             else 0
                         )
-                        if const_expr(DUALWAVE_SWP):
-                            _phase_barrier()
-                        else:
-                            gpu.barrier()
-
-                if const_expr(DUALWAVE_SWP):
-                    # Close the four-rendezvous matrix phase (three K-plane
-                    # handoffs above plus this phase boundary).
-                    _phase_barrier()
-                    rocdl.s_setprio(0)
+                        gpu.barrier()
 
                 # ==== Online softmax over 64 KV positions ====
-                if const_expr(DUALWAVE_SWP):
-                    # V and next-tile K staging belong to the VALU phase.
-                    # Their VMEM latency is hidden by exact softmax below.
-                    _v_vecs_prefetch = coop_load_v_global(
-                        kv_start, n_half=0
-                    )
-                    _v_vecs_hi = coop_load_v_global(kv_start, n_half=1)
                 s_raw_lo = []
                 s_raw_hi = []
                 for r in range_constexpr(16):
@@ -1094,7 +873,6 @@ def build_fmha_varlen_gfx942_module(
                 peer_max = reduction_peer(local_max)
                 row_max = _fmax(local_max, peer_max)
                 m_new_raw = _fmax(m_running, row_max)
-                _phase_pad(1)
 
                 diff_m_raw = _fsub(m_running, m_new_raw)
                 diff_m_scaled = _fmul(diff_m_raw, c_sm_scale_log2e)
@@ -1116,7 +894,6 @@ def build_fmha_varlen_gfx942_module(
                     p_lo = fx.Float32(rocdl.exp2(T.f32, _raw(diff_lo)))
                     p_vals_lo.append(p_lo)
                     local_sum = _fadd(local_sum, p_lo)
-                _phase_pad(1)
                 for r in range_constexpr(16):
                     diff_hi = fmath.fma(
                         s_raw_hi[r],
@@ -1127,7 +904,6 @@ def build_fmha_varlen_gfx942_module(
                     p_hi = fx.Float32(rocdl.exp2(T.f32, _raw(diff_hi)))
                     p_vals_hi.append(p_hi)
                     local_sum = _fadd(local_sum, p_hi)
-                _phase_pad(1)
 
                 peer_sum = reduction_peer(local_sum)
                 tile_sum = _fadd(local_sum, peer_sum)
@@ -1135,12 +911,14 @@ def build_fmha_varlen_gfx942_module(
                 l_new = _fadd(l_corr, tile_sum)
 
                 corr_vec = Vec.from_elements([corr], fx.Float32).broadcast_to(16)
-                if const_expr(not DUALWAVE_SWP and D_CHUNKS <= PV_K_STEPS):
+                if const_expr(D_CHUNKS <= PV_K_STEPS):
                     o_accs[0] = _fmul(Vec(o_accs[0]), corr_vec)
                 else:
                     for dc in range_constexpr(D_CHUNKS):
                         o_accs[dc] = _fmul(Vec(o_accs[dc]), corr_vec)
 
+                v_slot = 0
+                v_base = v_buf_base(v_slot)
                 # Context has eight outstanding V loads (four per half).
                 # Retire only half 0 here; keep half 1 in flight while the
                 # first LDS stores issue. Causal has only loaded half 0.
@@ -1159,21 +937,13 @@ def build_fmha_varlen_gfx942_module(
                     coop_dma_k_plane(
                         kv_start + _kv_loop_step, plane=0, buf_id=0
                     )
-                    if const_expr(DUALWAVE_SWP):
-                        coop_dma_k_plane(
-                            kv_start + _kv_loop_step, plane=1, buf_id=1
-                        )
-                        coop_dma_k_plane(
-                            kv_start + _kv_loop_step, plane=2, buf_id=2
-                        )
                     # The four older V-half-1 requests are complete while the
-                    # newly issued K DMAs remain outstanding.
-                    _waitcnt_vm_n(12 if DUALWAVE_SWP else 4)
+                    # four newly issued K DMAs remain outstanding.
+                    _waitcnt_vm_n(4)
                     coop_store_v_lds(
                         _v_vecs_hi, n_half=1, buf_id=v_slot
                     )
-                if const_expr(not DUALWAVE_SWP):
-                    _lds_handoff_barrier()
+                _lds_handoff_barrier()
 
                 if const_expr(dtype_str == "bf16"):
                     p_packs_lo = []
@@ -1228,7 +998,7 @@ def build_fmha_varlen_gfx942_module(
                     v_idx = v_base + _v_lds_elem_offset(k_base_v, d_pos)
                     return Vec.load(v4f16_type, lds_v, [v_idx])
 
-                if const_expr(not DUALWAVE_SWP and CAUSAL):
+                if const_expr(CAUSAL):
                     for n_half in range_constexpr(2):
                         if const_expr(n_half == 1):
                             _waitcnt_vm_n(0)
@@ -1270,7 +1040,7 @@ def build_fmha_varlen_gfx942_module(
                             rocdl.sched_dsrd(2)
                             rocdl.sched_mfma(4)
                         rocdl.sched_barrier(0)
-                elif const_expr(not DUALWAVE_SWP):
+                else:
                     v_lo_cur = _read_v_pack(0, 0)
                     v_hi_cur = _read_v_pack(0, 1)
                     for si in range_constexpr(len(_steps)):
@@ -1306,51 +1076,10 @@ def build_fmha_varlen_gfx942_module(
                 m_running = m_new_raw
                 l_running = l_new
                 _waitcnt_vm_n(0)
-                if const_expr(DUALWAVE_SWP):
-                    # Fourth VALU rendezvous: publishes V(t) and K(t+1)
-                    # while pairing with the partner's matrix boundary.
-                    _phase_barrier()
-                else:
-                    gpu.barrier()  # K(t+1) visible for the next GEMM1
+                gpu.barrier()  # K(t+1) visible for the next GEMM1
 
             _yield_args = [m_running, l_running] + o_accs
-            if const_expr(DUALWAVE_SWP):
-                _yield_args += p_packs_lo + p_packs_hi
             loop_results = yield _yield_args
-
-        if const_expr(DUALWAVE_SWP):
-            # Drain P(last)*V(last) as one final matrix phase. Group 0 then
-            # supplies a complete phase of barriers while group 1 drains.
-            p_arg = 2 + D_CHUNKS
-            p_packs_lo_last = [
-                loop_results[p_arg + i]
-                for i in range_constexpr(PV_K_STEPS)
-            ]
-            p_packs_hi_last = [
-                loop_results[p_arg + PV_K_STEPS + i]
-                for i in range_constexpr(PV_K_STEPS)
-            ]
-            rocdl.s_setprio(1)
-            o_last = [
-                loop_results[2 + i] for i in range_constexpr(D_CHUNKS)
-            ]
-            o_last = _apply_pv(
-                p_packs_lo_last,
-                p_packs_hi_last,
-                o_last,
-                Vec.from_elements([fx.Float32(1.0)], fx.Float32).broadcast_to(16),
-            )
-            for _ in range_constexpr(PHASE_BARRIERS):
-                _phase_barrier()
-            rocdl.s_setprio(0)
-            rocdl.sched_barrier(0)
-            _wait_one_full_phase(0)
-            rocdl.sched_barrier(0)
-            loop_results = (
-                [loop_results[0], loop_results[1]]
-                + o_last
-                + list(loop_results[p_arg:])
-            )
 
         # ---- Normalize and store O (128-bit buffer_store_dwordx4) ----
         # gfx950: pack 4 f32 -> 2 bf16 dwords (cvt_pk_bf16_f32), permlane32_swap fuses
@@ -1436,7 +1165,7 @@ def build_fmha_varlen_gfx942_module(
             },
         ).launch(
             grid=(grid_x, 1, 1),
-            block=(flat_work_group_size, 1, 1),
+            block=(BLOCK_SIZE, 1, 1),
             stream=stream,
         )
 
@@ -1466,7 +1195,6 @@ def _get_launcher(
     block_m: int,
     block_n: int,
     sm_scale: float,
-    dualwave_swp: bool,
 ):
     return build_fmha_varlen_gfx942_module(
         num_heads=num_heads,
@@ -1480,7 +1208,6 @@ def _get_launcher(
         block_n=block_n,
         num_kv_heads=num_kv_heads,
         return_lse=return_lse,
-        dualwave_swp=dualwave_swp,
     )
 
 
@@ -1500,17 +1227,12 @@ def flash_attn_varlen_gfx942(
     block_m: int = DEFAULT_BLOCK_M,
     block_n: int = DEFAULT_BLOCK_N,
     waves_per_eu: int = DEFAULT_WAVES_PER_EU,
-    dualwave_swp: bool = False,
     stream: torch.cuda.Stream | None = None,
 ):
     """Packed-THD varlen FMHA on gfx942.
 
     ``max_seqlen_k`` is accepted to match ``flash_attn_varlen_func``; the kernel
     reads per-batch KV length from ``cu_seqlens_k``.
-
-    ``dualwave_swp=True`` explicitly selects the experimental non-causal
-    bf16 H=12/QK=192/V=128 variant. The default four-wave path and production
-    dispatcher remain unchanged.
     """
     del max_seqlen_k
     if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
@@ -1535,10 +1257,7 @@ def flash_attn_varlen_gfx942(
         )
     if hq % hk != 0:
         raise ValueError(f"num_heads ({hq}) must be divisible by num_kv_heads ({hk})")
-    effective_block_m = 256 if dualwave_swp else block_m
-    validate_fmha_gfx942_tiles(
-        dq, dv, block_m=effective_block_m, block_n=block_n
-    )
+    validate_fmha_gfx942_tiles(dq, dv, block_m=block_m, block_n=block_n)
     if softmax_scale is None:
         softmax_scale = 1.0 / host_math.sqrt(dq)
 
@@ -1573,7 +1292,6 @@ def flash_attn_varlen_gfx942(
         block_m=int(block_m),
         block_n=int(block_n),
         sm_scale=float(softmax_scale),
-        dualwave_swp=bool(dualwave_swp),
     )
     launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
     if launch_stream.device != q.device:

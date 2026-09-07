@@ -41,6 +41,10 @@ _LAZY_IMPORTS = {
         ".kernels.fmha_gfx942",
         "flash_attn_varlen_gfx942",
     ),
+    "flash_attn_varlen_gfx942_pingpong": (
+        ".kernels.fmha_gfx942",
+        "flash_attn_varlen_gfx942_pingpong",
+    ),
     "flydsl_flash_attn_func": (".fmha_kernels", "flydsl_flash_attn_func"),
     "flydsl_flash_attn_varlen_func": (".fmha_kernels", "flydsl_flash_attn_varlen_func"),
     "flydsl_fp8_mqa_logits": (
@@ -92,6 +96,7 @@ __all__ = [
     "GateMode",
     "compute_varqlen_windows",
     "flash_attn_varlen_gfx942",
+    "flash_attn_varlen_gfx942_pingpong",
     "flydsl_flash_attn_func",
     "flydsl_flash_attn_varlen_func",
     "flydsl_fp8_mqa_logits",
