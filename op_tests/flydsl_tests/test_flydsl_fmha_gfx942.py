@@ -24,7 +24,10 @@ import pytest
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl import flash_attn_varlen_gfx942
+from aiter.ops.flydsl import (
+    flash_attn_varlen_gfx942,
+    flash_attn_varlen_gfx942_pingpong,
+)
 from aiter.ops.mha import flash_attn_varlen_func
 from aiter.test_common import checkAllclose, run_perftest
 
@@ -171,6 +174,31 @@ def test_fmha_gfx942_block_n_forwarded():
         q, k, v, cu_q, cu_k, 64, 256, softmax_scale=scale, causal=False, block_n=64
     )
     _assert_close(out_default, out_bn, "block_n forwarded")
+
+
+@pytest.mark.parametrize("coupled_softmax", [False, True])
+def test_fmha_gfx942_pingpong_boundary(coupled_softmax):
+    sq, sk, h = 257, 511, 12
+    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, 192, 128)
+    scale = 1.0 / math.sqrt(192)
+    out_asm = _run_asm(q, k, v, cu_q, cu_k, sq, sk, scale, False)
+    out_fd = flash_attn_varlen_gfx942_pingpong(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        sq,
+        sk,
+        softmax_scale=scale,
+        causal=False,
+        coupled_softmax=coupled_softmax,
+    )
+    _assert_close(
+        out_asm,
+        out_fd,
+        f"pingpong coupled={coupled_softmax} Sq=257 Sk=511",
+    )
 
 
 def run_case(sq: int, sk: int, h: int, causal: bool, *, bench: bool, seed: int = 0):
