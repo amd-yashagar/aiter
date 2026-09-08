@@ -96,3 +96,10 @@ aiter/ops/opus/configs/
 # Debug assembly dumps from csrc/opus_gemm/gen_co/build_co.py. The .co files
 # next to them ARE tracked (the wheel needs them); these are just for analysis.
 csrc/opus_gemm/gen_co/*/asm/
+
+# Local rocprofv3 sessions and regenerated FlyDSL/ISA dump trees
+.rocprofv3/
+asm_experiments/**/*.mlir
+asm_experiments/**/*.ll
+asm_experiments/**/*.s
+asm_experiments/**/*.co
