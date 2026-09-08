@@ -3,10 +3,13 @@
 
 """Opt-in gfx942 packed-varlen FMHA ping-pong experiment.
 
-Two four-wave groups use group-private K/V LDS and a persistent phase skew.
-The exact softmax is the matched control. ``coupled_softmax=True`` selects the
-declared mixed-exp plus BF16 MFMA-denominator treatment. This module is never
-used by production dispatch.
+Two four-wave groups use group-private K/V LDS and a two-rendezvous phase
+skew copied from the FP8 ping-pong skeleton: one cohort streams PV+QK MFMA
+while the partner runs softmax VALU. Mid-plane K barriers are removed; K
+planes 3..5 DMA into already-consumed 3-slot buffers and become visible at
+one rendezvous. The exact softmax is the matched control.
+``coupled_softmax=True`` selects the declared mixed-exp plus BF16
+MFMA-denominator treatment. This module is never used by production dispatch.
 """
 
 from __future__ import annotations
@@ -104,6 +107,8 @@ def build_fmha_pingpong_gfx942_module(
     fast_fp_math=True,
     daz=True,
     dualwave_coupled_softmax=False,
+    rotate_pv_accumulators=False,
+    vop2_o_rescale=False,
 ):
     """Build the fixed-shape packed-THD ping-pong launcher for gfx942."""
     gpu_arch = get_hip_arch()
@@ -126,6 +131,8 @@ def build_fmha_pingpong_gfx942_module(
 
     DUALWAVE_SWP = True
     DUALWAVE_COUPLED_SOFTMAX = bool(dualwave_coupled_softmax)
+    ROTATE_PV_ACCUMULATORS = bool(rotate_pv_accumulators)
+    VOP2_O_RESCALE = bool(vop2_o_rescale)
     if (
         dtype_str != "bf16"
         or int(num_heads) != 12
@@ -171,9 +178,11 @@ def build_fmha_pingpong_gfx942_module(
 
     K_PLANES = HEAD_DIM_QK // 32
     K_BUFFER_COUNT = 3
-    # Plane 0/1/2 are staged by the preceding VALU phase. Three in-matrix
-    # handoffs publish planes 3..5; the fourth rendezvous closes the phase.
-    PHASE_BARRIERS = K_PLANES - 2
+    # Two workgroup rendezvous per KV tile, matching the FP8 ping-pong
+    # skeleton: one publishes K planes 3..5 after QK 0..2, one closes the
+    # phase after QK 3..5 / V+K prefetch. Mid-plane barriers are removed
+    # because those DMAs land in already-consumed 3-slot buffers.
+    PHASE_BARRIERS = 2
     V_D64_TILES = HEAD_DIM_V // 64
     V_KGROUP_STRIDE = (HEAD_DIM_V // 8) * 72
     V_HALF_TILE_SIZE = 4 * V_KGROUP_STRIDE
@@ -226,11 +235,39 @@ def build_fmha_pingpong_gfx942_module(
         def _fadd(a, b):
             return arith.addf(_raw(a), _raw(b), fastmath=fm_fast)
 
+        def _fadd_vop2(a, b):
+            # Non-packed VOP2: v_pk_add_f32 contends with the partner MFMA.
+            return llvm.InlineAsmOp(
+                T.f32,
+                [_raw(a), _raw(b)],
+                "v_add_f32_e32 $0, $1, $2",
+                "=v,v,v",
+                has_side_effects=False,
+            ).res
+
         def _fsub(a, b):
             return arith.subf(_raw(a), _raw(b), fastmath=fm_fast)
 
         def _fmul(a, b):
             return arith.mulf(_raw(a), _raw(b), fastmath=fm_fast)
+
+        def _fmul_vop2(a, b):
+            return llvm.InlineAsmOp(
+                T.f32,
+                [_raw(a), _raw(b)],
+                "v_mul_f32_e32 $0, $1, $2",
+                "=v,v,v",
+                has_side_effects=False,
+            ).res
+
+        def _pin_f32(v):
+            return llvm.InlineAsmOp(
+                T.f32,
+                [_raw(v)],
+                "",
+                "=v,0",
+                has_side_effects=False,
+            ).res
 
         def _fmax(a, b):
             return arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fm_fast).result
@@ -652,11 +689,19 @@ def build_fmha_pingpong_gfx942_module(
 
         v_slot = 0
         v_base = v_buf_base(v_slot)
-        _steps = [
-            (dc, pks)
-            for dc in range(D_CHUNKS)
-            for pks in range(PV_K_STEPS)
-        ]
+        _steps = (
+            [
+                (dc, pks)
+                for pks in range(PV_K_STEPS)
+                for dc in range(D_CHUNKS)
+            ]
+            if ROTATE_PV_ACCUMULATORS
+            else [
+                (dc, pks)
+                for dc in range(D_CHUNKS)
+                for pks in range(PV_K_STEPS)
+            ]
+        )
 
         def _read_v_pack(step_idx, n_half):
             dc, pks = _steps[step_idx]
@@ -774,8 +819,7 @@ def build_fmha_pingpong_gfx942_module(
             gpu.barrier()
         if const_expr(DUALWAVE_SWP):
             # Group 0 executes a complete matrix phase before group 1 starts.
-            # Four barriers, rather than the rejected one-plane skew, keep the
-            # phase displacement persistent across the whole KV loop.
+            # Two barriers match the in-loop PV+QK0-2 / QK3-5 split.
             rocdl.sched_barrier(0)
             _wait_one_full_phase(1)
             rocdl.sched_barrier(0)
@@ -796,6 +840,7 @@ def build_fmha_pingpong_gfx942_module(
                     for i in range_constexpr(PV_K_STEPS)
                 ]
                 rocdl.s_setprio(1)
+                rocdl.sched_barrier(0)
                 o_accs = _apply_pv(
                     p_packs_lo_prev,
                     p_packs_hi_prev,
@@ -817,22 +862,17 @@ def build_fmha_pingpong_gfx942_module(
                     k_base = k_buf_base(stage)
                     next_plane = plane + (2 if DUALWAVE_SWP else 1)
 
-                    # While this plane feeds MFMA, copy the next 32-D plane to
-                    # the other stage. The previous iteration's fence made the
-                    # current stage visible.
-                    if const_expr(
-                        next_plane < K_PLANES
-                        and (not DUALWAVE_SWP or plane > 0)
-                    ):
+                    # 4-wave path: DMA the next plane while this one feeds MFMA.
+                    # Dual-wave path: do not overwrite a live 3-slot buffer;
+                    # planes 3..5 are issued after each of 0..2 is consumed.
+                    if const_expr(not DUALWAVE_SWP and next_plane < K_PLANES):
                         coop_dma_k_plane(
                             kv_start,
                             next_plane,
                             next_plane % K_BUFFER_COUNT,
                         )
                         if const_expr(
-                            not DUALWAVE_SWP
-                            and not CAUSAL
-                            and plane + 2 == K_PLANES
+                            not CAUSAL and plane + 2 == K_PLANES
                         ):
                             # Start context V while plane 4 feeds MFMA. K plane
                             # 5 is older in the VMEM queue, so vmcnt(4) below
@@ -841,12 +881,11 @@ def build_fmha_pingpong_gfx942_module(
                                 kv_start, n_half=0
                             )
                     elif const_expr(not DUALWAVE_SWP):
-                        # The second V half overlaps the final plane's MFMAs.
-                        if const_expr(not DUALWAVE_SWP and CAUSAL):
+                        if const_expr(CAUSAL):
                             _v_vecs_prefetch = coop_load_v_global(
                                 kv_start, n_half=0
                             )
-                        elif const_expr(not DUALWAVE_SWP):
+                        else:
                             _v_vecs_hi = coop_load_v_global(
                                 kv_start, n_half=1
                             )
@@ -901,27 +940,29 @@ def build_fmha_pingpong_gfx942_module(
                         rocdl.sched_mfma(4)
                     rocdl.sched_barrier(0)
 
-                    if const_expr(
-                        next_plane < K_PLANES
-                        and (not DUALWAVE_SWP or plane > 0)
-                    ):
+                    if const_expr(DUALWAVE_SWP):
+                        # Buffer plane%3 is now free. Overlap K(plane+3) DMA
+                        # with later MFMAs; one barrier publishes all three.
+                        dma_plane = plane + K_BUFFER_COUNT
+                        if const_expr(dma_plane < K_PLANES):
+                            coop_dma_k_plane(
+                                kv_start,
+                                dma_plane,
+                                dma_plane % K_BUFFER_COUNT,
+                            )
+                        if const_expr(plane + 1 == K_BUFFER_COUNT):
+                            _waitcnt_vm_n(0)
+                            _phase_barrier()
+                    elif const_expr(next_plane < K_PLANES):
                         _waitcnt_vm_n(
                             4
-                            if (
-                                not DUALWAVE_SWP
-                                and not CAUSAL
-                                and plane + 2 == K_PLANES
-                            )
+                            if (not CAUSAL and plane + 2 == K_PLANES)
                             else 0
                         )
-                        if const_expr(DUALWAVE_SWP):
-                            _phase_barrier()
-                        else:
-                            gpu.barrier()
+                        gpu.barrier()
 
                 if const_expr(DUALWAVE_SWP):
-                    # Close the four-rendezvous matrix phase (three K-plane
-                    # handoffs above plus this phase boundary).
+                    # Close the two-rendezvous matrix phase.
                     _phase_barrier()
                     rocdl.s_setprio(0)
 
@@ -1126,7 +1167,6 @@ def build_fmha_pingpong_gfx942_module(
                 peer_max = reduction_peer(local_max)
                 row_max = _fmax(local_max, peer_max)
                 m_new_raw = _fmax(m_running, row_max)
-                _phase_pad(1)
 
                 diff_m_raw = _fsub(m_running, m_new_raw)
                 diff_m_scaled = _fmul(diff_m_raw, c_sm_scale_log2e)
@@ -1146,13 +1186,17 @@ def build_fmha_pingpong_gfx942_module(
                         fastmath=fm_fast,
                     )
                     p_lo = fx.Float32(rocdl.exp2(T.f32, _raw(diff_lo)))
+                    if const_expr(DUALWAVE_SWP):
+                        p_lo = fx.Float32(_pin_f32(p_lo))
                     p_vals_lo.append(p_lo)
-                    local_sum = _fadd(local_sum, p_lo)
+                    if const_expr(DUALWAVE_SWP):
+                        local_sum = _fadd_vop2(local_sum, p_lo)
+                    else:
+                        local_sum = _fadd(local_sum, p_lo)
                 if const_expr(DUALWAVE_COUPLED_SOFTMAX):
                     p_packs_lo, denominator_lo = denominator_mfma_half(
                         p_vals_lo
                     )
-                _phase_pad(1)
                 for r in range_constexpr(16):
                     if const_expr(
                         DUALWAVE_COUPLED_SOFTMAX and r >= 4
@@ -1170,13 +1214,17 @@ def build_fmha_pingpong_gfx942_module(
                         p_hi = fx.Float32(
                             rocdl.exp2(T.f32, _raw(diff_hi))
                         )
+                    if const_expr(DUALWAVE_SWP):
+                        p_hi = fx.Float32(_pin_f32(p_hi))
                     p_vals_hi.append(p_hi)
-                    local_sum = _fadd(local_sum, p_hi)
+                    if const_expr(DUALWAVE_SWP):
+                        local_sum = _fadd_vop2(local_sum, p_hi)
+                    else:
+                        local_sum = _fadd(local_sum, p_hi)
                 if const_expr(DUALWAVE_COUPLED_SOFTMAX):
                     p_packs_hi, denominator_hi = denominator_mfma_half(
                         p_vals_hi
                     )
-                _phase_pad(1)
 
                 if const_expr(DUALWAVE_COUPLED_SOFTMAX):
                     tile_sum = _fadd(denominator_lo, denominator_hi)
@@ -1191,7 +1239,19 @@ def build_fmha_pingpong_gfx942_module(
                     o_accs[0] = _fmul(Vec(o_accs[0]), corr_vec)
                 else:
                     for dc in range_constexpr(D_CHUNKS):
-                        o_accs[dc] = _fmul(Vec(o_accs[dc]), corr_vec)
+                        if const_expr(VOP2_O_RESCALE):
+                            o_accs[dc] = Vec.from_elements(
+                                [
+                                    _fmul_vop2(Vec(o_accs[dc])[i], corr)
+                                    for i in range_constexpr(16)
+                                ],
+                                fx.Float32,
+                            )
+                        else:
+                            o_accs[dc] = _fmul(Vec(o_accs[dc]), corr_vec)
+
+                # Match the matrix-side visibility barrier after QK planes 0..2.
+                _phase_pad(1)
 
                 # Context has eight outstanding V loads (four per half).
                 # Retire only half 0 here; keep half 1 in flight while the
@@ -1364,8 +1424,8 @@ def build_fmha_pingpong_gfx942_module(
                 l_running = l_new
                 _waitcnt_vm_n(0)
                 if const_expr(DUALWAVE_SWP):
-                    # Fourth VALU rendezvous: publishes V(t) and K(t+1)
-                    # while pairing with the partner's matrix boundary.
+                    # Second VALU rendezvous: publishes V(t) and K(t+1)
+                    # planes 0..2 while pairing with the partner's QK 3..5 close.
                     _phase_barrier()
                 else:
                     gpu.barrier()  # K(t+1) visible for the next GEMM1
@@ -1388,6 +1448,7 @@ def build_fmha_pingpong_gfx942_module(
                 for i in range_constexpr(PV_K_STEPS)
             ]
             rocdl.s_setprio(1)
+            rocdl.sched_barrier(0)
             o_last = [
                 loop_results[2 + i] for i in range_constexpr(D_CHUNKS)
             ]
@@ -1522,6 +1583,8 @@ def _get_pingpong_launcher(
     waves_per_eu: int,
     sm_scale: float,
     dualwave_coupled_softmax: bool,
+    rotate_pv_accumulators: bool,
+    vop2_o_rescale: bool,
 ):
     return build_fmha_pingpong_gfx942_module(
         num_heads=num_heads,
@@ -1534,6 +1597,8 @@ def _get_pingpong_launcher(
         num_kv_heads=num_kv_heads,
         return_lse=return_lse,
         dualwave_coupled_softmax=dualwave_coupled_softmax,
+        rotate_pv_accumulators=rotate_pv_accumulators,
+        vop2_o_rescale=vop2_o_rescale,
     )
 
 
@@ -1552,6 +1617,8 @@ def flash_attn_varlen_gfx942_pingpong(
     *,
     waves_per_eu: int = DEFAULT_WAVES_PER_EU,
     coupled_softmax: bool = False,
+    rotate_pv_accumulators: bool = False,
+    vop2_o_rescale: bool = False,
     stream: torch.cuda.Stream | None = None,
 ):
     """Run the opt-in gfx942 packed-THD ping-pong experiment.
@@ -1633,6 +1700,8 @@ def flash_attn_varlen_gfx942_pingpong(
         waves_per_eu=int(waves_per_eu),
         sm_scale=float(softmax_scale),
         dualwave_coupled_softmax=bool(coupled_softmax),
+        rotate_pv_accumulators=bool(rotate_pv_accumulators),
+        vop2_o_rescale=bool(vop2_o_rescale),
     )
     launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
     if launch_stream.device != q.device:

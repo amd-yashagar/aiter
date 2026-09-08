@@ -22,6 +22,7 @@ os.environ.setdefault("FLYDSL_DUMP_IR", "1")
 import torch
 
 from aiter.ops.flydsl import flash_attn_varlen_gfx942_pingpong
+from aiter.ops.mha import flash_attn_varlen_func
 
 
 def _cpu_bf16_randn(shape, generator):
@@ -35,6 +36,12 @@ def main() -> int:
         action="store_true",
         help="capture the exact ping-pong control instead of the coupled treatment",
     )
+    parser.add_argument(
+        "--optimized-overlap",
+        action="store_true",
+        help="capture the combined overlap treatment",
+    )
+    parser.add_argument("--check", action="store_true")
     parser.add_argument("--sq", type=int, default=4096)
     parser.add_argument("--sk", type=int, default=42700)
     parser.add_argument("--seed", type=int, default=0)
@@ -53,6 +60,24 @@ def main() -> int:
     out = torch.empty((args.sq, h, dv), dtype=torch.bfloat16, device="cuda")
     torch.cuda.synchronize()
 
+    if args.exact and args.optimized_overlap:
+        parser.error("--exact and --optimized-overlap are mutually exclusive")
+
+    ref = None
+    if args.check:
+        ref, _ = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            args.sq,
+            args.sk,
+            softmax_scale=1.0 / math.sqrt(dq),
+            causal=False,
+            return_lse=True,
+        )
+
     flash_attn_varlen_gfx942_pingpong(
         q,
         k,
@@ -65,11 +90,27 @@ def main() -> int:
         causal=False,
         out=out,
         coupled_softmax=not args.exact,
+        rotate_pv_accumulators=args.optimized_overlap,
+        vop2_o_rescale=False,
     )
     torch.cuda.synchronize()
+    if ref is not None:
+        ref64 = ref.double()
+        out64 = out.double()
+        cos_diff = 1.0 - 2.0 * (ref64 * out64).sum().item() / max(
+            (ref64.square() + out64.square()).sum().item(),
+            1e-12,
+        )
+        if not math.isfinite(cos_diff) or cos_diff >= 1e-4:
+            raise RuntimeError(
+                f"FMHA ping-pong correctness failed: cos_diff={cos_diff:.3e}"
+            )
+        print(f"PASS: fmha_pingpong_gfx942 cos_diff={cos_diff:.3e}")
+
     print(
         "dispatched fmha_pingpong_gfx942_kernel once; "
-        f"coupled_softmax={not args.exact}"
+        f"coupled_softmax={not args.exact}; "
+        f"optimized_overlap={args.optimized_overlap}"
     )
     return 0
 
