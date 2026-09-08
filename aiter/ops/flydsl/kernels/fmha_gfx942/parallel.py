@@ -31,7 +31,7 @@ _EMPTY_LSE = -1.0e30
 
 
 # Prefer fewer splits when modeled time is within this relative band of the
-# minimum. Prologue, ping-pong stagger, and the host combine dominate once
+# minimum. Prologue, ping-pong stagger, and the split combine dominate once
 # each workgroup's KV walk is short, so a 5–10% arithmetic win is not real.
 _SPLIT_COST_REL_TOL = 0.10
 
@@ -76,6 +76,22 @@ def choose_kv_splits(
     return 1
 
 
+def _combine_split_kv_eager(
+    o_parts: torch.Tensor,
+    lse_parts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch fallback when the fused bf16 kernel cannot run."""
+    lse_f = lse_parts.float()
+    o_f = o_parts.float()
+    lse_max = lse_f.amax(dim=0)
+    alpha = (lse_f - lse_max).exp()
+    denom = alpha.sum(dim=0).clamp_min(1e-20)
+    weight = (alpha / denom).permute(0, 2, 1).unsqueeze(-1)
+    out = (o_f * weight).sum(dim=0).to(o_parts.dtype)
+    lse = lse_max + denom.log()
+    return out, lse
+
+
 def combine_split_kv(
     o_parts: torch.Tensor,
     lse_parts: torch.Tensor,
@@ -85,12 +101,35 @@ def combine_split_kv(
     ``o_parts`` is ``[S, T, H, D]`` (already divided by each split's ``l``).
     ``lse_parts`` is ``[S, H, T]`` with empty splits at ``_EMPTY_LSE``.
     """
-    lse_f = lse_parts.float()
-    o_f = o_parts.float()
-    lse_max = lse_f.amax(dim=0)
-    alpha = (lse_f - lse_max).exp()
-    denom = alpha.sum(dim=0).clamp_min(1e-20)
-    weight = (alpha / denom).permute(0, 2, 1).unsqueeze(-1)
-    out = (o_f * weight).sum(dim=0).to(o_parts.dtype)
-    lse = lse_max + denom.log()
+    splits, seqlen_q, num_heads, head_dim = o_parts.shape
+    can_fuse = (
+        o_parts.dtype == torch.bfloat16
+        and o_parts.is_cuda
+        and lse_parts.is_cuda
+        and splits >= 2
+        and head_dim % 8 == 0
+        and tuple(lse_parts.shape) == (splits, num_heads, seqlen_q)
+    )
+    if not can_fuse:
+        return _combine_split_kv_eager(o_parts, lse_parts)
+
+    # Imported lazily so ``choose_kv_splits`` does not pull the FlyDSL compiler.
+    from aiter.ops.flydsl.kernels.fmha_gfx942.combine import run_fused_combine
+
+    o_parts = o_parts.contiguous()
+    lse_parts = lse_parts.contiguous()
+    out = torch.empty(
+        seqlen_q,
+        num_heads,
+        head_dim,
+        device=o_parts.device,
+        dtype=o_parts.dtype,
+    )
+    lse = torch.empty(
+        num_heads,
+        seqlen_q,
+        device=o_parts.device,
+        dtype=torch.float32,
+    )
+    run_fused_combine(o_parts, lse_parts, out, lse)
     return out, lse
