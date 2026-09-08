@@ -57,6 +57,10 @@ from aiter.ops.flydsl.kernels.fmha_gfx942.config import (
     validate_fmha_gfx942_tiles,
     v_lds_elems,
 )
+from aiter.ops.flydsl.kernels.fmha_gfx942.parallel import (
+    choose_kv_splits,
+    combine_split_kv,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 _LOG2E = host_math.log2(host_math.e)
@@ -111,6 +115,7 @@ def build_fmha_varlen_gfx942_module(
     block_n=DEFAULT_BLOCK_N,
     num_kv_heads=None,
     return_lse=False,
+    num_kv_splits=1,
     unsafe_fp_math=True,
     fast_fp_math=True,
     daz=True,
@@ -144,6 +149,7 @@ def build_fmha_varlen_gfx942_module(
     BLOCK_N = int(block_n)
     RETURN_LSE = bool(return_lse)
     CAUSAL = bool(causal)
+    NUM_KV_SPLITS = max(1, int(num_kv_splits))
     NUM_HEADS_Q = int(num_heads)
     NUM_HEADS_KV = int(num_kv_heads)
     GQA_GROUP_SIZE = NUM_HEADS_Q // NUM_HEADS_KV
@@ -263,8 +269,13 @@ def build_fmha_varlen_gfx942_module(
 
         wave_q_offset = wave_id * ROWS_PER_WAVE
 
-        q_head_idx = block_id % NUM_HEADS_Q
-        batch_q_tile_id = block_id // NUM_HEADS_Q
+        work_id = block_id
+        kv_split_id = fx.Index(0)
+        if const_expr(NUM_KV_SPLITS > 1):
+            kv_split_id = block_id % fx.Index(NUM_KV_SPLITS)
+            work_id = block_id // fx.Index(NUM_KV_SPLITS)
+        q_head_idx = work_id % NUM_HEADS_Q
+        batch_q_tile_id = work_id // NUM_HEADS_Q
         num_q_tiles = (max_sq + BLOCK_M - 1) // BLOCK_M
         q_tile_idx = batch_q_tile_id % num_q_tiles
         batch_idx = batch_q_tile_id // num_q_tiles
@@ -512,7 +523,10 @@ def build_fmha_varlen_gfx942_module(
         _q_nrec_bytes = _raw(q_len * fx.Index(STRIDE_TOKEN_Q * 2))
         _o_nrec_bytes = _raw(q_len * fx.Index(STRIDE_TOKEN_O * 2))
         _q_batch_byte_off = _raw(q0 * fx.Index(STRIDE_TOKEN_Q * 2))
-        _o_batch_byte_off = _raw(q0 * fx.Index(STRIDE_TOKEN_O * 2))
+        _o_split_byte_off = kv_split_id * total_q_v * fx.Index(STRIDE_TOKEN_O * 2)
+        _o_batch_byte_off = _raw(
+            q0 * fx.Index(STRIDE_TOKEN_O * 2) + _o_split_byte_off
+        )
         q_rsrc = buffer_ops.create_buffer_resource(
             Q, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
         )
@@ -554,25 +568,42 @@ def build_fmha_varlen_gfx942_module(
                 return fx.Float32(ArithValue(peer_i32).bitcast(compute_type))
             return fx.Float32(v_f32).shuffle_xor(shuf_32_i32, width_i32)
 
-        # ---- KV loop upper bound ----
+        # ---- KV loop bounds (optional split-K tile slice) ----
         _q_end = q_start + BLOCK_M
         _has_q = q_start < q_len
+        kv_tiles = (seq_len_v + fx.Index(BLOCK_N - 1)) // fx.Index(BLOCK_N)
+        tiles_per_split = (
+            kv_tiles + fx.Index(NUM_KV_SPLITS - 1)
+        ) // fx.Index(NUM_KV_SPLITS)
+        tile_lo = kv_split_id * tiles_per_split
+        _tile_hi_raw = tile_lo + tiles_per_split
+        tile_hi = fx.Index(
+            ArithValue(_tile_hi_raw < kv_tiles).select(_tile_hi_raw, kv_tiles)
+        )
+        _kv_loop_start = tile_lo * fx.Index(BLOCK_N)
+        _split_end = tile_hi * fx.Index(BLOCK_N)
+        _split_end = fx.Index(
+            ArithValue(_split_end < seq_len_v).select(_split_end, seq_len_v)
+        )
         if const_expr(CAUSAL):
             _causal_end = _q_end + (seq_len_v - q_len)
-            _kv_cap = fx.Index(ArithValue(_causal_end < seq_len_v).select(_causal_end, seq_len_v))
+            _kv_cap = fx.Index(
+                ArithValue(_causal_end < _split_end).select(_causal_end, _split_end)
+            )
         else:
-            _kv_cap = seq_len_v
-        kv_upper = fx.Index(ArithValue(_has_q).select(_kv_cap, fx.Index(0)))
+            _kv_cap = _split_end
+        kv_upper = fx.Index(
+            ArithValue(_has_q).select(_kv_cap, _kv_loop_start)
+        )
 
         init_args = [c_neg_inf, c_zero_f]
         for _ in range_constexpr(D_CHUNKS):
             init_args.append(c_zero_v16f32)
 
         loop_results = init_args
-        _kv_loop_start = fx.Index(0)
         _kv_loop_step = fx.Index(BLOCK_N)
         # Prologue: K tile 0, D-plane 0 into ping stage 0.
-        if kv_upper > fx.Index(0):
+        if kv_upper > _kv_loop_start:
             coop_load_k(_kv_loop_start, plane=0, buf_id=0)
             _waitcnt_vm_n(0)
             gpu.barrier()
@@ -1087,28 +1118,64 @@ def build_fmha_varlen_gfx942_module(
         # num_records-bounded (o_rsrc) -> partial-q-tile OOB rows drop.
         l_final = loop_results[1]
         o_finals = [loop_results[2 + dc] for dc in range_constexpr(D_CHUNKS)]
+        packed_q = q0 + q_row
+        lse_idx = (
+            kv_split_id * fx.Index(NUM_HEADS_Q) * total_q_v
+            + q_head_idx * total_q_v
+            + packed_q
+        )
+        has_kv = kv_upper > _kv_loop_start
+        if has_kv:
+            inv_l = rocdl.rcp(T.f32, l_final)
+            inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(16)
+            v_o = [Vec(o_finals[dc]) * inv_l_vec for dc in range_constexpr(D_CHUNKS)]
 
-        inv_l = rocdl.rcp(T.f32, l_final)
-        inv_l_vec = Vec.from_elements([inv_l], fx.Float32).broadcast_to(16)
-        v_o = [Vec(o_finals[dc]) * inv_l_vec for dc in range_constexpr(D_CHUNKS)]
+            for dc in range_constexpr(D_CHUNKS):
+                for grp in range_constexpr(4):
+                    r0 = grp * 4
+                    o_f16 = [
+                        fx.Float32(Vec(v_o[dc])[r0 + i]).to(elem_dtype)
+                        for i in range_constexpr(4)
+                    ]
+                    pack = Vec.from_elements(o_f16, elem_dtype).bitcast(fx.Int32)
+                    o2 = Vec.from_elements([_raw(pack[0]), _raw(pack[1])], fx.Int32)
+                    d_col = (
+                        fx.Index(dc * D_CHUNK)
+                        + lane_div_32 * fx.Index(4)
+                        + fx.Index(grp * 8)
+                    )
+                    o_global = global_idx_o(q_row, d_col)
+                    buffer_ops.buffer_store(
+                        o2, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True
+                    )
 
-        for dc in range_constexpr(D_CHUNKS):
-            for grp in range_constexpr(4):
-                r0 = grp * 4
-                o_f16 = [fx.Float32(Vec(v_o[dc])[r0 + i]).to(elem_dtype) for i in range_constexpr(4)]
-                pack = Vec.from_elements(o_f16, elem_dtype).bitcast(fx.Int32)
-                o2 = Vec.from_elements([_raw(pack[0]), _raw(pack[1])], fx.Int32)
-                d_col = fx.Index(dc * D_CHUNK) + lane_div_32 * fx.Index(4) + fx.Index(grp * 8)
-                o_global = global_idx_o(q_row, d_col)
-                buffer_ops.buffer_store(o2, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True)
-
-        if const_expr(RETURN_LSE):
-            if q_row < q_len:
-                log_l = fmath.log(_raw(l_final), fastmath=fm_fast)
-                lse_val = _fadd(_fmul(loop_results[0], fx.Float32(sm_scale)), log_l)
-                packed_q = q0 + q_row
-                lse_idx = q_head_idx * total_q_v + packed_q
-                buffer_ops.buffer_store(fx.Float32(lse_val), lse_rsrc, lse_idx)
+            if const_expr(RETURN_LSE):
+                if q_row < q_len:
+                    log_l = fmath.log(_raw(l_final), fastmath=fm_fast)
+                    lse_val = _fadd(
+                        _fmul(loop_results[0], fx.Float32(sm_scale)), log_l
+                    )
+                    buffer_ops.buffer_store(
+                        fx.Float32(lse_val), lse_rsrc, lse_idx
+                    )
+        else:
+            zero_o2 = Vec.from_elements([fx.Int32(0), fx.Int32(0)], fx.Int32)
+            for dc in range_constexpr(D_CHUNKS):
+                for grp in range_constexpr(4):
+                    d_col = (
+                        fx.Index(dc * D_CHUNK)
+                        + lane_div_32 * fx.Index(4)
+                        + fx.Index(grp * 8)
+                    )
+                    o_global = global_idx_o(q_row, d_col)
+                    buffer_ops.buffer_store(
+                        zero_o2, o_rsrc, o_global * fx.Index(2), offset_is_bytes=True
+                    )
+            if const_expr(RETURN_LSE):
+                if q_row < q_len:
+                    buffer_ops.buffer_store(
+                        fx.Float32(-1.0e30), lse_rsrc, lse_idx
+                    )
 
 
     @flyc.jit
@@ -1135,7 +1202,9 @@ def build_fmha_varlen_gfx942_module(
         bs_idx = fx.Index(batch_size)
         sl_idx = fx.Index(max_seqlen_q)
         num_q_tiles = (sl_idx + BLOCK_M - 1) // BLOCK_M
-        grid_x = bs_idx * num_q_tiles * NUM_HEADS_Q
+        grid_x = (
+            bs_idx * num_q_tiles * NUM_HEADS_Q * fx.Index(NUM_KV_SPLITS)
+        )
 
         passthrough_entries = (
             [
@@ -1195,6 +1264,7 @@ def _get_launcher(
     block_m: int,
     block_n: int,
     sm_scale: float,
+    num_kv_splits: int,
 ):
     return build_fmha_varlen_gfx942_module(
         num_heads=num_heads,
@@ -1208,6 +1278,7 @@ def _get_launcher(
         block_n=block_n,
         num_kv_heads=num_kv_heads,
         return_lse=return_lse,
+        num_kv_splits=num_kv_splits,
     )
 
 
@@ -1227,14 +1298,15 @@ def flash_attn_varlen_gfx942(
     block_m: int = DEFAULT_BLOCK_M,
     block_n: int = DEFAULT_BLOCK_N,
     waves_per_eu: int = DEFAULT_WAVES_PER_EU,
+    kv_splits: int | None = None,
     stream: torch.cuda.Stream | None = None,
 ):
     """Packed-THD varlen FMHA on gfx942.
 
-    ``max_seqlen_k`` is accepted to match ``flash_attn_varlen_func``; the kernel
-    reads per-batch KV length from ``cu_seqlens_k``.
+    ``kv_splits=None`` chooses a split-K factor that fills gfx942 CUs. Pass
+    ``1`` to disable splitting. ``max_seqlen_k`` is used for that choice; the
+    kernel still reads per-batch KV length from ``cu_seqlens_k``.
     """
-    del max_seqlen_k
     if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
         raise ValueError("q/k/v must be packed THD [total, H, D]")
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
@@ -1266,20 +1338,48 @@ def flash_attn_varlen_gfx942(
     v = v.contiguous()
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
     cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
-    if out is None:
-        out = torch.empty(total_q, hq, dv, device=q.device, dtype=q.dtype)
-    else:
-        out = out.contiguous()
-        if tuple(out.shape) != (total_q, hq, dv):
-            raise ValueError(
-                f"out shape {tuple(out.shape)} != {(total_q, hq, dv)}"
-            )
-    if return_lse:
-        lse = torch.empty(hq, total_q, device=q.device, dtype=torch.float32)
-    else:
-        lse = torch.empty(1, device=q.device, dtype=torch.float32)
-
     batch = int(cu_seqlens_q.numel() - 1)
+    if kv_splits is None:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        kv_splits = choose_kv_splits(
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            num_heads=int(hq),
+            block_m=int(block_m),
+            block_n=int(block_n),
+            cu_count=int(get_cu_num()),
+            batch=batch,
+        )
+    kv_splits = max(1, int(kv_splits))
+    want_lse = bool(return_lse)
+    kernel_lse = want_lse or kv_splits > 1
+    caller_out = out
+    if kv_splits > 1:
+        out_parts = torch.empty(
+            kv_splits, total_q, hq, dv, device=q.device, dtype=q.dtype
+        )
+        lse_parts = torch.empty(
+            kv_splits, hq, total_q, device=q.device, dtype=torch.float32
+        )
+        kernel_out = out_parts.reshape(kv_splits * total_q, hq, dv)
+        kernel_lse_buf = lse_parts.reshape(kv_splits * hq, total_q)
+    else:
+        if caller_out is None:
+            out = torch.empty(total_q, hq, dv, device=q.device, dtype=q.dtype)
+        else:
+            out = caller_out.contiguous()
+            if tuple(out.shape) != (total_q, hq, dv):
+                raise ValueError(
+                    f"out shape {tuple(out.shape)} != {(total_q, hq, dv)}"
+                )
+        kernel_out = out
+        if kernel_lse:
+            lse = torch.empty(hq, total_q, device=q.device, dtype=torch.float32)
+        else:
+            lse = torch.empty(1, device=q.device, dtype=torch.float32)
+        kernel_lse_buf = lse
+
     exe = _get_launcher(
         num_heads=int(hq),
         num_kv_heads=int(hk),
@@ -1287,11 +1387,12 @@ def flash_attn_varlen_gfx942(
         head_dim_v=int(dv),
         causal=bool(causal),
         dtype_str=dtype_str,
-        return_lse=bool(return_lse),
+        return_lse=bool(kernel_lse),
         waves_per_eu=int(waves_per_eu),
         block_m=int(block_m),
         block_n=int(block_n),
         sm_scale=float(softmax_scale),
+        num_kv_splits=int(kv_splits),
     )
     launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
     if launch_stream.device != q.device:
@@ -1302,8 +1403,8 @@ def flash_attn_varlen_gfx942(
             q,
             k,
             v,
-            out,
-            lse,
+            kernel_out,
+            kernel_lse_buf,
             cu_seqlens_q,
             cu_seqlens_k,
             batch,
@@ -1311,6 +1412,11 @@ def flash_attn_varlen_gfx942(
             int(total_q),
             launch_stream,
         )
-    if return_lse:
+    if kv_splits > 1:
+        out, lse = combine_split_kv(out_parts, lse_parts)
+        if caller_out is not None:
+            caller_out.copy_(out)
+            out = caller_out
+    if want_lse:
         return out, lse
     return out
