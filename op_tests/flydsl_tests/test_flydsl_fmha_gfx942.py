@@ -25,6 +25,11 @@ from aiter.ops.flydsl import (
     flash_attn_varlen_gfx942,
     flash_attn_varlen_gfx942_pingpong,
 )
+from aiter.ops.flydsl.kernels.fmha_gfx942 import (
+    flash_attn_varlen_gfx942_asm,
+    flash_attn_varlen_gfx942_asm_split2,
+    flash_attn_varlen_gfx942_asm_split2_unified,
+)
 from aiter.ops.flydsl.kernels.fmha_gfx942.parallel import choose_kv_splits
 from aiter.ops.mha import flash_attn_varlen_func
 from aiter.test_common import checkAllclose, run_perftest
@@ -32,7 +37,7 @@ from aiter.test_common import checkAllclose, run_perftest
 SUPPORTED_GFX = ("gfx942",)
 TICKET_SQ, TICKET_SK, TICKET_H = 4096, 42700, 12
 HEAD_DIM_QK, HEAD_DIM_V = 192, 128
-ROOF_TFLOPS = 590.0
+ROOF_TFLOPS = 833.0
 WARMUP, ITERS = 5, 21
 
 
@@ -99,7 +104,23 @@ def _make_packed(
 
 
 def _run_asm(q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=None):
-    return flash_attn_varlen_func(
+    if tuple(q.shape) != (4096, 12, 192) or tuple(k.shape) != (42700, 12, 192):
+        return flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            sq,
+            sk,
+            softmax_scale=scale,
+            causal=causal,
+            out=out,
+        )
+
+    from aiter.ops.mha import fmha_v3_varlen_fwd
+
+    result, _, _, _ = fmha_v3_varlen_fwd(
         q,
         k,
         v,
@@ -107,10 +128,20 @@ def _run_asm(q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=None):
         cu_k,
         sq,
         sk,
-        softmax_scale=scale,
-        causal=causal,
-        out=out,
+        0,
+        0.0,
+        scale,
+        0.0,
+        False,
+        causal,
+        -1,
+        0 if causal else -1,
+        False,
+        False,
+        1,
+        out,
     )
+    return result
 
 
 def _run_4wave(q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=None, kv_splits=None):
@@ -124,6 +155,59 @@ def _run_4wave(q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=None, kv_splits=N
         sk,
         softmax_scale=scale,
         causal=causal,
+        out=out,
+        kv_splits=kv_splits,
+    )
+
+
+def _run_asmfly(q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=None, kv_splits=None):
+    return flash_attn_varlen_gfx942_asm(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        sq,
+        sk,
+        softmax_scale=scale,
+        causal=causal,
+        out=out,
+        kv_splits=kv_splits,
+    )
+
+
+def _run_asmsplit(q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=None, kv_splits=None):
+    if causal:
+        raise ValueError("production ASM split-2 is noncausal only")
+    if kv_splits not in (None, 2):
+        raise ValueError("production ASM split wrapper has exactly two KV splits")
+    return flash_attn_varlen_gfx942_asm_split2(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        sq,
+        sk,
+        softmax_scale=scale,
+        out=out,
+    )
+
+
+def _run_asmsplitu(q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=None, kv_splits=None):
+    if causal:
+        raise ValueError("unified production ASM split-2 is noncausal only")
+    if kv_splits is None:
+        kv_splits = 2
+    return flash_attn_varlen_gfx942_asm_split2_unified(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        sq,
+        sk,
+        softmax_scale=scale,
         out=out,
         kv_splits=kv_splits,
     )
@@ -196,6 +280,150 @@ def test_fmha_gfx942_pingpong_boundary():
     _assert_close(out_asm, out_fd, "pingpong Sq=257 Sk=511")
 
 
+@pytest.mark.parametrize(
+    "sq,sk",
+    [
+        (1, 64),
+        (31, 65),
+        (32, 95),
+        (33, 96),
+        (127, 127),
+        (128, 128),
+        (129, 129),
+        (257, 511),
+    ],
+)
+def test_fmha_gfx942_production_asm_split2_boundaries(sq, sk):
+    h = 4
+    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, 192, 128, seed=sq + sk)
+    scale = 1.0 / math.sqrt(192)
+    ref = _run_asm(q, k, v, cu_q, cu_k, sq, sk, scale, False)
+    out = torch.full_like(ref, float("nan"))
+    got = flash_attn_varlen_gfx942_asm_split2(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        sq,
+        sk,
+        softmax_scale=scale,
+        out=out,
+    )
+    assert got.data_ptr() == out.data_ptr()
+    assert torch.isfinite(got).all()
+    _assert_close(ref, got, f"production ASM split-2 Sq={sq} Sk={sk}")
+
+
+@pytest.mark.parametrize(
+    "sq,sk",
+    [
+        (1, 96),
+        (31, 129),
+        (32, 160),
+        (33, 191),
+        (127, 192),
+        (128, 193),
+        (129, 224),
+        (257, 511),
+    ],
+)
+def test_fmha_gfx942_unified_asm_split3_boundaries(sq, sk):
+    h = 4
+    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, 192, 128, seed=sq + sk)
+    scale = 1.0 / math.sqrt(192)
+    ref = _run_asm(q, k, v, cu_q, cu_k, sq, sk, scale, False)
+    out = torch.full_like(ref, float("nan"))
+    got = flash_attn_varlen_gfx942_asm_split2_unified(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        sq,
+        sk,
+        softmax_scale=scale,
+        out=out,
+        kv_splits=3,
+    )
+    assert got.data_ptr() == out.data_ptr()
+    assert torch.isfinite(got).all()
+    _assert_close(ref, got, f"unified production ASM split-3 Sq={sq} Sk={sk}")
+
+
+def test_fmha_gfx942_production_asm_split2_lse_and_determinism():
+    sq, sk, h = 257, 511, 12
+    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, 192, 128, seed=17)
+    scale = 0.125
+    ref, ref_lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        sq,
+        sk,
+        softmax_scale=scale,
+        causal=False,
+        return_lse=True,
+    )
+    got, got_lse = flash_attn_varlen_gfx942_asm_split2(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        sq,
+        sk,
+        softmax_scale=scale,
+        return_lse=True,
+    )
+    _assert_close(ref, got, "production ASM split-2 output/LSE")
+    torch.testing.assert_close(got_lse, ref_lse, rtol=2e-4, atol=2e-4)
+    for _ in range(100):
+        got_repeat = flash_attn_varlen_gfx942_asm_split2(
+            q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale
+        )
+        assert torch.equal(got, got_repeat)
+
+
+def test_fmha_gfx942_unified_asm_split3_lse_and_determinism():
+    sq, sk, h = 257, 511, 12
+    q, k, v, cu_q, cu_k = _make_packed(sq, sk, h, 192, 128, seed=19)
+    scale = 0.125
+    ref, ref_lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        sq,
+        sk,
+        softmax_scale=scale,
+        causal=False,
+        return_lse=True,
+    )
+    got, got_lse = flash_attn_varlen_gfx942_asm_split2_unified(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        sq,
+        sk,
+        softmax_scale=scale,
+        return_lse=True,
+        kv_splits=3,
+    )
+    _assert_close(ref, got, "unified production ASM split-3 output/LSE")
+    torch.testing.assert_close(got_lse, ref_lse, rtol=2e-4, atol=2e-4)
+    for _ in range(100):
+        got_repeat = flash_attn_varlen_gfx942_asm_split2_unified(
+            q, k, v, cu_q, cu_k, sq, sk, softmax_scale=scale, kv_splits=3
+        )
+        assert torch.equal(got, got_repeat)
+
+
 def test_choose_kv_splits_ticket_shape():
     assert (
         choose_kv_splits(
@@ -241,6 +469,8 @@ def test_fmha_gfx942_pingpong_split_kv_matches_unsplit():
 def _grid_info(sq: int, sk: int, h: int, impl: str, kv_splits: int | None):
     block_m = 256 if impl == "pingpong" else 128
     nq = (sq + block_m - 1) // block_m
+    if impl == "asmsplit":
+        kv_splits = 2
     if kv_splits is None:
         kv_splits = choose_kv_splits(
             max_seqlen_q=sq,
@@ -261,6 +491,18 @@ def _dispatch(impl, q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=None, kv_spl
         return _run_asm(q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=out)
     if impl == "4wave":
         return _run_4wave(
+            q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=out, kv_splits=kv_splits
+        )
+    if impl == "asmfly":
+        return _run_asmfly(
+            q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=out, kv_splits=kv_splits
+        )
+    if impl == "asmsplit":
+        return _run_asmsplit(
+            q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=out, kv_splits=kv_splits
+        )
+    if impl == "asmsplitu":
+        return _run_asmsplitu(
             q, k, v, cu_q, cu_k, sq, sk, scale, causal, out=out, kv_splits=kv_splits
         )
     if impl == "pingpong":
@@ -339,13 +581,13 @@ def main():
     )
     parser.add_argument(
         "--once",
-        choices=("4wave", "pingpong", "asm"),
+        choices=("4wave", "asmfly", "asmsplit", "asmsplitu", "pingpong", "asm"),
         help="one dispatch for WaveScope ATT (CPU-generated inputs)",
     )
     parser.add_argument(
         "--impl",
         default="all",
-        choices=("all", "4wave", "pingpong", "asm"),
+        choices=("all", "4wave", "asmfly", "asmsplit", "asmsplitu", "pingpong", "asm"),
     )
     parser.add_argument("--sq", type=int, default=TICKET_SQ)
     parser.add_argument("--sk", type=int, default=TICKET_SK)
@@ -371,7 +613,11 @@ def main():
             kv_splits=args.kv_splits,
         )
     if args.bench:
-        impls = ["asm", "4wave", "pingpong"] if args.impl == "all" else [args.impl]
+        impls = (
+            ["asm", "4wave", "asmfly", "asmsplit", "asmsplitu", "pingpong"]
+            if args.impl == "all"
+            else [args.impl]
+        )
         return run_bench(impls, args.sq, args.sk, args.heads, args.kv_splits)
 
     parser.error("pass --bench or --once; pytest drives correctness tests")

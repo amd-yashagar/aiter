@@ -34,6 +34,12 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.fmha_gfx942.pinned_qk_agpr import (
+    K_AGPR0,
+    Q_AGPR0,
+    mfma_qk_chain,
+    mfma_vgpr_chain,
+)
 from aiter.ops.flydsl.kernels.fmha_gfx942.config import (
     BLOCK_SIZE,
     D_CHUNK,
@@ -46,7 +52,6 @@ from aiter.ops.flydsl.kernels.fmha_gfx942.config import (
     SUPPORTED_DTYPES,
     SUPPORTED_GFX,
     WARP_SIZE,
-    WAVES_PER_EU as DEFAULT_WAVES_PER_EU,
     k_lds_elems,
     validate_fmha_gfx942_tiles,
     v_lds_elems,
@@ -56,6 +61,9 @@ from aiter.ops.flydsl.kernels.fmha_gfx942.parallel import (
     combine_split_kv,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+# Occupancy frozen vs the 4-wave ASM-parity path (config WAVES_PER_EU=1).
+DEFAULT_WAVES_PER_EU = 2
 
 _LOG2E = host_math.log2(host_math.e)
 _VMCNT_LO_MASK = 0xF
@@ -604,7 +612,11 @@ def build_fmha_pingpong_gfx942_module(
         for ks in range_constexpr(K_STEPS_QK):
             q_col = fx.Index(ks * K_STEP_QK) + lane_div_32 * MFMA_LANE_K
             g_idx = global_idx_q(q_row, q_col)
-            q_b_packs.append(buffer_ops.buffer_load(q_rsrc, g_idx, vec_width=MFMA_LANE_K, dtype=elem_dtype))
+            q_b_packs.append(
+                buffer_ops.buffer_load(
+                    q_rsrc, g_idx, vec_width=MFMA_LANE_K, dtype=elem_dtype
+                )
+            )
 
         # ---- Constants ----
         c_neg_inf = fx.Float32(float("-inf"))
@@ -758,35 +770,21 @@ def build_fmha_pingpong_gfx942_module(
                         rocdl.sched_mfma(4)
                     rocdl.sched_barrier(0)
             else:
-                v_lo_cur = _read_v_pack(0, 0)
-                v_hi_cur = _read_v_pack(0, 1)
-                for si in range_constexpr(len(_steps)):
-                    dc, pks = _steps[si]
-                    if const_expr(si + 1 < len(_steps)):
-                        v_lo_nxt = _read_v_pack(si + 1, 0)
-                        v_hi_nxt = _read_v_pack(si + 1, 1)
-                    o_accs[dc] = mfma_acc(
-                        v_lo_cur, p_packs_lo[pks], o_accs[dc]
-                    )
-                    o_accs[dc] = mfma_acc(
-                        v_hi_cur, p_packs_hi[pks], o_accs[dc]
-                    )
-                    if const_expr(
-                        not DUALWAVE_SWP
-                        and D_CHUNKS <= PV_K_STEPS
-                        and dc == 0
-                        and pks < D_CHUNKS - 1
-                    ):
-                        o_accs[pks + 1] = Vec(o_accs[pks + 1]) * corr_vec
-                    if const_expr(si + 1 < len(_steps)):
-                        v_lo_cur = v_lo_nxt
-                        v_hi_cur = v_hi_nxt
-
-                for pv_group in range_constexpr(8):
-                    if const_expr(pv_group % 2 == 0):
-                        rocdl.sched_vmem(1)
-                    rocdl.sched_dsrd(2)
-                    rocdl.sched_mfma(4)
+                # Burst V packs per D-chunk, then a waitcnt-free 4-MFMA chain.
+                # One-MFMA-one-wait was painting ATT as all lgkmcnt(0).
+                for dc in range_constexpr(D_CHUNKS):
+                    v_lo = []
+                    v_hi = []
+                    p_lo = []
+                    p_hi = []
+                    for pks in range_constexpr(PV_K_STEPS):
+                        si = dc * PV_K_STEPS + pks
+                        v_lo.append(_read_v_pack(si, 0))
+                        v_hi.append(_read_v_pack(si, 1))
+                        p_lo.append(p_packs_lo[pks])
+                        p_hi.append(p_packs_hi[pks])
+                    o_accs[dc] = mfma_vgpr_chain(o_accs[dc], v_lo, p_lo)
+                    o_accs[dc] = mfma_vgpr_chain(o_accs[dc], v_hi, p_hi)
                 rocdl.sched_barrier(0)
             return o_accs
 
@@ -921,42 +919,45 @@ def build_fmha_pingpong_gfx942_module(
                                 kv_start, n_half=1
                             )
 
-                    k_packs_lo = []
-                    k_packs_hi = []
+                    k_lo_packs = []
+                    k_hi_packs = []
                     for ks_local in range_constexpr(4):
                         d = (
                             fx.Index(ks_local * K_STEP_QK)
                             + lane_div_32 * MFMA_LANE_K
                         )
-                        k_packs_lo.append(
+                        k_lo_packs.append(
                             Vec.load(
                                 mfma_pack_type,
                                 lds_k,
                                 [k_base + _lds_elem_offset(seqk0, d)],
                             )
                         )
-                        k_packs_hi.append(
+                        k_hi_packs.append(
                             Vec.load(
                                 mfma_pack_type,
                                 lds_k,
                                 [k_base + _lds_elem_offset(seqk1, d)],
                             )
                         )
+                    q_plane = [
+                        q_b_packs[plane * 4 + i] for i in range_constexpr(4)
+                    ]
+                    s_acc_lo = mfma_qk_chain(
+                        s_acc_lo,
+                        k_lo_packs,
+                        q_plane,
+                        K_AGPR0,
+                        Q_AGPR0 + 8 * plane,
+                    )
+                    s_acc_hi = mfma_qk_chain(
+                        s_acc_hi,
+                        k_hi_packs,
+                        q_plane,
+                        K_AGPR0 + 8,
+                        Q_AGPR0 + 8 * plane,
+                    )
 
-                    for ks_local in range_constexpr(4):
-                        qks = plane * 4 + ks_local
-                        s_acc_lo = mfma_acc(
-                            k_packs_lo[ks_local],
-                            q_b_packs[qks],
-                            s_acc_lo,
-                        )
-                        s_acc_hi = mfma_acc(
-                            k_packs_hi[ks_local],
-                            q_b_packs[qks],
-                            s_acc_hi,
-                        )
-
-                    # Six selected LDS instructions and eight MFMAs per plane.
                     for _ in range_constexpr(2):
                         rocdl.sched_vmem(
                             4

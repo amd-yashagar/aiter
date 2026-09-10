@@ -18,7 +18,8 @@ from __future__ import annotations
 # ``waves_per_eu`` knobs (see ``flash_attn_varlen_gfx942``).
 BLOCK_M = 128
 BLOCK_N = 64
-WAVES_PER_EU = 2  # staged-K path measures 232 combined VGPR/AGPR and 27 KiB LDS
+# ASM hd192x128 is 1 WG/CU (512 VGPR). Ping-pong pins 2 explicitly.
+WAVES_PER_EU = 1
 WARP_SIZE = 64
 BLOCK_SIZE = 256  # 4 waves; matches fallback BLOCK_M=128 (32 rows/wave)
 VEC_WIDTH = 16

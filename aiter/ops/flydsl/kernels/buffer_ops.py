@@ -118,6 +118,11 @@ def _create_i32_constant(value: int) -> ir.Value:
     return _unwrap_value(op.result)
 
 
+def _aux_attr(cache_modifier: int) -> ir.IntegerAttr:
+    """FlyDSL 0.3.2+ ROCDL buffer ops take cache policy as an ``aux`` attribute."""
+    return ir.IntegerAttr.get(T.i32(), int(cache_modifier))
+
+
 def _to_i32_offset(offset: ir.Value) -> ir.Value:
     """Normalize an already-unwrapped offset value to i32.
 
@@ -567,17 +572,13 @@ def buffer_load(
             soffset = _create_i32_constant(soffset_bytes)
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    # ROCDL RawPtrBufferLoadOp takes aux as an i32 *operand* (cache modifiers),
-    # not an attribute — keep in sync with FlyDSL python/flydsl/expr/buffer_ops.py.
-    aux_flags = _create_i32_constant(int(cache_modifier))
-
-    # Emit buffer load
+    # FlyDSL 0.3.2: aux is a cache-policy attribute, not an i32 SSA operand.
     load_op = rocdl.RawPtrBufferLoadOp(
         result_type,
         rsrc,
         offset,
         soffset,
-        aux_flags,
+        aux=_aux_attr(cache_modifier),
     )
 
     return load_op.result
@@ -655,13 +656,10 @@ def buffer_store(
             soffset = _create_i32_constant(int(soffset_bytes))
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    aux_flags = _create_i32_constant(int(cache_modifier))
-
-    # Emit buffer store (aux is an i32 operand on current ROCDL).
     rocdl.RawPtrBufferStoreOp(
         data,
         rsrc,
         offset,
         soffset,
-        aux_flags,
+        aux=_aux_attr(cache_modifier),
     )

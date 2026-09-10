@@ -95,6 +95,9 @@ def _combine_split_kv_eager(
 def combine_split_kv(
     o_parts: torch.Tensor,
     lse_parts: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge normalized split outputs.
 
@@ -111,25 +114,34 @@ def combine_split_kv(
         and tuple(lse_parts.shape) == (splits, num_heads, seqlen_q)
     )
     if not can_fuse:
-        return _combine_split_kv_eager(o_parts, lse_parts)
+        result, result_lse = _combine_split_kv_eager(o_parts, lse_parts)
+        if out is not None:
+            out.copy_(result)
+            result = out
+        if lse is not None:
+            lse.copy_(result_lse)
+            result_lse = lse
+        return result, result_lse
 
     # Imported lazily so ``choose_kv_splits`` does not pull the FlyDSL compiler.
     from aiter.ops.flydsl.kernels.fmha_gfx942.combine import run_fused_combine
 
     o_parts = o_parts.contiguous()
     lse_parts = lse_parts.contiguous()
-    out = torch.empty(
-        seqlen_q,
-        num_heads,
-        head_dim,
-        device=o_parts.device,
-        dtype=o_parts.dtype,
-    )
-    lse = torch.empty(
-        num_heads,
-        seqlen_q,
-        device=o_parts.device,
-        dtype=torch.float32,
-    )
+    if out is None:
+        out = torch.empty(
+            seqlen_q,
+            num_heads,
+            head_dim,
+            device=o_parts.device,
+            dtype=o_parts.dtype,
+        )
+    if lse is None:
+        lse = torch.empty(
+            num_heads,
+            seqlen_q,
+            device=o_parts.device,
+            dtype=torch.float32,
+        )
     run_fused_combine(o_parts, lse_parts, out, lse)
     return out, lse

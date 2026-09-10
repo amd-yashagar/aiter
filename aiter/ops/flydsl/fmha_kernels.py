@@ -26,6 +26,7 @@ from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
 from .kernels.fmha_gfx942 import (
     SUPPORTED_GFX as _GFX942,
     flash_attn_varlen_gfx942,
+    flash_attn_varlen_gfx942_asm_split2_unified,
     validate_fmha_gfx942_tiles,
 )
 
@@ -315,6 +316,34 @@ def flydsl_flash_attn_varlen_func(
             causal=causal,
             out=out,
             return_lse=return_lse,
+        )
+
+    # gfx942 MI325X ticket replacement. Keep the production default gate exact
+    # until the split producer has a broader multi-sequence validation matrix.
+    if (
+        gfx in _GFX942
+        and not causal
+        and q.dtype == torch.bfloat16
+        and tuple(q.shape) == (4096, 12, 192)
+        and tuple(k.shape) == (42700, 12, 192)
+        and tuple(v.shape) == (42700, 12, 128)
+        and cu_seqlens_q.numel() == 2
+        and cu_seqlens_k.numel() == 2
+        and max_seqlen_q == 4096
+        and max_seqlen_k == 42700
+    ):
+        return flash_attn_varlen_gfx942_asm_split2_unified(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            return_lse=return_lse,
+            out=out,
+            kv_splits=3,
         )
 
     # gfx942 — general QK/V that tile; production stays on ASM until this wins.
