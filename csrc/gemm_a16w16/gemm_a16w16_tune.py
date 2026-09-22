@@ -6,7 +6,9 @@ Multi-backend bf16 / a16w16 GEMM tuner.
 
 Follows the csrc tuner pattern (like ck_gemm_a8w8, ck_gemm_a8w8_blockscale).
 Backends: asm, opus, flydsl, triton, skinny, torch.
-hipblaslt is opt-in via --with-hipblaslt (imports from gradlib).
+hipblaslt is included in ``--libtype all`` (and ``--libtype hipblaslt``)
+so it competes with asm/opus/flydsl/triton/skinny/torch. ``--with-hipblaslt``
+is kept as an alias.
 """
 
 import argparse
@@ -460,15 +462,15 @@ class GemmA16W16Tuner(GemmCommonTuner):
             default=["all"],
             required=False,
             help="choose libtype to tune: all, asm, hipblaslt, triton, flydsl, torch, skinny, opus. "
-            "hipblaslt requires --with-hipblaslt.",
+            "``all`` includes hipblaslt when gradlib is available.",
         )
         self.parser.add_argument(
             "--with-hipblaslt",
             action="store_true",
             default=False,
             dest="with_hipblaslt",
-            help="Include hipblaslt in tuning (disabled by default). "
-            "hipblaslt tuning is also available standalone via gradlib/gradlib/gemm_tuner.py.",
+            help="Also include hipblaslt when --libtype is a subset (already "
+            "on for --libtype all / hipblaslt). Standalone: gradlib/gradlib/gemm_tuner.py.",
         )
 
     def _clear_op_caches(self):
@@ -979,7 +981,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
             shape_kernel_nums = len(task) - prev_count
             tasks_data.append((shape_kernel_nums, ()))
 
-            if with_hipblaslt and ("all" in libtype or "hipblaslt" in libtype):
+            # Fair search: hipBLASLt (Cijk_*) must compete, not only be the
+            # unmatched serving fallback. Skip only if the import failed.
+            if with_hipblaslt or "all" in libtype or "hipblaslt" in libtype:
                 hipblaslt_rets.extend(self._run_hipblaslt(ds, args))
 
         ret = []

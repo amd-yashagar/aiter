@@ -622,6 +622,41 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
     assert "kid=200, splitK=2" in stale_warnings[0]
 
 
+def test_global_a16_honors_tuned_triton_row(monkeypatch):
+    """Lookup must use the CSV winner, including Triton, after a fair tune."""
+    import aiter.tuned_gemm as tuned
+
+    dtype = str(torch.bfloat16)
+    triton_key = ("gfx950", 256, 16, 2048, 512, False, dtype, dtype, False, False)
+    flydsl_key = ("gfx950", 256, 8, 2048, 512, False, dtype, dtype, False, False)
+    cfg = {
+        triton_key: {
+            "libtype": "triton",
+            "solidx": 0,
+            "splitK": 0,
+            "kernelName": "auto",
+        },
+        flydsl_key: {
+            "libtype": "flydsl",
+            "solidx": 0,
+            "splitK": 1,
+            "kernelName": "flydsl_placeholder",
+        },
+    }
+    monkeypatch.setattr(tuned, "get_GEMM_A16W16_config_", lambda: cfg)
+    monkeypatch.setattr(tuned, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(tuned, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(tuned, "get_padded_m", lambda M, _N, _K, _gl: M)
+    tuned.get_GEMM_A16W16_config.cache_clear()
+    try:
+        config = tuned.get_GEMM_A16W16_config(16, 2048, 512, False, dtype, dtype)
+    finally:
+        tuned.get_GEMM_A16W16_config.cache_clear()
+
+    assert config["libtype"] == "triton"
+    assert config["kernelName"] == "auto"
+
+
 def _capture_shape_driven_opus_launch(monkeypatch, *, arch, tuned_config):
     from aiter.ops import opus
     from aiter.ops.opus import gemm_op_a16w16, policy
