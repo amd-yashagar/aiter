@@ -25,9 +25,11 @@ def build_causal_conv1d_flydsl_module(
     tn: int = 64,
     block_threads: int = 256,
     dtype_str: str = "bf16",
+    weight_dtype_str: str = "bf16",
 ):
     """Build the FlyDSL causal conv1d kernel for the given config."""
     assert width in (2, 3, 4)
+    assert weight_dtype_str in ("bf16", "fp16", "fp32")
     assert (
         tm == 64 and tn == 64 and block_threads == 256
     ), "fixed TM=TN=64, 256-thread tile"
@@ -47,6 +49,11 @@ def build_causal_conv1d_flydsl_module(
     SILU = bool(silu)
 
     fx_elem_dtype = fx.BFloat16 if dtype_str == "bf16" else fx.Float16
+    fx_weight_dtype = {
+        "bf16": fx.BFloat16,
+        "fp16": fx.Float16,
+        "fp32": fx.Float32,
+    }[weight_dtype_str]
 
     @fx.struct
     class SharedStorage:
@@ -87,8 +94,8 @@ def build_causal_conv1d_flydsl_module(
         # Every access here is one element wide, so each buffer gets a single
         # view typed by its own element -- `t[i]` is the whole access.
         x_r = ptr_buf_tensor(x_ptr, fx_elem_dtype)
-        w_r = ptr_buf_tensor(w_ptr, fx_elem_dtype)
-        b_r = ptr_buf_tensor(bias_ptr, fx_elem_dtype)
+        w_r = ptr_buf_tensor(w_ptr, fx_weight_dtype)
+        b_r = ptr_buf_tensor(bias_ptr, fx_weight_dtype)
         cs_r = ptr_buf_tensor(cs_ptr, fx_elem_dtype)
         ci_r = ptr_buf_tensor(cache_idx_ptr, fx.Int32)
         hi_r = ptr_buf_tensor(has_init_ptr, fx.Int8)
@@ -150,9 +157,12 @@ def build_causal_conv1d_flydsl_module(
         all_tok2 = tok_start >= (KW - 1)
         fast = all_feat & all_tok1 & all_tok2
 
+        def x_off(feat, tok):
+            return feat * sx0 + tok * sx1
+
         if fast:
             # fast path: fully interior, coalesced, no bounds/state
-            cur = (feat_start + f_base) * sx0 + gt1
+            cur = x_off(feat_start + f_base, gt1)
             fstep = FG * sx0
             raws = []
             for j in fx.range_constexpr(ELEMS):
@@ -160,7 +170,7 @@ def build_causal_conv1d_flydsl_module(
                 if fx.const_expr(j + 1 < ELEMS):
                     cur = cur + fstep
             do_halo = hc < (KW - 1)
-            prefix_off = do_halo.select((feat_start + hf) * sx0 + (tok_gbase + hc), 0)
+            prefix_off = do_halo.select(x_off(feat_start + hf, tok_gbase + hc), 0)
             prefix_v = fx_elem_dtype(x_r[prefix_off])
             lds_idx = f_base * LDS_PAD + (t_const + (KW - 1))
             for j in fx.range_constexpr(ELEMS):
@@ -179,7 +189,7 @@ def build_causal_conv1d_flydsl_module(
                 gf = (feat_start + f_base) + (j * FG)
                 gf_ok = gf < dim
                 safe_gf = gf_ok.select(gf, 0)
-                raw = fx_elem_dtype(x_r[safe_gf * sx0 + body_gt])
+                raw = fx_elem_dtype(x_r[x_off(safe_gf, body_gt)])
                 val = (body_ok & gf_ok).select(raw, zero_e)
                 lds_st(
                     val,
@@ -193,7 +203,7 @@ def build_causal_conv1d_flydsl_module(
                 wp = (tok_start + hc) - (KW - 1)
                 wp_in = (wp >= 0) & (wp < seqlen)
                 both = wp_in & gf_ok
-                safe_xoff = both.select(gf * sx0 + (seq_start + wp), 0)
+                safe_xoff = both.select(x_off(gf, seq_start + wp), 0)
                 xv = both.select(
                     fx_elem_dtype(x_r[safe_xoff]),
                     zero_e,
@@ -290,7 +300,7 @@ def build_causal_conv1d_flydsl_module(
                 in_coord = fx.Int32(ci_r[seq_idx * sci])
                 pos_x = (seqlen - (KW - 1)) + slot
                 x_in = pos_x >= 0
-                safe_x = x_in.select(gfeat * sx0 + (seq_start + pos_x), 0)
+                safe_x = x_in.select(x_off(gfeat, seq_start + pos_x), 0)
                 val_x = fx_elem_dtype(x_r[safe_x])
                 hi8 = fx.Int8(hi_r[seq_idx])
                 hi_nz = hi8 != 0
@@ -379,9 +389,18 @@ def build_causal_conv1d_flydsl_module(
 
 
 @functools.cache
-def _get_compiled(width, has_bias, silu, tm, tn, block_threads, dtype_str):
+def _get_compiled(
+    width, has_bias, silu, tm, tn, block_threads, dtype_str, weight_dtype_str="bf16"
+):
     return build_causal_conv1d_flydsl_module(
-        width, has_bias, silu, tm, tn, block_threads, dtype_str
+        width,
+        has_bias,
+        silu,
+        tm,
+        tn,
+        block_threads,
+        dtype_str,
+        weight_dtype_str,
     )
 
 
@@ -469,8 +488,21 @@ def causal_conv1d_split_qkv_flydsl_fn(
         return query, key, value
 
     dtype_str = "bf16" if x.dtype == torch.bfloat16 else "fp16"
+    if weight.dtype == torch.float32:
+        weight_dtype_str = "fp32"
+    elif weight.dtype == torch.float16:
+        weight_dtype_str = "fp16"
+    else:
+        weight_dtype_str = "bf16"
     launcher = _get_compiled(
-        int(width), bias is not None, bool(silu), int(block_m), 64, 256, dtype_str
+        int(width),
+        bias is not None,
+        bool(silu),
+        int(block_m),
+        64,
+        256,
+        dtype_str,
+        weight_dtype_str,
     )
     tn = launcher._tn
     grid_y_dim = (dim + tn - 1) // tn

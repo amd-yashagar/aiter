@@ -287,6 +287,53 @@ def test_backend_matches_reference(cu, with_is, backend):
     assert absd < 5e-2, f"{backend} conv_state mismatch: max_abs={absd:.4f}"
 
 
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_flydsl_transposed_activation_fp32_weight(with_bias):
+    """Transposed [dim, T] activation and FP32 conv weights, as Kimi-K3 prefill."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs GPU")
+
+    cu = [0, 8, 17]
+    x, w, b, cs, ci, hi, qsl = make_inputs(
+        cu,
+        with_initial_state=True,
+        with_bias=with_bias,
+        channel_last=True,
+    )
+    assert x.stride() == (1, CONV_DIM)
+    w = w.float()
+    if b is not None:
+        b = b.float()
+    ref_q, ref_k, ref_v, ref_cs = torch_reference(
+        x, w, b, cs.clone(), qsl, ci, hi, K_DIM, V_DIM
+    )
+    cs_work = cs.clone()
+    q, k, v = _call_backend(
+        "flydsl",
+        x=x,
+        weight=w,
+        bias=b,
+        conv_states=cs_work,
+        query_start_loc=qsl_to(qsl),
+        cache_indices=ci,
+        has_initial_state=hi,
+        k_dim=K_DIM,
+        v_dim=V_DIM,
+        seq_lens_cpu=qsl_to(qsl).diff().tolist(),
+        activation="silu",
+    )
+    for name, got, ref in (("q", q, ref_q), ("k", k, ref_k), ("v", v, ref_v)):
+        rel, absd = _max_abs_rel(got, ref)
+        assert absd < 5e-2, (
+            f"flydsl fp32-weight {name} with_bias={with_bias}: "
+            f"max_abs={absd:.4f} rel={rel:.4f}"
+        )
+    rel, absd = _max_abs_rel(cs_work, ref_cs)
+    assert (
+        absd < 5e-2
+    ), f"flydsl fp32-weight state with_bias={with_bias}: max_abs={absd:.4f}"
+
+
 @pytest.mark.parametrize("backend", ["hip", "triton2d", "flydsl"])
 def test_backend_accepts_causal_conv_prefill_metadata(backend):
     if not torch.cuda.is_available():
