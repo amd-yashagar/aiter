@@ -59,10 +59,11 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
+    apply_rope: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
-    bk, kh, dk_nope = k_nope.shape
+    _, _, dk_nope = k_nope.shape
 
     if q_out is None:
         q_out = torch.empty(
@@ -79,7 +80,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
         )
 
     if k_pe_out is None:
-        k_pe_out = torch.empty((bk, kh, d_pe), dtype=k_pe.dtype, device=k_pe.device)
+        k_pe_out = k_pe.clone()
 
     if num_decode_toks_for_zeros > 0:
         q_nope_zeros_out = torch.empty(
@@ -118,6 +119,7 @@ def fused_qk_rope_cat_and_cache_mla(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
+    apply_rope: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
@@ -139,24 +141,35 @@ def fused_qk_rope_cat_and_cache_mla(
     - kv_cache: The output matrix with shape (B_max, KH, D1 + D2) (inplace).
     """
     _LOGGER.info(
-        "FUSED_QK_ROPE_CAT_AND_CACHE_MLA: q_nope=%s q_pe=%s k_nope=%s k_pe=%s pos=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s",
+        "FUSED_QK_ROPE_CAT_AND_CACHE_MLA: q_nope=%s q_pe=%s k_nope=%s k_pe=%s pos=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s apply_rope=%s",
         tuple(q_nope.shape),
         tuple(q_pe.shape),
         tuple(k_nope.shape),
         tuple(k_pe.shape),
-        tuple(pos.shape),
-        tuple(cos.shape),
-        tuple(sin.shape),
+        None if pos is None else tuple(pos.shape),
+        None if cos is None else tuple(cos.shape),
+        None if sin is None else tuple(sin.shape),
         tuple(kv_cache.shape),
         tuple(slot_mapping.shape),
+        apply_rope,
     )
+    rope_tensors = (pos is not None, cos is not None, sin is not None)
+    if apply_rope and not all(rope_tensors):
+        raise ValueError("apply_rope=True requires pos, cos, and sin")
+    if not apply_rope and any(rope_tensors):
+        raise ValueError("apply_rope=False requires pos, cos, and sin to be None")
+    if not apply_rope and DEVICE_ARCH == "gfx1250":
+        raise RuntimeError(
+            "NoPE fused MLA KV write is not implemented on gfx1250; "
+            "the gluon kernel always applies RoPE"
+        )
 
     b, qh, d_nope = q_nope.shape
     b2, qh2, d_pe = q_pe.shape
     bk, kh, dk_nope = k_nope.shape
     bk2, kh2, dk2 = k_pe.shape
     kv_cache_dtype = kv_cache.dtype
-    d_freq = cos.shape[-1]
+    d_freq = cos.shape[-1] if apply_rope else d_pe // 2
     assert kv_cache_dtype in [
         torch.bfloat16,
         e4m3_dtype,
@@ -242,7 +255,9 @@ def fused_qk_rope_cat_and_cache_mla(
         ), "decode_q_pe_out shape mismatch"
 
     if k_pe_out is None:
-        k_pe_out = torch.empty((bk, kh, d_pe), dtype=k_pe.dtype, device=k_pe.device)
+        # Rows the grid does not visit must stay the original position half.
+        # empty() left those rows uninitialized once callers read k_pe_out.
+        k_pe_out = k_pe.clone()
     else:
         b_k_pe_out, hk_k_pe_out, d_k_pe_out = k_pe_out.shape
         assert (
@@ -275,6 +290,12 @@ def fused_qk_rope_cat_and_cache_mla(
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
 
+    # gfx1250's gluon kernel has no NoPE specialization. The host rejects
+    # apply_rope=False on that arch before dispatch.
+    rope_constexpr = {}
+    if _kernel is triton_fused_qk_rope_cat_and_cache_mla_kernel:
+        rope_constexpr["APPLY_ROPE"] = apply_rope
+
     _kernel[grid](
         q_nope,
         q_pe,
@@ -296,9 +317,9 @@ def fused_qk_rope_cat_and_cache_mla(
         *q_pe.stride(),
         *k_nope.stride(),
         *k_pe.stride(),
-        pos.stride(0),
-        cos.stride(0),
-        cos.stride(-1),
+        0 if pos is None else pos.stride(0),
+        0 if cos is None else cos.stride(0),
+        0 if cos is None else cos.stride(-1),
         *q_out.stride(),
         *decode_q_pe_out.stride(),
         *k_pe_out.stride(),
@@ -323,6 +344,7 @@ def fused_qk_rope_cat_and_cache_mla(
         HAVE_K_SCALE=(k_scale is not None and apply_scale),
         UPCAST_OPERAND=upcast_operand,
         num_warps=1,
+        **rope_constexpr,
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out

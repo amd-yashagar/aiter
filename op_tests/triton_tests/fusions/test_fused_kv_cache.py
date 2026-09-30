@@ -260,6 +260,51 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
 
 
+@pytest.mark.skipif(
+    DEVICE_ARCH == "gfx1250", reason="the gluon kernel always applies RoPE"
+)
+def test_fused_qk_rope_cat_and_cache_mla_nope_writes_unmapped_rows():
+    """A negative cache slot still has to fill the position half attention reads.
+
+    The cache store is skipped for that slot. Leaving the row untouched used
+    to publish an uninitialized key once callers cat k_pe_out.
+    """
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    tokens, kv_heads, query_heads = 4, 1, 4
+    nope_dim, pe_dim = 16, 8
+    q_nope = torch.randn(tokens, query_heads, nope_dim, dtype=dtype, device="cuda")
+    q_pe = torch.randn(tokens, query_heads, pe_dim, dtype=dtype, device="cuda")
+    k_nope = torch.randn(tokens, kv_heads, nope_dim, dtype=dtype, device="cuda")
+    k_pe = torch.randn(tokens, kv_heads, pe_dim, dtype=dtype, device="cuda")
+    kv_cache = torch.zeros(8, kv_heads, nope_dim + pe_dim, dtype=dtype, device="cuda")
+    slot_mapping = torch.tensor([1, -1, 3, -1], dtype=torch.int64, device="cuda")
+    k_pe_out = torch.full_like(k_pe, float("nan"))
+    q, _, k_pe_out, zeros = fused_qk_rope_cat_and_cache_mla(
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        None,
+        None,
+        None,
+        None,
+        False,
+        apply_rope=False,
+        k_pe_out=k_pe_out,
+    )
+
+    torch.testing.assert_close(q, torch.cat((q_nope, q_pe), dim=-1))
+    torch.testing.assert_close(k_pe_out, k_pe)
+    torch.testing.assert_close(kv_cache[1], torch.cat((k_nope[0], k_pe[0]), dim=-1))
+    torch.testing.assert_close(kv_cache[3], torch.cat((k_nope[2], k_pe[2]), dim=-1))
+    torch.testing.assert_close(kv_cache[0], torch.zeros_like(kv_cache[0]))
+    torch.testing.assert_close(kv_cache[2], torch.zeros_like(kv_cache[2]))
+    assert zeros.shape[0] == 0
+
+
 @pytest.mark.parametrize("T", [1, 8, 2048])
 @pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [8])
