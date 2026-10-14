@@ -499,9 +499,17 @@ def _moe_sorting_impl(
             aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
     if use_opus:
-        ws_size = aiter.moe_sorting_opus_get_workspace_size(
-            M, num_experts, topk, dispatch_policy, topk_ids.get_device()
-        )
+        # Opus workspace API grew a device_id arg; tolerate older JIT .so builds
+        # that only expose (tokens, experts, topk, policy) so S>=64 2-stage
+        # fused_moe does not hard-fail on a stale module_moe_sorting_opus.so.
+        try:
+            ws_size = aiter.moe_sorting_opus_get_workspace_size(
+                M, num_experts, topk, dispatch_policy, topk_ids.get_device()
+            )
+        except TypeError:
+            ws_size = aiter.moe_sorting_opus_get_workspace_size(
+                M, num_experts, topk, dispatch_policy
+            )
         workspace = (
             torch.empty(ws_size, dtype=torch.uint8, device=device)
             if ws_size > 0
