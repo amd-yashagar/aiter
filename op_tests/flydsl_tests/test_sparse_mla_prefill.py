@@ -1188,6 +1188,205 @@ def test_flash_2region_multitile():
     assert cos_mean > 0.999, f"cosine too low: {cos_mean}"
 
 
+def _pack_flat512_cache(kv, block_size, *, is_ocp=False):
+    """Pack [num_tokens, 512] bf16 into contiguous flat fp8 [num_blocks, block_size, 512]."""
+    assert kv.shape[-1] == PACKED_HEAD_DIM
+    num_tokens = kv.shape[0]
+    num_blocks = (num_tokens + block_size - 1) // block_size
+    dtype = _OCP if is_ocp else _FNUZ
+    cache = torch.zeros(
+        (num_blocks, block_size, PACKED_HEAD_DIM), dtype=dtype, device=kv.device
+    )
+    n = num_tokens
+    cache.view(-1, PACKED_HEAD_DIM)[:n].copy_(kv[:n].to(dtype))
+    return cache
+
+
+def _as_padded_flat512(cache, block_stride_bytes, phys_map):
+    """Scatter contiguous flat512 blocks into a padded pool at high phys IDs.
+
+    ``phys_map[logical_block] = phys_block``.  Returns ``(padded_cache, block_table_1d)``
+    where ``padded_cache`` has ``stride(0) == block_stride_bytes`` (1 B elems).
+    """
+    device = cache.device
+    block_size = cache.shape[1]
+    num_logical = cache.shape[0]
+    assert len(phys_map) == num_logical
+    max_phys = int(max(phys_map)) + 1
+    storage = torch.zeros(max_phys * block_stride_bytes, dtype=torch.uint8, device=device)
+    src = cache.view(torch.uint8).reshape(num_logical, block_size * PACKED_HEAD_DIM)
+    for logical, phys in enumerate(phys_map):
+        base = int(phys) * block_stride_bytes
+        storage[base : base + block_size * PACKED_HEAD_DIM].copy_(src[logical])
+    padded = torch.as_strided(
+        storage.view(cache.dtype),
+        size=(max_phys, block_size, PACKED_HEAD_DIM),
+        stride=(block_stride_bytes, PACKED_HEAD_DIM, 1),
+    )
+    # Single-request identity BT remapped through phys_map (max_blocks = num_logical).
+    bt = torch.tensor(phys_map, dtype=torch.int32, device=device).view(1, -1)
+    return padded, bt
+
+
+def test_flash_flat512_contiguous_oracle():
+    """Absolute oracle for contiguous flat512 H=8 (catches silent rebase bugs).
+
+    The padded-vs-contiguous relative check can pass when both paths are equally
+    wrong; this gates numerics against a dequantized f32 reference.
+    """
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_2region
+
+    device = "cuda"
+    block_size = 64
+    main_tokens, extra_tokens = 128, 64
+    main_kv = _gen_kv(main_tokens, seed=101)
+    extra_kv = _gen_kv(extra_tokens, seed=102)
+    main_c = _pack_flat512_cache(main_kv, block_size, is_ocp=False)
+    extra_c = _pack_flat512_cache(extra_kv, block_size, is_ocp=True)
+    main_rows = [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]]
+    extra_rows = [[0, 1, 2, 3]]
+    sq = 1
+    q = _gen_q(sq, FLASH_H, seed=103)
+    main_indices, main_indptr = _ragged_from_rows(main_rows, device)
+    extra_indices, extra_indptr = _ragged_from_rows(extra_rows, device)
+    main_bt = _identity_block_table(main_tokens, block_size, device)
+    extra_bt = _identity_block_table(extra_tokens, block_size, device)
+
+    out = torch.empty(sq, FLASH_H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill_2region(
+        q, out,
+        main_c, main_indices, main_indptr, main_bt,
+        extra_c, extra_indices, extra_indptr, extra_bt,
+        block_size=block_size,
+        main_is_fnuz=True, extra_is_fnuz=False,
+        q_scale=1.0, main_kv_scale=1.0,
+    )
+
+    # Kernel: main fnuz DMA as-is; extra OCP decoded as fnuz then *2 (bias +1).
+    main_ref = main_c.view(torch.float8_e4m3fnuz).to(torch.float32).reshape(-1, PACKED_HEAD_DIM)
+    extra_u8 = extra_c.view(torch.uint8).reshape(-1, PACKED_HEAD_DIM)
+    # Match kernel: interpret OCP bytes via fnuz cvt then * 2
+    extra_as_fnuz = extra_u8.view(torch.float8_e4m3fnuz).to(torch.float32) * 2.0
+    scale = PACKED_HEAD_DIM ** -0.5
+    q_ref = q.to(torch.float8_e4m3fnuz).to(torch.float32)
+    # Build dense gather for one query
+    m_idx = torch.tensor(main_rows[0], device=device, dtype=torch.long)
+    e_idx = torch.tensor(extra_rows[0], device=device, dtype=torch.long)
+    kv = torch.cat([main_ref[m_idx], extra_as_fnuz[e_idx]], dim=0)
+    scores = torch.einsum("hd,kd->hk", q_ref[0], kv) * (scale * LOG2E)
+    m = scores.max(dim=-1, keepdim=True).values
+    p = torch.exp2(scores - m)
+    p = p / p.sum(dim=-1, keepdim=True)
+    ref = torch.einsum("hk,kd->hd", p, kv).unsqueeze(0)
+    cos_mean, cos_min, max_abs = _metrics(out, ref)
+    print(
+        f"[flash_flat512_oracle H={FLASH_H}] cos_mean={cos_mean:.5f} "
+        f"cos_min={cos_min:.5f} max_abs={max_abs:.4f}"
+    )
+    assert not torch.isnan(out).any()
+    assert cos_mean > 0.999, f"flat512 absolute oracle failed: cos={cos_mean}"
+
+
+def test_flash_flat512_padded_stride_i64():
+    """Flash H=8 flat512: padded vLLM-like stride with phys*stride overflowing int32.
+
+    Production GSM8K faults came from ``token_base = phys * stride`` in i32 with
+    stride ≈ 1_039_680 and phys ≳ 2070.  This compares a contiguous baseline to a
+    padded pool at phys >= 2100 (product > 2^31-1) under the same CSR gather.
+    """
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_2region
+
+    device = "cuda"
+    block_size = 64
+    # Production-like padded page stride (bytes); phys>=2100 overflows int32 multiply.
+    pad_stride = 1_039_680
+    phys0, phys1 = 2100, 2200  # both overflow: 2100*1039680 > 2**31-1
+    assert phys0 * pad_stride > 2**31 - 1
+
+    main_tokens, extra_tokens = 64, 64  # one physical block each
+    main_kv = _gen_kv(main_tokens, seed=81)
+    extra_kv = _gen_kv(extra_tokens, seed=82)
+    main_c = _pack_flat512_cache(main_kv, block_size, is_ocp=False)
+    extra_c = _pack_flat512_cache(extra_kv, block_size, is_ocp=True)
+    main_rows = [[0, 1, 2, 3, 4, 5, 6, 7]]
+    extra_rows = [[0, 1, 2, 3]]
+    sq = 1
+    q = _gen_q(sq, FLASH_H, seed=83)
+    main_indices, main_indptr = _ragged_from_rows(main_rows, device)
+    extra_indices, extra_indptr = _ragged_from_rows(extra_rows, device)
+    sink = torch.randn(FLASH_H, dtype=torch.float32, device=device) * 0.3
+
+    out_base = torch.empty(sq, FLASH_H, PACKED_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    main_bt_id = _identity_block_table(main_tokens, block_size, device)
+    extra_bt_id = _identity_block_table(extra_tokens, block_size, device)
+    flydsl_sparse_mla_prefill_2region(
+        q, out_base,
+        main_c, main_indices, main_indptr, main_bt_id,
+        extra_c, extra_indices, extra_indptr, extra_bt_id,
+        block_size=block_size, attn_sink=sink,
+        main_is_fnuz=True, extra_is_fnuz=False,
+        q_scale=1.0, main_kv_scale=1.0,
+    )
+
+    main_pad, main_bt = _as_padded_flat512(main_c, pad_stride, [phys0])
+    extra_pad, extra_bt = _as_padded_flat512(extra_c, pad_stride, [phys1])
+    assert main_pad.stride(0) == pad_stride
+    out_pad = torch.empty_like(out_base)
+    flydsl_sparse_mla_prefill_2region(
+        q, out_pad,
+        main_pad, main_indices, main_indptr, main_bt,
+        extra_pad, extra_indices, extra_indptr, extra_bt,
+        block_size=block_size, attn_sink=sink,
+        main_is_fnuz=True, extra_is_fnuz=False,
+        q_scale=1.0, main_kv_scale=1.0,
+    )
+    cos_mean, cos_min, max_abs = _metrics(out_pad, out_base)
+    print(
+        f"[flash_flat512_padded H={FLASH_H}] phys={phys0}/{phys1} stride={pad_stride} "
+        f"overflow_i32={phys0 * pad_stride > 2**31 - 1} "
+        f"cos_mean={cos_mean:.5f} cos_min={cos_min:.5f} max_abs={max_abs:.4f}"
+    )
+    assert not torch.isnan(out_pad).any(), "NaN in padded-path output"
+    assert cos_mean > 0.999, f"padded vs contiguous mismatch: cos={cos_mean}"
+
+
+def test_flash_flat512_empty_region1():
+    """Flash flat512: empty compressed region1, non-empty SWA region0 + sink."""
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill_2region
+
+    device = "cuda"
+    block_size = 64
+    main_tokens = 128
+    main_kv = _gen_kv(main_tokens, seed=91)
+    # Extra cache must exist for layout detect, but CSR span is empty.
+    extra_kv = _gen_kv(block_size, seed=92)
+    main_c = _pack_flat512_cache(main_kv, block_size, is_ocp=False)
+    extra_c = _pack_flat512_cache(extra_kv, block_size, is_ocp=True)
+    main_rows = [[10, 11, 12, 13, 20, 21]]
+    extra_rows = [[]]  # empty region1
+    sq = 1
+    q = _gen_q(sq, FLASH_H, seed=93)
+    main_indices, main_indptr = _ragged_from_rows(main_rows, device)
+    extra_indices, extra_indptr = _ragged_from_rows(extra_rows, device)
+    main_bt = _identity_block_table(main_tokens, block_size, device)
+    extra_bt = _identity_block_table(block_size, block_size, device)
+    sink = torch.randn(FLASH_H, dtype=torch.float32, device=device) * 0.25
+
+    out = torch.full((sq, FLASH_H, PACKED_HEAD_DIM), 7.0, dtype=torch.bfloat16, device=device)
+    flydsl_sparse_mla_prefill_2region(
+        q, out,
+        main_c, main_indices, main_indptr, main_bt,
+        extra_c, extra_indices, extra_indptr, extra_bt,
+        block_size=block_size, attn_sink=sink,
+        main_is_fnuz=True, extra_is_fnuz=False,
+        q_scale=1.0, main_kv_scale=1.0,
+    )
+    assert not torch.isnan(out).any(), "NaN with empty region1"
+    written = int((out != 7.0).sum().item())
+    print(f"[flash_flat512_empty_r1 H={FLASH_H}] written={written}/{out.numel()}")
+    assert written == out.numel(), "empty-r1 path must still write region0+sink output"
+
+
 def test_flash_output_oob_canary():
     """Permanent canary for the flash (H=8) surplus-head output-masking contract.
 
@@ -1305,6 +1504,9 @@ def _main():
     test_flash_packed_single_region()
     test_flash_2region()
     test_flash_2region_multitile()
+    test_flash_flat512_contiguous_oracle()
+    test_flash_flat512_padded_stride_i64()
+    test_flash_flat512_empty_region1()
     test_flash_output_oob_canary()
     print("ALL TESTS PASSED")
     return 0

@@ -45,13 +45,14 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, memref
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator
+from aiter.ops.flydsl.kernels import buffer_ops
 
 # ---------------------------------------------------------------------------
 # Compile-time constants (Phase A: HEAD_DIM=512, V_DIM=512, no rope, no sink)
@@ -959,6 +960,9 @@ def compile_sparse_mla_prefill_paged(
        "glm_flat576" -- GLM/DSv3.2 flat fp8 rows (``head_dim`` fp8 bytes per
                        token, latent+rope both fp8, per-tensor scale, no scale
                        region).  Single region only.
+       "dsv4_flat512" -- vLLM ROCm fp8_e4m3 production layout: flat 512 B fp8
+                       rows (NoPE+RoPE all fp8, per-tensor scale outside the
+                       cache).  Two-region only (SWA fnuz + compressed OCP).
     scale_mode:  ``per_tensor`` enables runtime ``q_scale`` / ``kv_scale`` f32
                  launch args (GLM).  DSv4 UE8M0 scales stay in the cache bytes.
     """
@@ -978,13 +982,18 @@ def compile_sparse_mla_prefill_paged(
 
     # ---- head-dim-dependent constants (shadow the module 512 defaults) ----
     GLM_FLAT = cache_layout == "glm_flat576"
-    USE_PT_SCALE = scale_mode == "per_tensor"
-    if cache_layout not in ("fp8_ds_mla", "glm_flat576"):
+    DSV4_FLAT = cache_layout == "dsv4_flat512"
+    USE_PT_SCALE = scale_mode == "per_tensor" or DSV4_FLAT
+    if cache_layout not in ("fp8_ds_mla", "glm_flat576", "dsv4_flat512"):
         raise NotImplementedError(f"unknown cache_layout {cache_layout!r}")
     if GLM_FLAT and NREG != 1:
         raise NotImplementedError("glm_flat576 is single-region only")
     if GLM_FLAT and not USE_PT_SCALE:
         raise NotImplementedError("glm_flat576 requires scale_mode='per_tensor'")
+    if DSV4_FLAT and (NREG != 2 or int(head_dim) != 512):
+        raise NotImplementedError("dsv4_flat512 requires num_regions=2, head_dim=512")
+    if DSV4_FLAT and ROPE_BF16:
+        raise NotImplementedError("dsv4_flat512 stores RoPE as fp8; use rope_bf16=False")
     # bf16 RoPE split-dot is DSv4-only (448 fp8 NoPE + 64 bf16 RoPE). GLM stores
     # the whole 576 row as fp8, so its rope is genuinely fp8 (no bf16 tail).
     if ROPE_BF16 and (GLM_FLAT or int(head_dim) != 512):
@@ -1060,11 +1069,11 @@ def compile_sparse_mla_prefill_paged(
         assert BLOCK_N * RBF_ROW_STRIDE <= SZ_LDS_KV, (
             f"bf16 RoPE K tile {BLOCK_N * RBF_ROW_STRIDE} B exceeds dead KV buffer {SZ_LDS_KV} B"
         )
-    # Flat (GLM) rows have no scale region and store rope as fp8, so the row
-    # stride equals head_dim bytes; DSv4 packed rows are 584 B with a 576 B
-    # data sub-region.
-    PK_TOKEN_BYTES = QK_HEAD_DIM if GLM_FLAT else 576
-    PK_CACHE_ROW = QK_HEAD_DIM if GLM_FLAT else 584
+    # Flat rows have no scale region and store rope as fp8, so the row stride
+    # equals head_dim bytes; DSv4 packed rows are 584 B with a 576 B data
+    # sub-region.
+    PK_TOKEN_BYTES = QK_HEAD_DIM if (GLM_FLAT or DSV4_FLAT) else 576
+    PK_CACHE_ROW = QK_HEAD_DIM if (GLM_FLAT or DSV4_FLAT) else 584
 
     base_scale = (QK_HEAD_DIM ** -0.5) if softmax_scale is None else float(softmax_scale)
     SOFTMAX_SCALE = fx.Float32(base_scale)
@@ -1092,6 +1101,8 @@ def compile_sparse_mla_prefill_paged(
         extra_block_size: fx.Int32,
         main_max_blocks: fx.Int32,
         extra_max_blocks: fx.Int32,
+        main_cache_block_stride: fx.Int32,
+        extra_cache_block_stride: fx.Int32,
     ):
         fm_no_inf = (
             arith.FastMathFlags.nnan
@@ -1219,10 +1230,21 @@ def compile_sparse_mla_prefill_paged(
         kv_ld_col_base = _i32((lane_idx % 16) * 4)
 
         # ---- token_base / scale_base (bytes) for this lane's KV row, or -1 ----
-        def _row_addrs(idx_rsrc, bt_rsrc, num_rows_i32, block_size_i32, max_blocks_i32, kv_tile_start_i32, kv_end_i32):
+        def _row_addrs(
+            idx_rsrc,
+            bt_rsrc,
+            num_rows_i32,
+            block_size_i32,
+            max_blocks_i32,
+            kv_tile_start_i32,
+            kv_end_i32,
+            cache_block_stride_i32,
+        ):
             row_idx = kv_ld_row_base + _idx(kv_tile_start_i32)
             in_range = row_idx < _idx(kv_end_i32)
-            slot = buffer_ops.buffer_load(idx_rsrc, _i32(row_idx), vec_width=1, dtype=T.i32)
+            slot = fx.Int32(-1)
+            if in_range:
+                slot = buffer_ops.buffer_load(idx_rsrc, _i32(row_idx), vec_width=1, dtype=T.i32)
             slot_a = ArithValue(slot)
             valid = ArithValue(_raw(in_range)) & (slot_a >= 0) & (slot_a < ArithValue(num_rows_i32))
             safe_slot = ArithValue(_raw(valid)).select(_raw(slot), _raw(c_zero_i32))
@@ -1230,17 +1252,27 @@ def compile_sparse_mla_prefill_paged(
             block_idx = ArithValue(safe_slot).with_signedness(False) // bsz
             pos = ArithValue(safe_slot) - ArithValue(_raw(block_idx)) * bsz
             bt_index = ArithValue(req_id) * ArithValue(max_blocks_i32) + ArithValue(_raw(block_idx))
-            phys = buffer_ops.buffer_load(bt_rsrc, _i32(bt_index), vec_width=1, dtype=T.i32)
-            blk_stride = bsz * PK_CACHE_ROW
-            token_base = ArithValue(phys) * ArithValue(_raw(blk_stride)) + ArithValue(_raw(pos)) * PK_TOKEN_BYTES
-            scale_base = (
-                ArithValue(phys) * ArithValue(_raw(blk_stride))
-                + bsz * PK_TOKEN_BYTES
-                + ArithValue(_raw(pos)) * 8
+            phys = c_zero_i32
+            if valid:
+                phys = buffer_ops.buffer_load(bt_rsrc, _i32(bt_index), vec_width=1, dtype=T.i32)
+            phys_i64 = ArithValue(ArithValue(_raw(phys)).extsi(T.i64))
+            stride_i64 = ArithValue(ArithValue(_raw(cache_block_stride_i32)).extui(T.i64))
+            pos_i64 = ArithValue(ArithValue(_raw(pos)).extsi(T.i64))
+            bsz_i64 = ArithValue(ArithValue(_raw(block_size_i32)).extui(T.i64))
+            pk_i64 = ArithValue(fx.Int64(PK_TOKEN_BYTES))
+            token_base_i64 = phys_i64 * stride_i64 + pos_i64 * pk_i64
+            scale_base_i64 = (
+                phys_i64 * stride_i64
+                + bsz_i64 * pk_i64
+                + pos_i64 * ArithValue(fx.Int64(8))
             )
-            tb = ArithValue(_raw(valid)).select(_raw(token_base), _raw(fx.Int32(-1)))
-            sb = ArithValue(_raw(valid)).select(_raw(scale_base), _raw(c_zero_i32))
-            return _i32(tb), _i32(sb)
+            tb = ArithValue(_raw(valid)).select(_raw(token_base_i64), _raw(fx.Int64(0)))
+            sb = ArithValue(_raw(valid)).select(_raw(scale_base_i64), _raw(fx.Int64(0)))
+            return _raw(tb), _raw(sb), _raw(valid)
+
+        def _packed_token_base_i32(token_base_i64, valid):
+            tb_i32 = ArithValue(ArithValue(_raw(token_base_i64)).trunci(T.i32))
+            return _i32(ArithValue(_raw(valid)).select(_raw(tb_i32), _raw(fx.Int32(-1))))
 
         # ---- NoPE DMA load (region0 fnuz fast path), blocks 0..6 ----
         def _load_nope_dma(cache_rsrc, p_lds_kv_warp, token_base_i32):
@@ -1323,7 +1355,11 @@ def compile_sparse_mla_prefill_paged(
                     zero2 = Vec.from_elements([c_zero_i32, c_zero_i32], fx.Int32)
                     _ptr_store(zero2, _lds_ptr_from_i32(rbf_addr), alignment=8)
             else:
-                byte_off = ArithValue(token_base_i32) + PK_NOPE_BYTES + kv_ld_col_base * 2
+                byte_off = (
+                    ArithValue(token_base_i32)
+                    + ArithValue(fx.Int32(PK_NOPE_BYTES))
+                    + kv_ld_col_base * 2
+                )
                 pair = buffer_ops.buffer_load(
                     cache_rsrc, _i32(byte_off.with_signedness(False) // 4), vec_width=2, dtype=T.i32
                 )
@@ -1337,23 +1373,82 @@ def compile_sparse_mla_prefill_paged(
         # ---- GLM flat fp8 load: whole row is fp8 (latent+rope), row stride =
         # head_dim bytes; DMA all KV_NUM_BLOCKS 64-col blocks straight to LDS.
         # The per-tensor scale is folded in the softmax/output, not here.
-        def _load_flat_dma(cache_rsrc, p_lds_kv_warp, token_base_i32):
+        def _load_flat_dma(cache_tensor, cache_rsrc_global, p_lds_kv_warp, token_base_i64, valid):
+            if const_expr(DSV4_FLAT):
+                cache_base_i64 = ArithValue(
+                    arith.index_cast(
+                        T.i64, _raw(buffer_ops.extract_base_index(cache_tensor))
+                    )
+                )
+                cache_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    _raw(cache_base_i64 + token_base_i64),
+                    num_records_bytes=PK_TOKEN_BYTES,
+                )
+                token_base_i32 = c_zero_i32
+            else:
+                cache_rsrc = cache_rsrc_global
+                token_base_i32 = _packed_token_base_i32(token_base_i64, valid)
             for blk in range_constexpr(KV_NUM_BLOCKS):
                 lds_adjust = blk * KV_BLOCK_BYTES - blk * KV_NUM_COLS
                 lds_base_i32 = _i32(ArithValue(p_lds_kv_warp) + lds_adjust)
-                is_oob = ArithValue(token_base_i32) == -1
+                is_oob = (
+                    ArithValue(_raw(valid)) == 0
+                    if const_expr(DSV4_FLAT)
+                    else ArithValue(token_base_i32) == -1
+                )
                 if is_oob:
                     lds_addr = _i32(ArithValue(lds_base_i32) + blk * KV_NUM_COLS + _i32(lane_idx) * 4)
                     _ptr_store(c_zero_i32, _lds_ptr_from_i32(lds_addr), alignment=4)
                 else:
-                    voff = _i32(ArithValue(token_base_i32) + kv_ld_col_base)
+                    voff = (
+                        kv_ld_col_base
+                        if const_expr(DSV4_FLAT)
+                        else _i32(ArithValue(token_base_i32) + kv_ld_col_base)
+                    )
                     rocdl.buffer_load_to_lds(
                         cache_rsrc, _lds_ptr_from_i32(lds_base_i32), voff, offset=blk * KV_NUM_COLS
                     )
 
-        def _prefetch_flat_tile_asm(cache_rsrc, p_lds_kv_warp, token_base_i32, block_idx_const):
+        # Flat 512 all-fp8 row (vLLM fp8_e4m3 per-tensor): OCP bytes -> fnuz LDS.
+        def _load_flat_all_fp8_ocp_convert(
+            cache_tensor, cache_rsrc_global, p_lds_kv_warp, token_base_i64, valid
+        ):
+            cache_base_i64 = ArithValue(
+                arith.index_cast(T.i64, _raw(buffer_ops.extract_base_index(cache_tensor)))
+            )
+            cache_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                _raw(cache_base_i64 + token_base_i64),
+                num_records_bytes=PK_TOKEN_BYTES,
+            )
+            bias_f32 = fx.Float32(1.0)
+            sc = _fast_exp2(bias_f32)
+            for blk in range_constexpr(KV_NUM_BLOCKS):
+                dst_addr = _i32(ArithValue(p_lds_kv_warp) + blk * KV_BLOCK_BYTES + _i32(lane_idx) * 4)
+                is_oob = ArithValue(_raw(valid)) == 0
+                if is_oob:
+                    _ptr_store(c_zero_i32, _lds_ptr_from_i32(dst_addr), alignment=4)
+                else:
+                    byte_off = kv_ld_col_base + blk * KV_NUM_COLS
+                    word = buffer_ops.buffer_load(
+                        cache_rsrc, _i32(byte_off.with_signedness(False) // 4), vec_width=1, dtype=T.i32
+                    )
+                    f01 = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(word), 0))
+                    f23 = Vec(rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(word), 1))
+                    f0 = _flush_nan(_fmul(f01[0], sc))
+                    f1 = _flush_nan(_fmul(f01[1], sc))
+                    f2 = _flush_nan(_fmul(f23[0], sc))
+                    f3 = _flush_nan(_fmul(f23[1], sc))
+                    w = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f0), _raw(f1), c_zero_i32, 0)
+                    w = rocdl.cvt_pk_fp8_f32(T.i32, _raw(f2), _raw(f3), w, 1)
+                    _ptr_store(w, _lds_ptr_from_i32(dst_addr), alignment=4)
+
+        def _prefetch_flat_tile_asm(
+            cache_rsrc, p_lds_kv_warp, token_base_i64, valid, block_idx_const
+        ):
+            # GLM packed path only: global rsrc + i32 token voffset (Pro-style).
             lds_adjust = block_idx_const * KV_BLOCK_BYTES - block_idx_const * KV_NUM_COLS
             lds_base_i32 = _i32(ArithValue(p_lds_kv_warp) + lds_adjust)
+            token_base_i32 = _packed_token_base_i32(token_base_i64, valid)
 
             def _emit_normal_load():
                 voff = _i32(ArithValue(token_base_i32) + kv_ld_col_base)
@@ -1630,8 +1725,10 @@ def compile_sparse_mla_prefill_paged(
             rse_in,
             is_first,
             p_lds_kv_next_warp=None,
+            prefetch_cache_tensor=None,
             prefetch_cache_rsrc=None,
             token_base_next=None,
+            valid_next=None,
             q_rope_b=None,
         ):
             k_base_i32 = _i32(ArithValue(p_lds_kv_base) + k_lds_lane_offset)
@@ -1640,7 +1737,13 @@ def compile_sparse_mla_prefill_paged(
             def _maybe_prefetch(block_idx):
                 if const_expr(not do_prefetch):
                     return
-                _prefetch_flat_tile_asm(prefetch_cache_rsrc, p_lds_kv_next_warp, token_base_next, block_idx)
+                _prefetch_flat_tile_asm(
+                    prefetch_cache_rsrc,
+                    p_lds_kv_next_warp,
+                    token_base_next,
+                    valid_next,
+                    block_idx,
+                )
 
             _maybe_prefetch(0)
             P_COMP_SUBS = BLOCK_N // MFMA_N
@@ -1781,7 +1884,12 @@ def compile_sparse_mla_prefill_paged(
             # sink: fold a per-head virtual key (score=sink[h], zero value).
             if const_expr(HAS_SINK):
                 head = _i32(ArithValue(_uniform_i32(warp_idx)) * 16 + ArithValue(_i32(lane_idx % 16)))
-                sink_val = _f32(buffer_ops.buffer_load(sink_rsrc, head, vec_width=1, dtype=T.f32))
+                head_in = _raw(ArithValue(head) < NUM_Q_HEADS)
+                safe_head = ArithValue(head_in).select(_raw(head), _raw(c_zero_i32))
+                sink_raw = buffer_ops.buffer_load(sink_rsrc, safe_head, vec_width=1, dtype=T.f32)
+                sink_val = _f32(
+                    ArithValue(head_in).select(_raw(sink_raw), _raw(c_neg_inf))
+                )
                 m_fin = _fmax(rm, sink_val)
                 alpha = _fast_exp2(_fmul(_fsub(rm, m_fin), c_log2e))
                 sink_term = _fast_exp2(_fmul(_fsub(sink_val, m_fin), c_log2e))
@@ -1838,21 +1946,24 @@ def compile_sparse_mla_prefill_paged(
 
         # ---- region-0 attend body (single-region: const-fixed resources) ----
         def _attend_region0(kv_tile_start_i32, rm_in, rse_in, oaccu_in, is_first):
-            tb, sb = _row_addrs(
+            tb, sb, valid = _row_addrs(
                 main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size, main_max_blocks,
-                kv_tile_start_i32, main_end,
+                kv_tile_start_i32, main_end, main_cache_block_stride,
             )
             if const_expr(GLM_FLAT):
-                _load_flat_dma(main_cache_rsrc, p_lds_kv_0_warp, tb)
+                _load_flat_dma(main_cache, main_cache_rsrc, p_lds_kv_0_warp, tb, valid)
+            elif const_expr(DSV4_FLAT):
+                _load_flat_dma(main_cache, main_cache_rsrc, p_lds_kv_0_warp, tb, valid)
             else:
+                packed_tb = _packed_token_base_i32(tb, valid)
                 if const_expr(R0_CONVERT):
                     _load_nope_convert(
-                        main_cache_rsrc, p_lds_kv_0_warp, tb, sb,
+                        main_cache_rsrc, p_lds_kv_0_warp, packed_tb, _i32(sb),
                         fx.Float32(1.0) if R0_OCP else fx.Float32(0.0),
                     )
                 else:
-                    _load_nope_dma(main_cache_rsrc, p_lds_kv_0_warp, tb)
-                _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb)
+                    _load_nope_dma(main_cache_rsrc, p_lds_kv_0_warp, packed_tb)
+                _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, packed_tb)
             _barrier(vmcnt=0, lgkmcnt=0)
             rocdl.sched_barrier(0)
             rm_n, rse_n, p_pack, rescale = _process_tile_gemm1(
@@ -1885,15 +1996,26 @@ def compile_sparse_mla_prefill_paged(
             if is_r1:
                 local = _raw(ArithValue(global_t_i32) - ArithValue(n0_tiles))
                 kv_ts = _raw(ArithValue(extra_start) + ArithValue(local) * BLOCK_N)
-                tb, sb = _row_addrs(
+                tb, sb, valid = _row_addrs(
                     extra_indices_rsrc, extra_bt_rsrc, extra_num_rows, extra_block_size,
-                    extra_max_blocks, kv_ts, extra_end,
+                    extra_max_blocks, kv_ts, extra_end, extra_cache_block_stride,
                 )
-                _load_nope_convert(
-                    extra_cache_rsrc, p_lds_kv_0_warp, tb, sb,
-                    fx.Float32(1.0) if R1_OCP else fx.Float32(0.0),
-                )
-                _load_rope_block(extra_cache_rsrc, p_lds_kv_0_warp, tb)
+                if const_expr(DSV4_FLAT):
+                    if const_expr(R1_OCP):
+                        _load_flat_all_fp8_ocp_convert(
+                            extra_cache, extra_cache_rsrc, p_lds_kv_0_warp, tb, valid
+                        )
+                    else:
+                        _load_flat_dma(
+                            extra_cache, extra_cache_rsrc, p_lds_kv_0_warp, tb, valid
+                        )
+                else:
+                    packed_tb = _packed_token_base_i32(tb, valid)
+                    _load_nope_convert(
+                        extra_cache_rsrc, p_lds_kv_0_warp, packed_tb, _i32(sb),
+                        fx.Float32(1.0) if R1_OCP else fx.Float32(0.0),
+                    )
+                    _load_rope_block(extra_cache_rsrc, p_lds_kv_0_warp, packed_tb)
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
                 rm_n, rse_n, pp, rescale = _process_tile_gemm1(
@@ -1902,18 +2024,23 @@ def compile_sparse_mla_prefill_paged(
                 )
             else:
                 kv_ts = _raw(ArithValue(main_start) + ArithValue(global_t_i32) * BLOCK_N)
-                tb, sb = _row_addrs(
+                tb, sb, valid = _row_addrs(
                     main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size,
-                    main_max_blocks, kv_ts, main_end,
+                    main_max_blocks, kv_ts, main_end, main_cache_block_stride,
                 )
-                if const_expr(R0_CONVERT):
+                if const_expr(DSV4_FLAT):
+                    _load_flat_dma(main_cache, main_cache_rsrc, p_lds_kv_0_warp, tb, valid)
+                elif const_expr(R0_CONVERT):
+                    packed_tb = _packed_token_base_i32(tb, valid)
                     _load_nope_convert(
-                        main_cache_rsrc, p_lds_kv_0_warp, tb, sb,
+                        main_cache_rsrc, p_lds_kv_0_warp, packed_tb, _i32(sb),
                         fx.Float32(1.0) if R0_OCP else fx.Float32(0.0),
                     )
                 else:
-                    _load_nope_dma(main_cache_rsrc, p_lds_kv_0_warp, tb)
-                _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, tb)
+                    packed_tb = _packed_token_base_i32(tb, valid)
+                    _load_nope_dma(main_cache_rsrc, p_lds_kv_0_warp, packed_tb)
+                if const_expr(not DSV4_FLAT):
+                    _load_rope_block(main_cache_rsrc, p_lds_kv_0_warp, packed_tb)
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
                 rm_n, rse_n, pp, rescale = _process_tile_gemm1(
@@ -1923,18 +2050,20 @@ def compile_sparse_mla_prefill_paged(
             return rm_n, rse_n, pp, rescale
 
         if const_expr(NREG == 1 and GLM_FLAT):
-            tb_first, _sb_first = _row_addrs(
+            tb_first, _sb_first, valid_first = _row_addrs(
                 main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size, main_max_blocks,
-                main_start, main_end,
+                main_start, main_end, main_cache_block_stride,
             )
-            _load_flat_dma(main_cache_rsrc, p_lds_kv_0_warp, tb_first)
+            _load_flat_dma(
+                main_cache, main_cache_rsrc, p_lds_kv_0_warp, tb_first, valid_first
+            )
             has_multi = ArithValue(n0_tiles) > 1
 
             def _multi_tile_path_glm():
                 kv_tile1_start = _raw(ArithValue(main_start) + BLOCK_N)
-                tb_tile1, _sb_tile1 = _row_addrs(
+                tb_tile1, _sb_tile1, valid_tile1 = _row_addrs(
                     main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size, main_max_blocks,
-                    kv_tile1_start, main_end,
+                    kv_tile1_start, main_end, main_cache_block_stride,
                 )
                 _barrier(vmcnt=0, lgkmcnt=0)
                 rocdl.sched_barrier(0)
@@ -1942,8 +2071,10 @@ def compile_sparse_mla_prefill_paged(
                     main_indices_rsrc, main_num_rows, p_lds_kv_0_base, main_start, main_end,
                     q_nope_packs, c_neg_large, c_zero_f32, True,
                     p_lds_kv_next_warp=p_lds_kv_1_warp,
+                    prefetch_cache_tensor=main_cache,
                     prefetch_cache_rsrc=main_cache_rsrc,
                     token_base_next=tb_tile1,
+                    valid_next=valid_tile1,
                 )
                 oaccu_first = _gemm2_first_iter(p_pack_first, _vt_base_i32())
 
@@ -1953,9 +2084,9 @@ def compile_sparse_mla_prefill_paged(
                     tile_i32_a = ArithValue(fx.Int32(tile_iv))
                     kv_ts = _raw(ArithValue(main_start) + tile_i32_a * BLOCK_N)
                     kv_next = _raw(ArithValue(kv_ts) + BLOCK_N)
-                    tb_next, _sb_next = _row_addrs(
+                    tb_next, _sb_next, valid_next = _row_addrs(
                         main_indices_rsrc, main_bt_rsrc, main_num_rows, main_block_size, main_max_blocks,
-                        kv_next, main_end,
+                        kv_next, main_end, main_cache_block_stride,
                     )
                     rm_c = state[0]
                     rse_c = state[1]
@@ -1969,8 +2100,10 @@ def compile_sparse_mla_prefill_paged(
                         main_indices_rsrc, main_num_rows, curr_base, kv_ts, main_end,
                         q_nope_packs, rm_c, rse_c, False,
                         p_lds_kv_next_warp=next_warp,
+                        prefetch_cache_tensor=main_cache,
                         prefetch_cache_rsrc=main_cache_rsrc,
                         token_base_next=tb_next,
+                        valid_next=valid_next,
                     )
                     oaccu_n = _gemm2_with_rescale(pp, rescale, oaccu_c, _vt_base_i32())
                     results = yield [rm_n, rse_n] + oaccu_n
@@ -2103,6 +2236,8 @@ def compile_sparse_mla_prefill_paged(
         extra_block_size: fx.Int32,
         main_max_blocks: fx.Int32,
         extra_max_blocks: fx.Int32,
+        main_cache_block_stride: fx.Int32,
+        extra_cache_block_stride: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         grid_x = arith.index_cast(T.index, _raw(num_queries))
@@ -2112,6 +2247,7 @@ def compile_sparse_mla_prefill_paged(
             q_req, sink_buf, final_output, q_scale, kv_scale, SOFTMAX_SCALE,
             main_num_rows, extra_num_rows, main_block_size, extra_block_size,
             main_max_blocks, extra_max_blocks,
+            main_cache_block_stride, extra_cache_block_stride,
         ).launch(grid=(grid_x, 1, 1), block=(NUM_THREADS, 1, 1), smem=0, stream=stream)
 
     return launch_paged
@@ -2214,6 +2350,11 @@ def compile_sparse_mla_prefill(
             raise NotImplementedError("glm_flat576: head_dim=576, single-region, no sink")
         if scale_mode != "per_tensor":
             raise NotImplementedError("glm_flat576 requires scale_mode='per_tensor'")
+    elif cache_layout == "dsv4_flat512":
+        if head_dim != 512 or num_regions != 2:
+            raise NotImplementedError("dsv4_flat512: head_dim=512, num_regions=2")
+        if scale_mode != "per_tensor":
+            raise NotImplementedError("dsv4_flat512 requires scale_mode='per_tensor'")
     elif head_dim != 512:
         raise NotImplementedError("fp8_ds_mla cache_layout requires head_dim=512")
     # region0 (SWA) is fnuz; UE8M0 != 1 forces the convert load path. GLM flat

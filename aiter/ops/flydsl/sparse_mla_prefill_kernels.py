@@ -201,6 +201,74 @@ def _packed_cache_u8(cache: torch.Tensor, block_size: int) -> tuple[torch.Tensor
     return cache_u8, num_rows, num_blocks
 
 
+def _flat512_cache_u8(cache: torch.Tensor, block_size: int) -> tuple[torch.Tensor, int, int, int]:
+    """vLLM ROCm fp8_e4m3 flat cache [num_blocks, block_size, 512] (1 B/elem).
+
+    vLLM page pools may pad ``stride(0)`` beyond ``block_size * 512``; the kernel
+    uses ``block_stride_bytes`` for physical block indexing.
+    """
+    if cache.dim() != 3 or cache.shape[-1] != HEAD_DIM:
+        raise ValueError(
+            f"flat512 cache must be [num_blocks, block_size, {HEAD_DIM}], got {tuple(cache.shape)}"
+        )
+    num_blocks, blk, _ = cache.shape
+    if blk != block_size:
+        raise ValueError(f"cache block_size {blk} != block_size arg {block_size}")
+    if cache.element_size() != 1:
+        raise ValueError("flat512 cache must be a 1-byte dtype (fp8 or uint8)")
+    token_stride_bytes = int(cache.stride(1) * cache.element_size())
+    if token_stride_bytes != HEAD_DIM:
+        raise ValueError(
+            f"flat512 cache token stride must be {HEAD_DIM} B, got {token_stride_bytes}"
+        )
+    if int(cache.stride(2) * cache.element_size()) != 1:
+        raise ValueError("flat512 cache last dim must be contiguous")
+    block_stride_bytes = int(cache.stride(0) * cache.element_size())
+    min_block_bytes = block_size * HEAD_DIM
+    if block_stride_bytes < min_block_bytes:
+        raise ValueError(
+            f"flat512 block stride {block_stride_bytes} B < {min_block_bytes} B "
+            f"(block_size={block_size})"
+        )
+    num_rows = num_blocks * block_size
+    # Keep the (possibly padded) 3D/uint8 view.  Do NOT flatten to a 1D span of
+    # ``(num_blocks-1)*block_stride`` -- that shape exceeds int32 for production
+    # vLLM page strides (~1e6) with phys ≳ 2e3, and the FlyDSL host ABI packs
+    # memref dims as int32.  The kernel indexes via i64 ``phys * stride`` from
+    # ``data_ptr`` instead.
+    cache_u8 = cache.view(torch.uint8)
+    return cache_u8, num_rows, num_blocks, block_stride_bytes
+
+
+def _cache_block_stride_bytes(cache: torch.Tensor, block_size: int, row_bytes: int) -> int:
+    """Byte stride between physical KV blocks (may exceed block_size * row_bytes)."""
+    block_stride_bytes = int(cache.stride(0) * cache.element_size())
+    min_block_bytes = block_size * row_bytes
+    if block_stride_bytes < min_block_bytes:
+        raise ValueError(
+            f"cache block stride {block_stride_bytes} B < {min_block_bytes} B "
+            f"(block_size={block_size}, row_bytes={row_bytes})"
+        )
+    return block_stride_bytes
+
+
+def _resolve_paged_cache(
+    cache: torch.Tensor, block_size: int
+) -> tuple[str, torch.Tensor, int, int, int]:
+    last = cache.shape[-1]
+    if last == 584:
+        cache_u8, num_rows, num_blocks = _packed_cache_u8(cache, block_size)
+        block_stride = _cache_block_stride_bytes(cache, block_size, 584)
+        return "fp8_ds_mla", cache_u8, num_rows, num_blocks, block_stride
+    if last == HEAD_DIM:
+        cache_u8, num_rows, num_blocks, block_stride = _flat512_cache_u8(cache, block_size)
+        return "dsv4_flat512", cache_u8, num_rows, num_blocks, block_stride
+    raise ValueError(
+        f"unsupported cache row width {last}; expected 584 (packed fp8_ds_mla) "
+        f"or {HEAD_DIM} (flat fp8_e4m3)"
+    )
+
+
 def _glm_cache_u8(cache: torch.Tensor, block_size: int) -> tuple[torch.Tensor, int, int]:
     """GLM/DSv3.2 flat fp8 cache [num_blocks, block_size, 576] (fp8 or uint8).
 
@@ -346,10 +414,12 @@ def flydsl_sparse_mla_prefill(
         cache_layout = "glm_flat576"
         kernel_scale_mode = "per_tensor"
         cache_u8, default_rows, _ = _glm_cache_u8(kv, block_size)
+        block_stride = _cache_block_stride_bytes(kv, block_size, GLM_CACHE_ROW)
     else:
         cache_layout = "fp8_ds_mla"
         kernel_scale_mode = scale_mode
         cache_u8, default_rows, _ = _packed_cache_u8(kv, block_size)
+        block_stride = _cache_block_stride_bytes(kv, block_size, 584)
     n_kv_rows = int(num_kv_rows) if num_kv_rows is not None else default_rows
     if block_table.dim() != 2:
         raise ValueError(f"block_table must be 2D [num_reqs, max_blocks], got {tuple(block_table.shape)}")
@@ -394,6 +464,8 @@ def flydsl_sparse_mla_prefill(
             int(block_size),
             int(max_blocks),
             int(max_blocks),
+            int(block_stride),
+            int(block_stride),
             _fx_stream(q.device, stream),
         )
 
@@ -420,6 +492,9 @@ def flydsl_sparse_mla_prefill_2region(
     extra_is_fnuz: bool = False,
     main_scale_mode: str = "none",
     rope_bf16: bool = False,
+    q_scale: torch.Tensor | float | None = None,
+    main_kv_scale: torch.Tensor | float | None = None,
+    extra_kv_scale: torch.Tensor | float | None = None,
     single_request: bool = True,
     validate_regions: bool = True,
     stream: torch.cuda.Stream | None = None,
@@ -450,10 +525,16 @@ def flydsl_sparse_mla_prefill_2region(
 
     ``rope_bf16`` selects the QK RoPE precision: ``False`` (default) re-quantizes
     the bf16 RoPE tail to fp8 (faster, ~2-4%); ``True`` dots the 64 RoPE dims in
-    bf16 to match the vLLM NoPE-fp8 / RoPE-bf16 contract.
+    bf16 to match the vLLM NoPE-fp8 / RoPE-bf16 contract (packed 584 layout only).
+
+    For vLLM ROCm ``fp8_e4m3`` flat-512 caches (auto-detected from ``shape[-1]``),
+    pass per-tensor ``q_scale`` / ``main_kv_scale`` / ``extra_kv_scale``; ``rope_bf16``
+    must be ``False``.
     """
-    if main_scale_mode not in ("none", "ue8m0"):
-        raise ValueError(f"main_scale_mode must be 'none' or 'ue8m0', got {main_scale_mode!r}")
+    if main_scale_mode not in ("none", "ue8m0", "per_tensor"):
+        raise ValueError(
+            f"main_scale_mode must be 'none', 'ue8m0', or 'per_tensor', got {main_scale_mode!r}"
+        )
     _require_cuda(q, out, main_cache, extra_cache, main_indices, main_indptr, extra_indices, extra_indptr)
     _check_gfx942(q.device)
     num_queries, num_heads, head_dim, v_dim = _validate_qout(q, out)
@@ -461,8 +542,22 @@ def flydsl_sparse_mla_prefill_2region(
     _require_int32_1d(extra_indptr, "extra_indptr", numel=num_queries + 1)
 
     e_block_size = block_size if extra_block_size is None else extra_block_size
-    m_cache_u8, m_default_rows, _ = _packed_cache_u8(main_cache, block_size)
-    e_cache_u8, e_default_rows, _ = _packed_cache_u8(extra_cache, e_block_size)
+    cache_layout_m, m_cache_u8, m_default_rows, _, m_block_stride = _resolve_paged_cache(main_cache, block_size)
+    cache_layout_e, e_cache_u8, e_default_rows, _, e_block_stride = _resolve_paged_cache(extra_cache, e_block_size)
+    if cache_layout_m != cache_layout_e:
+        raise ValueError(
+            f"main/extra cache layouts must match, got {cache_layout_m} vs {cache_layout_e}"
+        )
+    cache_layout = cache_layout_m
+    flat512 = cache_layout == "dsv4_flat512"
+    if flat512:
+        if rope_bf16:
+            raise ValueError("rope_bf16 is incompatible with flat-512 fp8_e4m3 caches")
+        kernel_scale_mode = "per_tensor"
+        kernel_rope_bf16 = False
+    else:
+        kernel_scale_mode = main_scale_mode
+        kernel_rope_bf16 = rope_bf16
     m_rows = int(main_num_rows) if main_num_rows is not None else m_default_rows
     e_rows = int(extra_num_rows) if extra_num_rows is not None else e_default_rows
 
@@ -503,16 +598,21 @@ def flydsl_sparse_mla_prefill_2region(
 
     if head_dim != HEAD_DIM:
         raise NotImplementedError("two-region path is DSv4-only (head_dim=512); GLM is single-region")
-    q_sc_t = _stub_f32_one(q.device)
-    kv_sc_t = _stub_f32_one(q.device)
+    if flat512:
+        q_sc_t = _resolve_f32_scalar(q_scale, "q_scale", device=q.device)
+        kv_sc_t = _resolve_f32_scalar(main_kv_scale, "main_kv_scale", device=q.device)
+    else:
+        q_sc_t = _stub_f32_one(q.device)
+        kv_sc_t = _stub_f32_one(q.device)
+    _ = extra_kv_scale
     exe = _get_kernel(
         num_q_heads=num_heads,
         head_dim=head_dim, v_dim=v_dim, num_regions=2, has_sink=has_sink,
         r0_dtype="fp8", r0_fnuz=main_is_fnuz, r1_dtype="fp8", r1_fnuz=extra_is_fnuz,
         qk_split=True, block_n=32, block_h=16, split_kv=False, packed=True,
-        scale_mode=main_scale_mode,
+        scale_mode=kernel_scale_mode,
         softmax_scale=DEFAULT_SOFTMAX_SCALE, single_request=single_request,
-        cache_layout="fp8_ds_mla", rope_bf16=rope_bf16,
+        cache_layout=cache_layout, rope_bf16=kernel_rope_bf16,
     )
     with torch.cuda.device(q.device.index):
         _run_compiled(
@@ -538,5 +638,7 @@ def flydsl_sparse_mla_prefill_2region(
             int(e_block_size),
             int(m_max_blocks),
             int(e_max_blocks),
+            int(m_block_stride),
+            int(e_block_stride),
             _fx_stream(q.device, stream),
         )
