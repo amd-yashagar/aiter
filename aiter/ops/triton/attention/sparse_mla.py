@@ -485,7 +485,11 @@ def sparse_mla_fwd(
             extra_indptr,
             extra_indices,
         )
-    assert arch_info.get_arch() == "gfx950", "sparse_mla_fwd is gfx950-only"
+    _arch = arch_info.get_arch()
+    assert _arch in (
+        "gfx950",
+        "gfx942",
+    ), f"sparse_mla_fwd supports gfx950/gfx942, got {_arch}"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(
@@ -522,10 +526,10 @@ def sparse_mla_fwd(
         # The kernel still wants a live pointer for the compile-time-elided slot.
         attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
 
-    # Tuned launch config (gfx950 / MI355). H < 16 runs natively at
-    # BLOCK_M = next_pow2(H) instead of padding heads
+    # gfx950: BLOCK_K=64 (160 KiB LDS). gfx942: BLOCK_K=32 (64 KiB LDS),
+    # matching the serving `_pa_decode_sparse_..._BLOCK_K_32_...` specialization.
     block_m = 16 if num_heads >= 16 else max(8, 1 << (num_heads - 1).bit_length())
-    block_k = 64
+    block_k = 32 if _arch == "gfx942" else 64
     num_warps = block_k // 16
 
     num_rows = cache.shape[0] * block_size if cache.ndim >= 2 else cache.shape[0]
@@ -600,6 +604,11 @@ def sparse_mla_fwd(
         has_extra=False,
         block_k=block_k,
     )
+    if _arch == "gfx942":
+        async_lds_on = False
+        block_k = 32
+        waves_per_eu = 1
+    num_warps = block_k // 16
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
