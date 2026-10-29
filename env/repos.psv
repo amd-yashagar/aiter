@@ -1,0 +1,18 @@
+repo|remote(origin)|other remotes|branch|HEAD|upstream state
+FlyDSL|git@github.com:ROCm/FlyDSL.git||main|b81e99d6|origin/main
+PyISA|git@github.com:AMD-ROCm-Internal/PyISA.git||main|a7473ed|origin/main
+TransferBench|https://github.com/ROCm/TransferBench.git||develop|44dec25|origin/develop
+WaveScope|git@github.com:aghamari/WaveScope.git||main|f1ccaeb|origin/main
+aiter|git@github.com:ROCm/aiter.git|yashagar=git@github.com:amd-yashagar/aiter.git |feat/gfx942-fmha-hd192-split-asm|d7c3e42ca|origin/feat/gfx942-fmha-hd192-split-asm
+amd-gpu-agent-kit|git@github.com:amd-yashagar/amd-gpu-agent-kit.git||main|438d073|origin/main
+flydsl-lab|git@github.com:aghamari/flydsl-lab.git||main|bb2a295|origin/main
+flylens|git@github.com:AMD-ROCm-Internal/flylens.git||feature/wavescope-trace-viewer|0157d12|origin/feature/wavescope-trace-viewer
+poc_kl|git@github.com:AMD-SiloASM/poc_kl.git||feat/gfx942-fmha-hd192-split-asm|9835e16|none
+quilt|git@github.com:AMD-ROCm-Internal/quilt.git||main|3e86678|origin/main
+rocm-systems|https://github.com/ROCm/rocm-systems.git||develop|cbafb09|origin/develop
+ruka-dashboard|git@github.com:AMD-ROCm-Internal/ruka-dashboard.git||main|7ed25cc|origin/main
+workstreams/aiter|git@github.com:ROCm/aiter.git|yashagar=git@github.com:amd-yashagar/aiter.git |ws/glm53-sparse-mla|778ab353d|origin/ws/glm53-sparse-mla
+workstreams/dsv4-flash-yashagar|git@github.com:ROCm/aiter.git|yashagar=git@github.com:amd-yashagar/aiter.git |ws/dsv4-unified-delivery|ce0c52f0b|none
+workstreams/dsv4-pro-sami|git@github.com:ROCm/aiter.git|yashagar=git@github.com:amd-yashagar/aiter.git |ws/dsv4-pro-sami|36b763bc8|origin/samremes/gfx942-sparse-mla-prefill
+/tmp/rocm-libraries-cd9574|https://github.com/ROCm/rocm-libraries.git||HEAD|cd957402|none
+/tmp/vllm-sparse/repo|https://github.com/vllm-project/vllm.git||main|c961121|origin/main

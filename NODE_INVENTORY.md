@@ -28,13 +28,22 @@ No local branch, worktree, or file was changed by the wrap-up.
 
 ## Saved as bundles (no push access from this node)
 
-Saved to the personal agent store `.../files/k08-325-bundles/`. Restore with
-`git fetch <bundle> <branch>:<branch>` inside a clone of the repo.
+In `git-bundles/` of the handover folder (also in the personal agent store `k08-325-bundles/`).
+See the top-level `README.md` for restore commands.
 
 | Repo | Why not pushed | Bundle content |
 |---|---|---|
 | `AMD-SiloASM/poc_kl` | SSH key gets "repository not found" | `feat/gfx942-fmha-hd192-split-asm`, 2 unpushed commits (`84b6033` hd192 split-K FMHA shader, `9835e16` split-kv naming refactor); full-history bundle |
 | `AMD-ROCm-Internal/quilt` | no push rights | `wip/k08-325-snapshot` = `origin/main` `3e86678` + uncommitted gfx942 FMHA hd192 example (`examples/fmha/`, `tests/test_fmha_hd192.py`) and changes to `arch/kernel/mfma/convert` (~+2114/-24) |
+
+## Found during packaging (also in this folder)
+
+| Item | State | Where in this folder |
+|---|---|---|
+| `/tmp/rocm-libraries-cd9574` (ROCm/rocm-libraries @ `cd957402`) | 3 uncommitted hipBLASLt tuning edits (`hipblaslt_random.cpp`, `tensile_config_generator.py`, `tasks.py`) + tuning templates, used for SILOTIGER-857 | `patches/rocm-libraries-*` |
+| SILOTIGER-857 (hipBLASLt / FlyDSL hgemm) | **Source lost.** The `op_tests/silotiger_857_*.py` scripts, `kernels/silotiger857_*` kernels, `REPORT.md`, and `AGENT_HANDOFF.md` are no longer on disk, on any branch, or in git dangling objects. Final result from the chat: best FlyDSL variant ~570 TFLOP/s, did not beat the existing kernel, nothing promoted. | logs/scripts: `data/silotiger_857/`; reasoning: `chat-history/` chats `297eb22f…` and `f9a3ad84…` |
+| `/tmp/featherless-docs/featherless-harness` | vLLM wiring docs and overlays for the sparse MLA work, not in git | `tmp-scratch/featherless-docs/` |
+| Loose `/tmp` prototypes | `sparse_mla_v3/v4.py`, `bench_*sparse*.py`, `branch_*_decode.py`, FMHA `.co`/`.s` experiments, `glm53-sparse-mla-before-rebase.patch`, `5592-{old,new}.diff`, MHA tuning CSVs | `tmp-scratch/` |
 
 ## Deliberately not preserved
 
@@ -42,7 +51,10 @@ Saved to the personal agent store `.../files/k08-325-bundles/`. Restore with
 - `rocm-systems`: only submodule pointer drift and a local `install/` build output.
 - `amd-gpu-agent-kit/.cursor/rules`: generated graphify rule.
 - Local review checkouts of other people's PRs: `pr-4641-review` (Aakif Nawaz, MoE SwiGLU FP8), `pr-5024` (Hui Shi, CK_TILE MHA tuning), worktrees `/tmp/aiter-pr-4641`, and `/tmp/aiter-flydsl-sparse-donor` (already on origin user branches).
-- Non-git data in the workspace: `GLM5.3Flash/` (140 MB prefill traces), `Mehdi/` (15 MB Kimi-K3 serving logs), `.wavescope/` (438 MB ATT captures), `DSv4/deepseek-v4-pro-uplift-plan-tp8.html`. Copy them off manually if needed.
+- ATT captures: `.wavescope/runs` (438 MB) and `/tmp/wavescope-fmha-splitkv-att-*` (150 MB). Only `profiles.json`, launchers, and the run list are kept, in `data/wavescope/`; re-capture from the profiles.
+- Build trees and caches: `/tmp/ck-classic-build`, `rocm-cmake-*`, `/tmp/rocm-systems-2b22ab`, `torchinductor_root`, the `.o` files under `artifacts/silotiger_857`, and `__pycache__` (including the ignored `aiter/ops/flydsl/kernels/fmha_gfx942/`; its sources are on `feat/flydsl-gfx942-fmha-hd192x128`).
+- `/tmp/vllm-sparse/repo`: clean upstream vLLM clone at `c961121`, no local changes.
+- Non-git data (`GLM5.3Flash/`, `Mehdi/`, `DSv4/`) is copied into `data/`.
 
 ## Handovers
 

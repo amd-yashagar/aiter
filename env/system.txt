@@ -1,0 +1,9 @@
+Python 3.14.4
+rocm 7.14.0
+Linux cfb875f79782 5.15.0-164-generic #174-Ubuntu SMP Fri Nov 14 20:25:16 UTC 2025 x86_64 GNU/Linux
+PRETTY_NAME="Ubuntu 26.04 LTS"
+NAME="Ubuntu"
+GPU[0]		: Card Series: 		AMD Instinct MI325X
+GPU[0]		: GFX Version: 		gfx942
+GPU[1]		: Card Series: 		AMD Instinct MI325X
+gfx942
