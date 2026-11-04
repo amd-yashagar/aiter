@@ -46,6 +46,7 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
+from aiter.ops.moe_limits import normalize_swiglu_limit
 from aiter.fused_moe_registry import make_fused_moe_impl_kernel_name
 from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
@@ -753,7 +754,10 @@ class FmoeTuner(TunerCommon):
 
     def parse_args(self) -> argparse.Namespace:
         args = super().parse_args()
-        self.swiglu_limit = args.swiglu_limit or None
+        try:
+            self.swiglu_limit = normalize_swiglu_limit(args.swiglu_limit)
+        except ValueError as exc:
+            self.parser.error(str(exc))
         self.swiglu_limit_tag = swiglu_limit_tag(self.swiglu_limit)
         if self.swiglu_limit is not None:
             if args.grouped_gemm or args.mxfp4_flydsl or args.e2e_tune:
@@ -887,12 +891,13 @@ class FmoeTuner(TunerCommon):
     ):
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
+        swiglu_limit = normalize_swiglu_limit(swiglu_limit)
+        if swiglu_limit is not None:
+            if splitk > 1 or "Splitk" in kernelName:
+                raise ValueError("Runtime SiLU clamp tuning requires non-split CK")
+            if q_type != QuantType.per_1x128 or act_type != ActivationType.Silu:
+                raise ValueError("Runtime clamp tuning requires per_1x128 SiLU")
         is_splitk = q_type == QuantType.per_1x128 and splitk > 1
-        # Without split-K the clamp lives in the CK epilogue (swiglustep_and_mul);
-        # fused_moe.ck_moe_stage1 swaps the kernel name the same way.
-        swiglustep = bool(swiglu_limit) and not is_splitk
-        if swiglustep:
-            kernelName = kernelName.replace("_silu_", "_swiglustep_")
         if is_splitk:
             sorted_size = min(token_num * topk * blockM, sorted_ids.shape[0])
             tmp_out = torch.empty(
@@ -926,8 +931,8 @@ class FmoeTuner(TunerCommon):
             splitk if is_splitk else 0,
             use_non_temporal_load=use_nt,
             dst_type=dtype if is_splitk else None,
-            swiglustep=swiglustep,
             swiglu_limit=float(swiglu_limit or 0.0),
+            swiglu_limit_enabled=swiglu_limit is not None,
         )
         if is_splitk:
             out = torch.empty(
@@ -3518,7 +3523,7 @@ class FmoeTuner(TunerCommon):
                     if k.MPerBlock == blockM
                 ]
                 # CK blockscale split-K at block_m 64 (pipeline V3) writes up as zeros.
-                if clamp_limit is not None and blockM <= 32:
+                if clamp_limit is None and blockM <= 32:
                     stage1_candidates += [
                         (f"{k.name}_sk{sk}", k.name, sk)
                         for k in _ck_stage1_splitk_kernels.values()
@@ -6312,10 +6317,8 @@ class FmoeTuner(TunerCommon):
             best_one["q_dtype_w"] = str(best_one["q_dtype_w"])
             if self.swiglu_limit_tag:
                 best_one["_tag"] = self.swiglu_limit_tag
-                if int(best_one.get("ksplit", 0) or 0) <= 1:
-                    best_one["kernelName1"] = str(best_one["kernelName1"]).replace(
-                        "_silu_", "_swiglustep_"
-                    )
+                if int(best_one.get("ksplit", 0) or 0) > 1:
+                    raise ValueError("Runtime SiLU clamp winner cannot use split-K")
             bests.append(best_one)
         if len(prorfiles) > 0:
             profile_result = pd.concat(prorfiles)

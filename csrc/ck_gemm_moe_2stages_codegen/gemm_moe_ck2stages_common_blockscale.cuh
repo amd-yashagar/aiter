@@ -39,7 +39,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
                         std::optional<void*> a1_scale, // [m, 1], token scale
                         std::optional<int> splitk,     // splitk
-                        [[maybe_unused]] float swiglu_limit)
+                        [[maybe_unused]] float swiglu_limit,
+                        [[maybe_unused]] bool swiglu_limit_enabled)
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     using A1DataType       = F32;
@@ -135,7 +136,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                 S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
                 S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
                 MXDLPerWave,    NXDLPerWave,   S<1, CSHUFFLE_M_THREADS, 1, CSHUFFLE_N_THREADS>, S<2, 1, 1, 1>,
-                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, IsSplitK, MulRoutedWeight, int32_t, A0DataType, A0DataType, A0DataType, A0DataType, NT, ActOP == 2>;
+                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, IsSplitK, MulRoutedWeight, int32_t, A0DataType, A0DataType, A0DataType, A0DataType, NT>;
 
     // clang-format on
 
@@ -171,7 +172,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
         a_element_op,
         b_element_op,
         cde_element_op,
-        swiglu_limit);
+        swiglu_limit,
+        swiglu_limit_enabled);
 
     if(!device_op.IsSupportedArgument(argument))
     {
@@ -217,7 +219,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<void*> a1_scale, // [m, 1], token scale
                         std::optional<int> splitk,     // splitk
                         std::optional<bool> nt,
-                        [[maybe_unused]] float swiglu_limit)
+                        [[maybe_unused]] float swiglu_limit,
+                        [[maybe_unused]] bool swiglu_limit_enabled)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt.value() <<
     // std::endl;
@@ -256,7 +259,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                  w1_scale,
                                  a1_scale,
                                  splitk,
-                                 swiglu_limit);
+                                 swiglu_limit,
+                                 swiglu_limit_enabled);
     }
     else
     {
@@ -293,7 +297,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                   w1_scale,
                                   a1_scale,
                                   splitk,
-                                  swiglu_limit);
+                                  swiglu_limit,
+                                  swiglu_limit_enabled);
     }
 }
 
@@ -332,7 +337,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                             std::optional<void*> a1_scale,    \
                                             std::optional<int> splitk,        \
                                             std::optional<bool> nt,           \
-                                            [[maybe_unused]] float swiglu_limit);
+                                            [[maybe_unused]] float swiglu_limit, \
+                                            [[maybe_unused]] bool swiglu_limit_enabled);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -516,7 +522,8 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                         std::optional<void *> w2_scale, // [e, 1, n], gate(up) scale
                         std::optional<void *> a2_scale, // [max_num_tokens_padded, 1], token scale
                         std::optional<int>   splitk,    // splitk
-                        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit)
+                        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit,
+                        [[maybe_unused]] bool swiglu_limit_enabled)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt.value() << std::endl;
     if (nt.has_value() && nt.value()) {
@@ -577,4 +584,5 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
         std::optional<void *> w2_scale,                                                                                                                              \
         std::optional<void *> a2_scale,                                                                                                                              \
         std::optional<int>   splitk,                                                                                                                                 \
-        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit);
+        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit, \
+        [[maybe_unused]] bool swiglu_limit_enabled);

@@ -405,7 +405,8 @@ using MoeKernel = std::function<void(const hipStream_t& stream,
                                      std::optional<void*>,
                                      std::optional<int>,
                                      std::optional<bool>,
-                                     float)>;
+                                     float,
+                                     bool)>;
 
 template <typename A0DataType,
           typename B0DataType,
@@ -441,7 +442,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<void*> a1_scale = std::nullopt, // [m, 1], token scale
                         std::optional<int> splitk     = 1,            // splitk
                         std::optional<bool> nt        = false,
-                        [[maybe_unused]] float swiglu_limit = 7.0f);
+                        [[maybe_unused]] float swiglu_limit = 7.0f,
+                        [[maybe_unused]] bool swiglu_limit_enabled = false);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -478,4 +480,5 @@ void ck_moe_stage2_gemm(
     std::optional<void*> a2_scale       = std::nullopt, // [max_num_tokens_padded, 1], token scale
     std::optional<int> splitk           = 1,            // splitk
     std::optional<bool> bt              = false,
-    [[maybe_unused]] float swiglu_limit = 7.0f);
+    [[maybe_unused]] float swiglu_limit = 7.0f,
+    [[maybe_unused]] bool swiglu_limit_enabled = false);

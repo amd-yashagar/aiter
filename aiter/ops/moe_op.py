@@ -354,6 +354,7 @@ def cmdGenFunc_ck_moe_stage(
     dst_type: str | None = None,
     is_shuffled: bool = True,
     swiglu_limit: float = 7.0,
+    swiglu_limit_enabled: bool = False,
     swiglustep: bool = False,
 ):
 
@@ -438,6 +439,7 @@ def ck_moe_stage1(
     dst_type: str | None = None,
     is_shuffled: bool = True,
     swiglu_limit: float = 7.0,
+    swiglu_limit_enabled: bool = False,
 ) -> None: ...
 
 
@@ -467,6 +469,7 @@ def ck_moe_stage1_swiglustep(
     dst_type: str | None = None,
     is_shuffled: bool = True,
     swiglu_limit: float = 7.0,
+    swiglu_limit_enabled: bool = False,
 ) -> None: ...
 
 
@@ -672,6 +675,9 @@ def get_moe_stage_module(
 
     parts = [
         "module_moe_ck2stages",
+        # The stage kernel ABI now includes an independent runtime enable bit.
+        # Never load an old .so that silently used swiglustep for runtime SiLU.
+        "runtime_limit_v2",
         Adtype,
         Bdtype,
         "preshuffle_on" if preshuffle_mode else "preshuffle_off",
@@ -711,7 +717,22 @@ def ck_moe_stage1_fwd(
     dst_type: torch.dtype | None = None,
     swiglustep: bool = False,
     swiglu_limit: float = 7.0,
+    swiglu_limit_enabled: bool = False,
 ):
+    from aiter.ops.moe_limits import normalize_swiglu_limit
+
+    limit = normalize_swiglu_limit(swiglu_limit)
+    if swiglu_limit_enabled and limit is not None:
+        if (
+            swiglustep
+            or activation != ActivationType.Silu
+            or quant_type not in (QuantType.per_1x128, QuantType.per_128x128)
+        ):
+            raise ValueError("Runtime clamp requires per_1x128 CK SiLU")
+        if kernelName and ("Splitk" in kernelName or "_silu_" not in kernelName):
+            raise ValueError("Runtime clamp requires a non-split CK SiLU kernel")
+        splitk = 0
+    swiglu_limit_enabled = swiglu_limit_enabled and limit is not None
     stage1 = ck_moe_stage1_swiglustep if swiglustep else ck_moe_stage1
     stage1(
         hidden_states,
@@ -733,7 +754,8 @@ def ck_moe_stage1_fwd(
         use_non_temporal_load,
         None if dst_type is None else dtype2str_dict[dst_type],
         is_shuffled=getattr(w1, "is_shuffled", False),
-        swiglu_limit=float(swiglu_limit or 0.0),
+        swiglu_limit=float(limit or 0.0),
+        swiglu_limit_enabled=swiglu_limit_enabled,
     )
     return out
 

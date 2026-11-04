@@ -122,8 +122,9 @@ def _reference(w, a1_qt, a1_scale, topk_weights, topk_ids, limit):
     )
 
 
-# Both limits use the CK swiglustep epilogue (clamp, then SiLU). None is unclamped.
-@pytest.mark.parametrize("limit", [7.0, 5.0, None])
+# Limit 1 distinguishes clamp-before-SiLU from post-SiLU clamping.
+# None, zero and +infinity all retain the default unclamped behavior.
+@pytest.mark.parametrize("limit", [1.0, 7.0, 5.0, None, 0.0, float("inf")])
 @pytest.mark.parametrize("tokens", [1, 32, 1024])
 def test_fused_moe_per_1x128_swiglu_limit(weights, tokens, limit):
     torch.manual_seed(tokens)
@@ -153,7 +154,7 @@ def test_fused_moe_per_1x128_swiglu_limit(weights, tokens, limit):
     expected = _reference(weights, a1_qt, a1_scale, topk_weights, topk_ids, limit)
     logits_diff = _calc_diff(expected, out)
     assert logits_diff < 1e-3, f"logits_diff={logits_diff}"
-    if limit:
+    if limit is not None and 0 < limit < float("inf"):
         unclamped = _reference(weights, a1_qt, a1_scale, topk_weights, topk_ids, None)
         assert (
             _calc_diff(unclamped, out) > 1e-2
@@ -238,7 +239,7 @@ def test_tuned_cohere_row_uses_the_epilogue(monkeypatch):
     meta = _dispatch(32, 2048, 768, 128, 8, 5.0)
     assert not int(meta.run_1stage or 0)
     assert int(meta.ksplit or 0) == 0
-    assert "_swiglustep_" in meta.stage1.keywords["kernelName"]
+    assert "_silu_" in meta.stage1.keywords["kernelName"]
     assert not any("no row" in msg for msg in messages)
 
 
@@ -278,7 +279,7 @@ def cohere_weights():
     return _weights_for(128, 768, 2048)
 
 
-@pytest.mark.parametrize("limit", [7.0, 5.0])
+@pytest.mark.parametrize("limit", [1.0, 7.0, 5.0])
 @pytest.mark.parametrize("tokens", [1, 32])
 def test_cohere_shape_clamps(cohere_weights, tokens, limit):
     model_dim, _inter_dim, experts, topk = 2048, 768, 128, 8
@@ -312,3 +313,12 @@ def test_cohere_shape_clamps(cohere_weights, tokens, limit):
         cohere_weights, a1_qt, a1_scale, topk_weights, topk_ids, None
     )
     assert _calc_diff(unclamped, out) > 1e-2
+
+
+@pytest.mark.parametrize("ksplit", ["-1", "1", "4", "16"])
+@pytest.mark.parametrize("tokens", [1, 32, 1024])
+def test_runtime_limit_overrides_splitk_environment(monkeypatch, ksplit, tokens):
+    monkeypatch.setenv("AITER_KSPLIT", ksplit)
+    meta = _dispatch(tokens, MODEL_DIM, INTER_DIM, EXPERTS, TOPK, 1.0)
+    assert not meta.run_1stage
+    assert int(meta.ksplit or 0) == 0

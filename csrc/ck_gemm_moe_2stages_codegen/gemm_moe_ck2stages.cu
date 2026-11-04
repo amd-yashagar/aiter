@@ -10,6 +10,7 @@
 #include "moe_ck.h"
 #include "aiter_logger.h"
 #include <cmath>
+#include <limits>
 
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 
@@ -41,7 +42,7 @@ static inline int map_activation_to_ck_stage1(int activation)
 // API for user aiter.ck_moe_stage1(...)
 
 template <int stage = 1>
-MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant_type, bool mul_routed_weight, bool is_shuffled)
+MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant_type, bool mul_routed_weight, bool is_shuffled, bool require_exact = false)
 {
     static const auto lookup = []
     {
@@ -56,6 +57,8 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::
             auto kernel = it->second;
             return kernel;
         }
+        TORCH_CHECK(!require_exact, "Unknown or incompatible CK MoE kernel: ", kernelName,
+                    "; regenerate instances or retune this configuration");
         AITER_LOG_WARNING("ck kernel not found: " << kernelName);
     }
     if constexpr (stage == 1)
@@ -87,8 +90,22 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                    bool nt = false,
                    std::optional<std::string> dst_type = std::nullopt,
                    bool is_shuffled = true,
-                   double swiglu_limit)
+                   double swiglu_limit,
+                   bool swiglu_limit_enabled)
 {
+    TORCH_CHECK(!std::isnan(swiglu_limit) && swiglu_limit >= 0.0,
+                "swiglu_limit must be non-negative and not NaN");
+    const bool clamp_enabled = swiglu_limit_enabled && swiglu_limit > 0.0 &&
+                               std::isfinite(swiglu_limit);
+    TORCH_CHECK(!clamp_enabled ||
+                    (activation == static_cast<int>(ActivationType::Silu) &&
+                     AITER_CK_MOE_STAGE1_SILU_ACT_OP == 1 &&
+                     quant_type == static_cast<int>(QuantType::per_1x128) &&
+                     splitk.value_or(1) <= 1 &&
+                     (kernelName.empty() ||
+                      (kernelName.find("_silu_") != std::string::npos &&
+                       kernelName.find("Splitk") == std::string::npos))),
+                "Runtime SiLU clamp requires non-split per_1x128 CK SiLU");
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt << " " << block_m.value() << std::endl;
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
     at::hip::getCurrentHIPStream();
@@ -136,11 +153,16 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
 
     activation = map_activation_to_ck_stage1(activation);
 
-    auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
+    auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled, clamp_enabled);
 
+    // A positive double must not underflow to the float sentinel (0 disables).
+    // Such tiny clamps produce zero at the output precision, not an override bypass.
+    const float ck_limit = clamp_enabled
+        ? std::max(static_cast<float>(swiglu_limit), std::numeric_limits<float>::denorm_min())
+        : static_cast<float>(swiglu_limit);
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
-           hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr, splitk_local, nt, static_cast<float>(swiglu_limit));
+           hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr, splitk_local, nt, ck_limit, clamp_enabled);
 }
 
 void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
@@ -203,5 +225,5 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
 
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
-           inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr, splitk_local, nt, 0.f);
+           inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr, splitk_local, nt, 0.f, false);
 }

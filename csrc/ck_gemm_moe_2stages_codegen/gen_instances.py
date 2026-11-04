@@ -837,7 +837,8 @@ def generate_instance_and_lookUpTable_head(working_path, activation=None):
     with open(f_lookUpTable, "w") as f_lookup:
         if activation == "swiglustep":
             # The runtime passes ActivationType::Silu; this module only holds
-            # swiglustep stage1 instances, so Silu must map to its CK act value.
+            # legacy swiglustep stage1 instances (SiLU then clamp at 7).
+            # Runtime SiLU overrides stay in the normal silu module/act value.
             f_lookup.write(
                 f"#define AITER_CK_MOE_STAGE1_SILU_ACT_OP {ACT_OP_MAP['swiglustep']}\n"
             )
