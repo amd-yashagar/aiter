@@ -720,6 +720,8 @@ def ck_moe_stage1_fwd(
 ):
     from aiter.ops.moe_limits import normalize_swiglu_limit
 
+    if quant_type == QuantType.per_128x128:
+        quant_type = QuantType.per_1x128
     limit = normalize_swiglu_limit(swiglu_limit)
     if swiglu_limit_enabled and limit is not None:
         if (

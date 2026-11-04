@@ -30,6 +30,40 @@ def test_positive_limit(limit):
     assert moe.swiglu_limit_tag(limit) == f"swiglu_limit={limit:g}"
 
 
+def test_dispatch_normalizes_infinite_limit_for_per_128x128_alias():
+    quant_type, quant_type_a, limit = moe._normalize_moe_dispatch_contract(
+        QuantType.per_128x128, ActivationType.Silu, float("inf")
+    )
+    assert quant_type == QuantType.per_1x128
+    assert quant_type_a is None
+    assert limit is None
+
+
+@pytest.mark.parametrize("quant_type_a", [QuantType.per_128x128, QuantType.per_1x128])
+def test_dispatch_accepts_matching_blockscale_aliases(quant_type_a):
+    quant_type, canonical_quant_type_a, _ = moe._normalize_moe_dispatch_contract(
+        QuantType.per_128x128, ActivationType.Silu, None, quant_type_a
+    )
+    assert quant_type == QuantType.per_1x128
+    assert canonical_quant_type_a == QuantType.per_1x128
+
+
+def test_torch_reference_clamps_large_finite_limit_without_overflow():
+    gate = torch.tensor([2.0], dtype=torch.float32)
+    up = torch.tensor([-3.0], dtype=torch.float32)
+    gate_ref, up_ref = moe._clamp_swiglu_gate_up(gate, up, 1e100)
+    torch.testing.assert_close(gate_ref, gate)
+    torch.testing.assert_close(up_ref, up)
+
+
+def test_torch_reference_applies_finite_limit():
+    gate = torch.tensor([2.0], dtype=torch.float32)
+    up = torch.tensor([-3.0], dtype=torch.float32)
+    gate_ref, up_ref = moe._clamp_swiglu_gate_up(gate, up, 1.0)
+    torch.testing.assert_close(gate_ref, torch.tensor([1.0]))
+    torch.testing.assert_close(up_ref, torch.tensor([-1.0]))
+
+
 @pytest.mark.parametrize("limit", [-1.0, float("nan"), -float("inf")])
 def test_invalid_limit(limit):
     with pytest.raises(ValueError, match="swiglu_limit"):
@@ -76,6 +110,32 @@ def test_ck_stage1_routes_without_split_for_override(monkeypatch, limit, splitk)
     assert not kwargs.get("swiglustep", False)
 
 
+def test_ck_stage1_canonicalizes_per_128x128_alias(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        aiter, "ck_moe_stage1_fwd", lambda *a, **k: calls.append((a, k))
+    )
+    moe.ck_moe_stage1(
+        torch.empty(1, 128),
+        torch.empty(1, 256, 128),
+        None,
+        torch.empty(16),
+        None,
+        None,
+        torch.empty(1, 1, 128),
+        1,
+        16,
+        None,
+        None,
+        quant_type=QuantType.per_128x128,
+        activation=ActivationType.Silu,
+        swiglu_limit=1.0,
+    )
+    args, kwargs = calls.pop()
+    assert args[13] == QuantType.per_1x128
+    assert kwargs["swiglu_limit_enabled"] is True
+
+
 @pytest.mark.parametrize("kernel", ["old_swiglustep_F8", "old_silu_Splitk_F8"])
 def test_stale_explicit_ck_kernel_rejected(kernel):
     with pytest.raises(ValueError, match="non-split CK SiLU"):
@@ -115,6 +175,21 @@ def test_binding_default_and_enabled_flag(monkeypatch, enabled):
     args, kwargs = calls.pop()
     assert kwargs["swiglu_limit_enabled"] is enabled
     assert args[15] == (0 if enabled else 1)
+
+
+def test_binding_canonicalizes_per_128x128_alias(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ops, "ck_moe_stage1", lambda *a, **k: calls.append((a, k)))
+    ops.ck_moe_stage1_fwd(
+        *([None] * 7),
+        1,
+        quant_type=QuantType.per_128x128,
+        activation=ActivationType.Silu,
+        swiglu_limit=1.0,
+        swiglu_limit_enabled=True,
+    )
+    args, _ = calls.pop()
+    assert args[13] == QuantType.per_1x128.value
 
 
 def test_silu_and_legacy_codegen_modules_are_distinct():

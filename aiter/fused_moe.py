@@ -1514,12 +1514,13 @@ def _fused_moe_impl(
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
-    if quant_type == QuantType.per_1x128 and activation == ActivationType.Silu:
-        swiglu_limit = normalize_swiglu_limit(swiglu_limit)
+    quant_type, quant_type_a, swiglu_limit = _normalize_moe_dispatch_contract(
+        quant_type, activation, swiglu_limit, quant_type_a
+    )
     gate_mode = GateMode(gate_mode)
-    if quant_type_a is not None and QuantType(quant_type_a) != quant_type:
+    if quant_type_a is not None and quant_type_a != quant_type:
         raise NotImplementedError(
-            f"quant_type_a={QuantType(quant_type_a)!s} != quant_type={quant_type!s}: "
+            f"quant_type_a={quant_type_a!s} != quant_type={quant_type!s}: "
             "mixed activation/weight quant granularity is not supported"
         )
     if block_size_M == -1:
@@ -1597,7 +1598,6 @@ def _fused_moe_impl(
                 num_valid_rows=num_local_tokens,
             )
             herd_topk = 0
-    quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = resolve_activation_dtype(
         quant_type,
@@ -2412,6 +2412,17 @@ fused_moe_1stage_dict = {
 # fmt: on
 
 quant_remap = {QuantType.per_128x128: QuantType.per_1x128}
+
+
+def _normalize_moe_dispatch_contract(
+    quant_type, activation, swiglu_limit, quant_type_a=None
+):
+    quant_type = quant_remap.get(quant_type, quant_type)
+    if quant_type_a is not None:
+        quant_type_a = quant_remap.get(QuantType(quant_type_a), QuantType(quant_type_a))
+    if quant_type == QuantType.per_1x128 and activation == ActivationType.Silu:
+        swiglu_limit = normalize_swiglu_limit(swiglu_limit)
+    return quant_type, quant_type_a, swiglu_limit
 
 
 def _mxfp4_per_1x32_weight_expert_to_f32(weight, scale, expert_id, rows, cols):
@@ -5646,13 +5657,17 @@ def torch_moe_stage1(
         elif use_situv2:
             out = situv2(gate, up, beta=situ_beta, linear_beta=situ_linear_beta)
         else:
-            if swiglu_limit:
-                gate = gate.clamp(min=None, max=swiglu_limit)
-                up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+            if swiglu_limit is not None:
+                gate, up = _clamp_swiglu_gate_up(gate, up, swiglu_limit)
             out = torch_act(gate) * up
     else:
         out = torch_act(out)
     return out.to(dtype)
+
+
+def _clamp_swiglu_gate_up(gate: torch.Tensor, up: torch.Tensor, limit: float):
+    limit = min(limit, torch.finfo(gate.dtype).max)
+    return gate.clamp(max=limit), up.clamp(min=-limit, max=limit)
 
 
 def torch_moe_stage2(
@@ -5806,6 +5821,7 @@ def ck_moe_stage1(
     dtype=None,
     swiglu_limit=None,
 ):
+    quant_type = quant_remap.get(quant_type, quant_type)
     if activation == ActivationType.Silu:
         swiglu_limit = normalize_swiglu_limit(swiglu_limit)
     runtime_limit = swiglu_limit is not None and activation == ActivationType.Silu
