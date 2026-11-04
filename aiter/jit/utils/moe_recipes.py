@@ -16,6 +16,7 @@ _DTYPE_MAP = {
 }
 
 _QUANT_ALIAS = {"per_128x128": "per_1x128"}
+MOE_MODULE_ABI_TAG = "runtime_limit_v2"
 
 
 def _build_moe_variant(
@@ -31,6 +32,7 @@ def _build_moe_variant(
 ) -> tuple[str, list]:
     parts = [
         "module_moe_ck2stages",
+        MOE_MODULE_ABI_TAG,
         a_dtype,
         b_dtype,
         "preshuffle_on" if preshuffle_mode else "preshuffle_off",

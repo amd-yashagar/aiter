@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import AITER_CSRC_DIR, compile_ops
+from ..jit.utils.moe_recipes import MOE_MODULE_ABI_TAG
 from ..utility import dtypes
 from .enum import ActivationType, QuantType
 
@@ -675,9 +676,7 @@ def get_moe_stage_module(
 
     parts = [
         "module_moe_ck2stages",
-        # The stage kernel ABI now includes an independent runtime enable bit.
-        # Never load an old .so that silently used swiglustep for runtime SiLU.
-        "runtime_limit_v2",
+        MOE_MODULE_ABI_TAG,
         Adtype,
         Bdtype,
         "preshuffle_on" if preshuffle_mode else "preshuffle_off",

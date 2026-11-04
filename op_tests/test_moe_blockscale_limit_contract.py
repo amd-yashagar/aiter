@@ -134,6 +134,31 @@ def test_silu_and_legacy_codegen_modules_are_distinct():
     assert "-act swiglustep " in legacy_cmd[0]
 
 
+def test_runtime_module_name_matches_prebuild_recipe():
+    recipe = importlib.import_module("aiter.jit.utils.moe_recipes")
+    runtime_name, _ = ops.get_moe_stage_module(
+        aiter.dtypes.fp8,
+        aiter.dtypes.fp8,
+        aiter.dtypes.bf16,
+        ActivationType.Silu,
+        QuantType.per_1x128,
+        2,
+        preshuffle_mode=True,
+    )
+    prebuild_name, _ = recipe._build_moe_variant(
+        aiter_csrc_dir="csrc",
+        a_dtype="f8",
+        b_dtype="f8",
+        c_dtype="b16",
+        activation="silu",
+        quant_type="per_1x128",
+        mul_routed_weight_stage=2,
+        preshuffle_mode=True,
+        is_splitk=False,
+    )
+    assert runtime_name == prebuild_name
+
+
 @pytest.fixture
 def tuner(monkeypatch):
     monkeypatch.syspath_prepend(
