@@ -773,7 +773,7 @@ class AITER_CONFIG:
                         # Legacy config without a gfx column: infer the arch from
                         # cu_num (256->gfx950, 80/304->gfx942) so archs that share
                         # a cu_num stay distinguishable after the merge.
-                        from .utils.chip_info import gfx_from_cu_num
+                        from aiter.jit.utils.chip_info import gfx_from_cu_num
 
                         cu_num = pd.to_numeric(df["cu_num"], errors="coerce")
                         df[c] = cu_num.map(gfx_from_cu_num)
