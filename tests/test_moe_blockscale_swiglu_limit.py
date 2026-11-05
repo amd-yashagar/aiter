@@ -23,6 +23,9 @@ from aiter.ops.moe_limits import normalize_swiglu_limit
 moe = importlib.import_module("aiter.fused_moe")
 ops = importlib.import_module("aiter.ops.moe_op")
 
+# Module names use the FP8 dtype registered when moe_op was imported.
+CK_FP8 = next(dtype for dtype, name in ops.dtype2str_dict.items() if name == "f8")
+
 
 @pytest.fixture(autouse=True)
 def fresh_dispatch(monkeypatch):
@@ -212,8 +215,8 @@ def test_binding_canonicalizes_per_128x128_alias(monkeypatch):
 def test_default_and_limit_module_names_match_prebuild_recipes():
     recipe = importlib.import_module("aiter.jit.utils.moe_recipes")
     args = (
-        aiter.dtypes.fp8,
-        aiter.dtypes.fp8,
+        CK_FP8,
+        CK_FP8,
         aiter.dtypes.bf16,
         ActivationType.Silu,
         QuantType.per_1x128,
@@ -278,8 +281,8 @@ def test_limit_tag_prebuilds_default_stage2_module(monkeypatch):
     variants = recipe.get_moe_ck2stages_prebuild_variants("csrc")
     names = {variant["md_name"] for variant in variants}
     stage2_name, _ = ops.get_moe_stage_module(
-        aiter.dtypes.fp8,
-        aiter.dtypes.fp8,
+        CK_FP8,
+        CK_FP8,
         aiter.dtypes.bf16,
         ActivationType.Silu,
         QuantType.per_1x128,
@@ -287,8 +290,8 @@ def test_limit_tag_prebuilds_default_stage2_module(monkeypatch):
         preshuffle_mode=True,
     )
     limit_name, _ = ops.get_moe_stage_module(
-        aiter.dtypes.fp8,
-        aiter.dtypes.fp8,
+        CK_FP8,
+        CK_FP8,
         aiter.dtypes.bf16,
         ActivationType.Silu,
         QuantType.per_1x128,
@@ -339,7 +342,7 @@ def test_runtime_module_requires_fp8_blockscale():
     with pytest.raises(ValueError, match="non-split FP8 per_1x128"):
         ops.get_moe_stage_module(
             aiter.dtypes.bf16,
-            aiter.dtypes.fp8,
+            CK_FP8,
             aiter.dtypes.bf16,
             ActivationType.Silu,
             QuantType.per_1x128,
@@ -422,8 +425,8 @@ def test_tuned_limit_rows_match_runtime_silu():
         for variant in recipe.get_moe_ck2stages_prebuild_variants("csrc")
     }
     default_name, _ = ops.get_moe_stage_module(
-        aiter.dtypes.fp8,
-        aiter.dtypes.fp8,
+        CK_FP8,
+        CK_FP8,
         aiter.dtypes.bf16,
         ActivationType.Silu,
         QuantType.per_1x128,
@@ -431,8 +434,8 @@ def test_tuned_limit_rows_match_runtime_silu():
         preshuffle_mode=True,
     )
     runtime_name, _ = ops.get_moe_stage_module(
-        aiter.dtypes.fp8,
-        aiter.dtypes.fp8,
+        CK_FP8,
+        CK_FP8,
         aiter.dtypes.bf16,
         ActivationType.Silu,
         QuantType.per_1x128,
@@ -459,8 +462,8 @@ def test_dispatch_overrides_splitk_environment(monkeypatch, ksplit, tokens):
             289,
             9,
             aiter.dtypes.bf16,
-            aiter.dtypes.fp8,
-            aiter.dtypes.fp8,
+            torch.float8_e4m3fnuz,
+            torch.float8_e4m3fnuz,
             QuantType.per_1x128,
             True,
             ActivationType.Silu,
@@ -514,8 +517,8 @@ def _dispatch(token, model_dim, inter_dim, expert, topk, limit):
         expert,
         topk,
         dtypes.bf16,
-        dtypes.fp8,
-        dtypes.fp8,
+        torch.float8_e4m3fnuz,
+        torch.float8_e4m3fnuz,
         QuantType.per_1x128,
         True,
         ActivationType.Silu,
