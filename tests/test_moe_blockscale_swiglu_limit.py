@@ -7,6 +7,7 @@ import ast
 import csv
 import functools
 import importlib
+import inspect
 import os
 import re
 import subprocess
@@ -22,6 +23,17 @@ from aiter.ops.moe_limits import normalize_swiglu_limit
 
 moe = importlib.import_module("aiter.fused_moe")
 ops = importlib.import_module("aiter.ops.moe_op")
+
+# Bind recorded launches to the real defaults, independent of positional/keyword
+# spelling or an omitted disabled limit. Capture before tests monkeypatch them.
+_STAGE1_FWD_SIGNATURE = inspect.signature(ops.ck_moe_stage1_fwd)
+
+
+def _forwarded_limit(args, kwargs):
+    bound = _STAGE1_FWD_SIGNATURE.bind(*args, **kwargs)
+    bound.apply_defaults()
+    return bound.arguments["swiglu_limit"] or 0.0
+
 
 # Module names use the FP8 dtype registered when moe_op was imported.
 CK_FP8 = next(dtype for dtype, name in ops.dtype2str_dict.items() if name == "f8")
@@ -128,7 +140,7 @@ def test_ck_stage1_routes_without_split_for_override(monkeypatch, limit, splitk)
     is_split = normalize_swiglu_limit(limit) is None and splitk > 1
     assert args[15] == (splitk if is_split else 0)
     assert bool(activations) is is_split
-    assert kwargs["swiglu_limit"] == (limit if limit == 1.0 else 0.0)
+    assert _forwarded_limit(args, kwargs) == (limit if limit == 1.0 else 0.0)
 
 
 def test_ck_stage1_canonicalizes_per_128x128_alias(monkeypatch):
@@ -154,7 +166,7 @@ def test_ck_stage1_canonicalizes_per_128x128_alias(monkeypatch):
     )
     args, kwargs = calls.pop()
     assert args[13] == QuantType.per_1x128
-    assert kwargs["swiglu_limit"] == 1.0
+    assert _forwarded_limit(args, kwargs) == 1.0
 
 
 @pytest.mark.parametrize("kernel", ["stale_activation_F8", "old_silu_Splitk_F8"])
@@ -193,8 +205,9 @@ def test_binding_selects_variant_from_limit(monkeypatch, limit):
         splitk=4 if enabled else 1,
         swiglu_limit=limit,
     )
-    args, kwargs = calls.pop()
-    assert kwargs["swiglu_limit"] == (1.0 if enabled else 0.0)
+    args, _ = calls.pop()
+    # compile_ops exposes (*args, **kwargs); native swiglu_limit is argument 19.
+    assert args[19] == (1.0 if enabled else 0.0)
     assert args[15] == (0 if enabled else 1)
 
 
@@ -624,7 +637,7 @@ def test_two_stage_forwards_limit_for_every_quant_type(
         call()
         assert len(launches) == 1
         if stage == "ck_moe_stage1":
-            assert launches[0][1]["swiglu_limit"] == 0.0
+            assert _forwarded_limit(*launches[0]) == 0.0
 
 
 @pytest.mark.parametrize("limit", [None, 0.0, float("inf"), 5.0])
@@ -749,3 +762,147 @@ def test_stale_tuned_limit_kernel_rejected(monkeypatch, tmp_path, kernel):
     monkeypatch.setenv("AITER_CONFIG_FMOE_SWIGLU_LIMIT", str(path))
     with pytest.raises(ValueError, match="Incompatible runtime SiLU limit tuning row"):
         _dispatch(32, 2048, 768, 128, 8, 5.0)
+
+
+@pytest.mark.parametrize("limit", [None, 0, 0.0, -0.0])
+@pytest.mark.parametrize("splitk", [None, 0, 1])
+def test_disabled_ck_entry_points_skip_normalization(monkeypatch, limit, splitk):
+    def unexpected_normalization(value):
+        pytest.fail("disabled CK limit must not need normalization")
+
+    monkeypatch.setattr(moe, "normalize_swiglu_limit", unexpected_normalization)
+    monkeypatch.setattr(ops, "normalize_swiglu_limit", unexpected_normalization)
+    launches = []
+    monkeypatch.setattr(ops, "ck_moe_stage1", lambda *a, **k: launches.append((a, k)))
+    x = torch.empty(1, 128, dtype=dtypes.bf16)
+    w1 = torch.empty(1, 256, 128, dtype=dtypes.bf16)
+    out = torch.empty(1, 1, 128, dtype=dtypes.bf16)
+    moe.ck_moe_stage1(
+        x,
+        w1,
+        None,
+        None,
+        None,
+        None,
+        out,
+        1,
+        16,
+        None,
+        None,
+        quant_type=QuantType.No,
+        activation=ActivationType.Silu,
+        swiglu_limit=limit,
+        splitk=splitk,
+    )
+    ops.ck_moe_stage1_fwd(
+        x,
+        w1,
+        None,
+        None,
+        None,
+        None,
+        out,
+        1,
+        quant_type=QuantType.No,
+        activation=ActivationType.Silu,
+        swiglu_limit=limit,
+        splitk=splitk,
+    )
+    assert len(launches) == 2
+    # compile_ops exposes (*args, **kwargs); native swiglu_limit is argument 19.
+    assert all(args[19] == 0.0 for args, _ in launches)
+    module = ops.cmdGenFunc_ck_moe_stage(
+        x,
+        w1,
+        None,
+        None,
+        None,
+        None,
+        out,
+        1,
+        splitk=0,
+        quant_type=QuantType.No,
+        activation=ActivationType.Silu,
+        swiglu_limit=limit,
+    )
+    assert "runtime_swiglu_limit" not in module["md_name"]
+
+
+@pytest.mark.parametrize("limit", [-1.0, float("nan"), -float("inf")])
+def test_module_selection_rejects_invalid_direct_limit(limit):
+    x = torch.empty(1, 128, dtype=CK_FP8)
+    with pytest.raises(ValueError, match="swiglu_limit"):
+        ops.cmdGenFunc_ck_moe_stage(
+            x,
+            x,
+            None,
+            None,
+            None,
+            None,
+            x,
+            1,
+            splitk=0,
+            quant_type=QuantType.per_1x128,
+            activation=ActivationType.Silu,
+            swiglu_limit=limit,
+        )
+
+
+@pytest.mark.parametrize("limit", [None, 0.0, float("inf"), 1.0])
+def test_direct_module_selection_uses_normalized_limit(limit):
+    x = torch.empty(1, 128, dtype=CK_FP8)
+    out = torch.empty(1, 128, dtype=dtypes.bf16)
+    module = ops.cmdGenFunc_ck_moe_stage(
+        x,
+        x,
+        None,
+        None,
+        None,
+        None,
+        out,
+        1,
+        splitk=0,
+        quant_type=QuantType.per_1x128,
+        activation=ActivationType.Silu,
+        swiglu_limit=limit,
+    )
+    assert ("runtime_swiglu_limit" in module["md_name"]) is (limit == 1.0)
+
+
+def test_disabled_per_128x128_keeps_main_nonsplit_behavior(monkeypatch):
+    launches = []
+    monkeypatch.setattr(
+        aiter, "ck_moe_stage1_fwd", lambda *a, **k: launches.append((a, k))
+    )
+    x = torch.empty(1, 128, dtype=dtypes.bf16)
+    out = torch.empty(1, 1, 128, dtype=dtypes.bf16)
+
+    def unexpected_split_work(*args, **kwargs):
+        pytest.fail("disabled per_128x128 must not allocate or post-activate")
+
+    monkeypatch.setattr(torch, "empty", unexpected_split_work)
+    monkeypatch.setattr(aiter, "silu_and_mul", unexpected_split_work)
+    result = moe.ck_moe_stage1(
+        x,
+        None,
+        None,
+        None,
+        None,
+        None,
+        out,
+        1,
+        16,
+        None,
+        None,
+        quant_type=QuantType.per_128x128,
+        activation=ActivationType.Silu,
+        splitk=2,
+        swiglu_limit=None,
+    )
+    assert result is out
+    assert len(launches) == 1
+    args, kwargs = launches[0]
+    assert args[6] is out
+    assert args[13] == QuantType.per_128x128
+    assert args[15] == 0
+    assert _forwarded_limit(args, kwargs) == 0.0

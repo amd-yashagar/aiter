@@ -10,6 +10,7 @@ from ..jit.core import AITER_CSRC_DIR, compile_ops
 from ..jit.utils.moe_recipes import MOE_MODULE_ABI_TAG
 from ..utility import dtypes
 from .enum import ActivationType, QuantType
+from .moe_limits import normalize_swiglu_limit
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 
@@ -361,9 +362,9 @@ def cmdGenFunc_ck_moe_stage(
     is_splitk = splitk > 1 and not kernelName
     is_splitk = is_splitk or (bool(kernelName) and "Splitk" in kernelName)
     outtype = str2dtype_dict[dst_type] if is_splitk else out.dtype
-    from aiter.ops.moe_limits import normalize_swiglu_limit
-
-    runtime_swiglu_limit = normalize_swiglu_limit(swiglu_limit) is not None
+    runtime_swiglu_limit = (
+        normalize_swiglu_limit(swiglu_limit) is not None if swiglu_limit else False
+    )
     md_name, blob_gen_cmd = get_moe_stage_module(
         hidden_states.dtype,
         w1.dtype,
@@ -695,16 +696,11 @@ def ck_moe_stage1_fwd(
     dst_type: torch.dtype | None = None,
     swiglu_limit: float | None = None,
 ):
-    from aiter.ops.moe_limits import normalize_swiglu_limit
-
-    if quant_type == QuantType.per_128x128:
-        quant_type = QuantType.per_1x128
-    limit = normalize_swiglu_limit(swiglu_limit)
+    limit = normalize_swiglu_limit(swiglu_limit) if swiglu_limit else None
     if limit is not None:
-        if activation != ActivationType.Silu or quant_type not in (
-            QuantType.per_1x128,
-            QuantType.per_128x128,
-        ):
+        if quant_type == QuantType.per_128x128:
+            quant_type = QuantType.per_1x128
+        if activation != ActivationType.Silu or quant_type != QuantType.per_1x128:
             raise ValueError("Runtime clamp requires per_1x128 CK SiLU")
         if kernelName and ("Splitk" in kernelName or "_silu_" not in kernelName):
             raise ValueError("Runtime clamp requires a non-split CK SiLU kernel")
@@ -728,8 +724,8 @@ def ck_moe_stage1_fwd(
         int(splitk) if splitk is not None else splitk,
         use_non_temporal_load,
         None if dst_type is None else dtype2str_dict[dst_type],
-        is_shuffled=getattr(w1, "is_shuffled", False),
-        swiglu_limit=float(limit or 0.0),
+        getattr(w1, "is_shuffled", False),
+        limit or 0.0,
     )
     return out
 

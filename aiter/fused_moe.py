@@ -6435,20 +6435,22 @@ def ck_moe_stage1(
     dtype=None,
     swiglu_limit=None,
 ):
-    quant_type = quant_remap.get(quant_type, quant_type)
-    if activation == ActivationType.Silu:
-        swiglu_limit = normalize_swiglu_limit(swiglu_limit)
-    runtime_limit = swiglu_limit is not None and activation == ActivationType.Silu
-    if runtime_limit:
-        if quant_type != QuantType.per_1x128:
-            raise NotImplementedError(
-                f"CK MoE stage1 cannot apply swiglu_limit={swiglu_limit!r}; "
-                "only FP8 per_1x128 has a clamped CK SiLU epilogue "
-                "(clamp before SiLU)."
-            )
-        if kernelName and ("Splitk" in kernelName or "_silu_" not in kernelName):
-            raise ValueError("Runtime SiLU clamp requires a non-split CK SiLU kernel")
-        splitk = 0
+    limit = None
+    if swiglu_limit and activation == ActivationType.Silu:
+        limit = normalize_swiglu_limit(swiglu_limit)
+        if limit is not None:
+            quant_type = quant_remap.get(quant_type, quant_type)
+            if quant_type != QuantType.per_1x128:
+                raise NotImplementedError(
+                    f"CK MoE stage1 cannot apply swiglu_limit={swiglu_limit!r}; "
+                    "only FP8 per_1x128 has a clamped CK SiLU epilogue "
+                    "(clamp before SiLU)."
+                )
+            if kernelName and ("Splitk" in kernelName or "_silu_" not in kernelName):
+                raise ValueError(
+                    "Runtime SiLU clamp requires a non-split CK SiLU kernel"
+                )
+            splitk = 0
     token_num = hidden_states.shape[0]
     is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
     if is_splitk:
@@ -6478,12 +6480,12 @@ def ck_moe_stage1(
         splitk if is_splitk else 0,
         use_non_temporal_load,
         out.dtype,
-        swiglu_limit=float(swiglu_limit or 0.0) if runtime_limit else 0.0,
+        limit,
     )
     if is_splitk:
         valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32), swiglu_limit or 0.0)
+            aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
         elif activation == ActivationType.Gelu:
             aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
         else:
