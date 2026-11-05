@@ -1002,6 +1002,11 @@ def _effective_gate_mode(q_type, aq_dtype, wq_dtype):
 
 
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
+    if (
+        quant_type in (aiter.QuantType.per_1x128, aiter.QuantType.per_128x128)
+        and aq_dtype == wq_dtype == dtypes.fp8
+    ):
+        return swiglu_limit
     if (quant_type, aq_dtype, wq_dtype) in (
         _PER1X32_BF16_FP4,
         _PER1X32_FP8_FP4,
@@ -1711,6 +1716,148 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
     )
 
 
+def _quant_blockscale_weight(w):
+    e, n, k = w.shape
+    blocks = w.view(e, n // 128, 128, k // 128, 128).permute(0, 1, 3, 2, 4).contiguous()
+    q, scale = aiter.pertoken_quant(
+        blocks.view(e, -1, 128 * 128), quant_dtype=dtypes.fp8
+    )
+    q = (
+        q.view(e, n // 128, k // 128, 128, 128)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .view_as(w)
+    )
+    return q, scale.view(e, n // 128, k // 128)
+
+
+@benchmark()
+def test_blockscale_swiglu_limit(token, swiglu_limit):
+    # Small FP8 model keeps the default CI regression sweep inexpensive.
+    model_dim, inter_dim, experts, topk = 256, 256, 8, 2
+    torch.manual_seed(token)
+    x = torch.randn(token, model_dim, dtype=dtypes.bf16)
+    w1, s1 = _quant_blockscale_weight(
+        torch.randn(experts, 2 * inter_dim, model_dim, dtype=dtypes.bf16) * 0.5
+    )
+    w2, s2 = _quant_blockscale_weight(
+        torch.randn(experts, model_dim, inter_dim, dtype=dtypes.bf16) / inter_dim**0.5
+    )
+    weights, ids = fused_topk(
+        x, torch.randn(token, experts, dtype=dtypes.bf16), topk, True
+    )
+    xq, xs = aiter.pertoken_quant(x.view(token, -1, 128), quant_dtype=dtypes.fp8)
+    xq = xq.view_as(x)
+    stage1 = torch_moe_stage1(
+        xq,
+        w1,
+        w2,
+        weights,
+        ids,
+        dtype=dtypes.bf16,
+        activation=aiter.ActivationType.Silu,
+        quant_type=aiter.QuantType.per_1x128,
+        a1_scale=xs.squeeze(-1),
+        w1_scale=s1,
+        swiglu_limit=swiglu_limit,
+    )
+
+    def stage2_reference(y):
+        yq, ys = aiter.pertoken_quant(y.view(token, -1, 128), quant_dtype=dtypes.fp8)
+        return torch_moe_stage2(
+            yq.view(token, topk, inter_dim),
+            w1,
+            w2,
+            weights,
+            ids,
+            dtype=dtypes.bf16,
+            quant_type=aiter.QuantType.per_1x128,
+            w2_scale=s2,
+            a2_scale=ys.view(token, topk, -1),
+            doweight=True,
+        )
+
+    ref = stage2_reference(stage1)
+    swapped_diff = None
+    if swiglu_limit == 1.0:
+        # Independently pin clamp-before-SiLU, not clamp(SiLU(gate)).
+        xd = (xq.float().view(token, -1, 128) * xs.float()).view_as(x)
+        wd = w1.float() * s1.repeat_interleave(128, 1).repeat_interleave(128, 2)
+        gu = torch.einsum("md,end->men", xd, wd)[
+            torch.arange(token)[:, None], ids.long()
+        ]
+        gate, up = gu.chunk(2, dim=-1)
+        swapped = torch.nn.functional.silu(gate).clamp(max=1.0) * up.clamp(-1.0, 1.0)
+        swapped_ref = stage2_reference(swapped.to(dtypes.bf16))
+        swapped_diff = float(
+            1
+            - 2
+            * (ref.double() * swapped_ref.double()).sum()
+            / (ref.double().square() + swapped_ref.double().square()).sum()
+        )
+        assert swapped_diff > 0.01, "test inputs must distinguish the clamp order"
+
+    w1_sh, w2_sh = shuffle_weight(w1, layout=(16, 16)), shuffle_weight(
+        w2, layout=(16, 16)
+    )
+    out = torch.empty(token, model_dim, dtype=dtypes.bf16)
+    candidates = {
+        "ck": lambda: fused_moe(
+            x,
+            w1_sh,
+            w2_sh,
+            weights,
+            ids,
+            w1_scale=s1,
+            w2_scale=s2,
+            quant_type=aiter.QuantType.per_128x128,
+            activation=aiter.ActivationType.Silu,
+            swiglu_limit=swiglu_limit,
+            output=out,
+        )
+    }
+    flops = 6 * token * topk * model_dim * inter_dim
+    nbytes = sum(t.numel() * t.element_size() for t in (x, w1, w2, out, s1, s2))
+    ret = {"gfx": get_gfx(), "swapped logits_diff": swapped_diff}
+    for name, fn in candidates.items():
+        actual, us = run_perftest(fn, num_iters=5, num_warmup=2)
+        err = checkAllclose(
+            ref.float(),
+            actual.float(),
+            rtol=0.05,
+            atol=0.05,
+            msg=f"blockscale limit={swiglu_limit}",
+        )
+        logits_diff = float(
+            1
+            - 2
+            * (ref.double() * actual.double()).sum()
+            / (ref.double().square() + actual.double().square()).sum()
+        )
+        assert err < 0.05 and logits_diff < 1e-3, (err, logits_diff)
+        ret[f"{name} logits_diff"] = logits_diff
+        ret.update(
+            {
+                f"{name} us": us,
+                f"{name} TFLOPS": flops / us / 1e6,
+                f"{name} TB/s": nbytes / us / 1e6,
+                f"{name} err": err,
+            }
+        )
+    return ret
+
+
+def run_blockscale_limit_cases():
+    rows = [
+        test_blockscale_swiglu_limit(token, limit)
+        for token, limit in itertools.product((1, 32, 1024), (1.0, 7.0, None))
+    ]
+    aiter.logger.info(
+        "blockscale SiLU limit summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1728,6 +1875,8 @@ if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     test_output_buffer_contract()
+    if get_gfx() in ("gfx942", "gfx950"):
+        run_blockscale_limit_cases()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
