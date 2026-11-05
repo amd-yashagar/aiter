@@ -77,6 +77,7 @@ def _get_flydsl_moe_kernels():
 
 
 BLOCK_SIZE_M = 32
+_SILU_VALUE = int(ActivationType.Silu)
 
 
 def swiglu_limit_tag(swiglu_limit):
@@ -1534,18 +1535,25 @@ def _fused_moe_impl(
     _stage2_override: Callable | None = None,
     _enforce_metadata_block_size: bool = False,
 ) -> torch.Tensor:
-    # We do such convert since custom_op schema restriction on block_size_M, and Enum type
+    # vLLM sends 0.0 for "no limit". Check floats and the raw int first:
+    # a pybind enum comparison costs about 0.4 us per call.
+    silu_limit = (
+        swiglu_limit is not None
+        and swiglu_limit != 0
+        and swiglu_limit != math.inf
+        and (
+            activation == _SILU_VALUE
+            if type(activation) is int
+            else ActivationType(activation) == ActivationType.Silu
+        )
+    )
+    # Convert for the custom_op schema restrictions on Enum types.
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
-    if swiglu_limit is not None and activation == ActivationType.Silu:
-        # vLLM sends 0.0 for "no limit"; for SiLU 0 and +inf mean no clamp on
-        # every path, so take the None path without extra calls.
-        if swiglu_limit == 0 or swiglu_limit == math.inf:
-            swiglu_limit = None
-        else:
-            quant_type, quant_type_a, swiglu_limit = _normalize_moe_dispatch_contract(
-                quant_type, activation, swiglu_limit, quant_type_a
-            )
+    if silu_limit:
+        quant_type, quant_type_a, swiglu_limit = _normalize_moe_dispatch_contract(
+            quant_type, activation, swiglu_limit, quant_type_a
+        )
     gate_mode = GateMode(gate_mode)
     if quant_type_a is not None and QuantType(quant_type_a) != quant_type:
         raise NotImplementedError(
@@ -2154,11 +2162,7 @@ def _fused_moe_impl(
     if metadata.run_1stage:
         if _stage2_override is not None:
             raise RuntimeError("_stage2_override requires a two-stage MoE config")
-        if (
-            swiglu_limit is not None
-            and activation == ActivationType.Silu
-            and normalize_swiglu_limit(swiglu_limit) is not None
-        ):
+        if silu_limit and normalize_swiglu_limit(swiglu_limit) is not None:
             raise NotImplementedError(
                 f"1-stage MoE cannot apply swiglu_limit={swiglu_limit!r}; "
                 "the selected kernel has no clamp."
@@ -5740,7 +5744,12 @@ def fused_moe_2stages(
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     elif stage1_func is _mxfp4_a4w4_stage1_fw:
         extra_stage1_args["swiglu_limit"] = normalized_swiglu_limit
-    elif swiglu_limit is not None and stage1_func in (ck_moe_stage1, asm_stage1):
+    elif (
+        swiglu_limit
+        and swiglu_limit != math.inf
+        and stage1_func in (ck_moe_stage1, asm_stage1)
+        and activation.value == _SILU_VALUE
+    ):
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
         extra_stage1_args["v2_output_layout"] = True
@@ -5990,11 +5999,11 @@ def asm_stage1(
 ):
     if swiglu_limit is not None and activation == ActivationType.Silu:
         swiglu_limit = normalize_swiglu_limit(swiglu_limit)
-    if swiglu_limit is not None and activation == ActivationType.Silu and ksplit <= 0:
-        raise NotImplementedError(
-            f"ASM MoE stage1 cannot apply swiglu_limit={swiglu_limit!r} without "
-            "split-K; the fused SiLU epilogue does not clamp."
-        )
+        if swiglu_limit is not None and ksplit <= 0:
+            raise NotImplementedError(
+                f"ASM MoE stage1 cannot apply swiglu_limit={swiglu_limit!r} without "
+                "split-K; the fused SiLU epilogue does not clamp."
+            )
     dtype = dtypes.bf16  # out.dtype, asm only support bf16
     if quant_type != QuantType.per_1x128:
         out = out.view(dtype)

@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -736,10 +737,19 @@ def test_one_stage_limit_guard_for_every_quant_type(quant_type, limit):
         for n in branch.body
         if isinstance(n, ast.If) and "normalize_swiglu_limit" in ast.unparse(n.test)
     )
-    code = compile(ast.Module(body=[guard], type_ignores=[]), moe.__file__, "exec")
+    silu_limit = next(
+        n
+        for n in impl.body
+        if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "silu_limit"
+    )
+    code = compile(
+        ast.Module(body=[silu_limit, guard], type_ignores=[]), moe.__file__, "exec"
+    )
     scope = {
-        "activation": ActivationType.Silu,
+        "activation": ActivationType.Silu.value,
         "ActivationType": ActivationType,
+        "_SILU_VALUE": moe._SILU_VALUE,
+        "math": __import__("math"),
         "quant_type": quant_type,
         "swiglu_limit": limit,
         "normalize_swiglu_limit": normalize_swiglu_limit,
@@ -836,7 +846,7 @@ def _stop(*args, **kwargs):
     raise _StopAfterLimitCheck
 
 
-def _run_fused_entry(activation, quant_type, limit):
+def _run_fused_entry(activation, quant_type, limit, *, as_arg=lambda a: a.value):
     x = torch.empty(1, 128, dtype=dtypes.bf16)
     w1 = torch.empty(1, 256, 128, dtype=dtypes.bf16)
     w2 = torch.empty(1, 128, 128, dtype=dtypes.bf16)
@@ -848,7 +858,7 @@ def _run_fused_entry(activation, quant_type, limit):
             w2,
             torch.ones(1, 1),
             topk_ids,
-            activation=activation.value,
+            activation=as_arg(activation),
             quant_type=quant_type.value,
             swiglu_limit=limit,
         )
@@ -858,13 +868,12 @@ def _run_fused_entry(activation, quant_type, limit):
 @pytest.mark.parametrize(
     "activation, quant_type, limit",
     [
-        (ActivationType.Silu, QuantType.per_1x128, None),
-        (ActivationType.Silu, QuantType.per_1x128, 0.0),
-        (ActivationType.Silu, QuantType.per_1x128, -0.0),
+        (ActivationType.Silu, quant_type, limit)
+        for quant_type in (QuantType.per_1x128, QuantType.per_Token, QuantType.No)
+        for limit in (None, 0.0, -0.0, 0, float("inf"))
+    ]
+    + [
         (ActivationType.Silu, QuantType.per_128x128, 0),
-        (ActivationType.Silu, QuantType.per_1x128, float("inf")),
-        (ActivationType.Silu, QuantType.per_Token, 0.0),
-        (ActivationType.Silu, QuantType.No, float("inf")),
         (ActivationType.Swiglu, QuantType.No, 0.0),
         (ActivationType.Swiglu, QuantType.per_1x128, 7.0),
         (ActivationType.Gelu, QuantType.per_1x128, 0.0),
@@ -880,11 +889,27 @@ def test_fused_entry_disabled_limit_skips_normalization(
     monkeypatch.setattr(moe, "normalize_swiglu_limit", unexpected)
     # GateMode(...) is the first call after the limit check.
     monkeypatch.setattr(moe, "GateMode", _stop)
+    calls = []
+    for enum_type in (ActivationType, QuantType):
+        original_eq = enum_type.__eq__
+
+        def record_eq(self, other, original_eq=original_eq):
+            calls.append((self, other))
+            return original_eq(self, other)
+
+        monkeypatch.setattr(enum_type, "__eq__", record_eq)
     _run_fused_entry(activation, quant_type, limit)
+    assert not calls
 
 
+# fused_moe_ passes an int; direct callers may pass the enum or another int-like.
+@pytest.mark.parametrize(
+    "as_arg",
+    [lambda a: a.value, lambda a: a, lambda a: np.int64(a.value)],
+    ids=["int", "enum", "np_int64"],
+)
 @pytest.mark.parametrize("limit", [5.0, -1.0, float("nan"), -float("inf")])
-def test_fused_entry_normalizes_other_silu_limits(monkeypatch, limit):
+def test_fused_entry_normalizes_other_silu_limits(monkeypatch, limit, as_arg):
     calls = []
 
     def record(quant_type, activation, swiglu_limit, quant_type_a=None):
@@ -892,7 +917,9 @@ def test_fused_entry_normalizes_other_silu_limits(monkeypatch, limit):
         raise _StopAfterLimitCheck
 
     monkeypatch.setattr(moe, "_normalize_moe_dispatch_contract", record)
-    _run_fused_entry(ActivationType.Silu, QuantType.per_1x128, limit)
+    # Stop at GateMode(...) if the limit check is skipped.
+    monkeypatch.setattr(moe, "GateMode", _stop)
+    _run_fused_entry(ActivationType.Silu, QuantType.per_1x128, limit, as_arg=as_arg)
     assert len(calls) == 1
 
 
@@ -908,6 +935,108 @@ def test_asm_stage1_without_limit_skips_normalization(monkeypatch, activation):
     w = torch.empty(1, 256, 128, dtype=dtypes.bf16)
     with pytest.raises(_StopAfterLimitCheck):
         moe.asm_stage1(None, w, w, None, None, None, out, 1, 16, activation=activation)
+
+
+def test_asm_stage1_swiglu_limit_skips_normalization(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("SwiGLU limits must not use SiLU normalization")
+
+    monkeypatch.setattr(moe, "normalize_swiglu_limit", unexpected)
+    launches = []
+    monkeypatch.setattr(
+        aiter, "moe_stage1_g1u1", lambda *a, **k: launches.append((a, k))
+    )
+    out = torch.empty(1, 1, 128, dtype=dtypes.bf16, device="cpu")
+    w1 = torch.empty(1, 256, 128, dtype=dtypes.bf16, device="cpu")
+    w2 = torch.empty(1, 128, 128, dtype=dtypes.bf16, device="cpu")
+    result = moe.asm_stage1(
+        None,
+        w1,
+        w2,
+        None,
+        None,
+        None,
+        out,
+        1,
+        16,
+        activation=ActivationType.Swiglu,
+        swiglu_limit=7.0,
+        ksplit=0,
+    )
+    assert result.data_ptr() == out.data_ptr()
+    assert result.shape == out.shape
+    assert len(launches) == 1
+
+
+def test_asm_stage1_nan_limit_raises():
+    with pytest.raises(ValueError, match="swiglu_limit"):
+        moe.asm_stage1(
+            *([None] * 7),
+            1,
+            16,
+            activation=ActivationType.Silu,
+            swiglu_limit=float("nan"),
+            ksplit=0,
+        )
+
+
+@pytest.mark.parametrize("stage", ["ck_moe_stage1", "asm_stage1"])
+@pytest.mark.parametrize(
+    "activation, limit, forwarded",
+    [
+        (ActivationType.Silu, 5.0, True),
+        (ActivationType.Silu, None, False),
+        (ActivationType.Silu, 0.0, False),
+        (ActivationType.Silu, -0.0, False),
+        (ActivationType.Silu, 0, False),
+        (ActivationType.Silu, float("inf"), False),
+        (ActivationType.Swiglu, 7.0, False),
+        (ActivationType.Swiglu, 0.0, False),
+        (ActivationType.Gelu, 0.0, False),
+        (ActivationType.Silu, float("nan"), True),
+        (ActivationType.Silu, -1.0, True),
+        (ActivationType.Silu, -float("inf"), True),
+    ],
+)
+def test_two_stage_limit_forwarding(monkeypatch, stage, activation, limit, forwarded):
+    calls = []
+
+    def capture(*args, **kwargs):
+        calls.append(kwargs)
+        raise _StopAfterLimitCheck
+
+    monkeypatch.setattr(moe, stage, capture)
+    metadata = moe.MOEMetadata(
+        functools.partial(capture, activation=activation, quant_type=QuantType.No),
+        lambda *a, **k: a[6],
+        16,
+        0,
+        prequant=False,
+        skip_inter_quant=True,
+    )
+    monkeypatch.setattr(moe, "get_2stage_cfgs", lambda *a, **k: metadata)
+    monkeypatch.setattr(moe, "get_quant", lambda _: lambda x, **k: (x, None))
+    with pytest.raises(_StopAfterLimitCheck):
+        moe.fused_moe_2stages(
+            torch.empty(1, 128, dtype=dtypes.bf16, device="cpu"),
+            torch.empty(1, 256, 128, dtype=dtypes.bf16, device="cpu"),
+            torch.empty(1, 128, 128, dtype=dtypes.bf16, device="cpu"),
+            1,
+            torch.zeros(16, dtype=torch.int32, device="cpu"),
+            None,
+            torch.zeros(1, dtype=torch.int32, device="cpu"),
+            torch.ones(1, dtype=torch.int32, device="cpu"),
+            torch.empty(1, 128, dtype=dtypes.bf16, device="cpu"),
+            True,
+            16,
+            activation=activation,
+            quant_type=QuantType.No,
+            swiglu_limit=limit,
+        )
+    assert len(calls) == 1
+    assert ("swiglu_limit" in calls[0]) is forwarded
+    if forwarded:
+        assert calls[0]["swiglu_limit"] is limit
 
 
 @pytest.mark.parametrize("limit", [-1.0, float("nan"), -float("inf")])
