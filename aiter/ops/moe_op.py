@@ -363,6 +363,11 @@ def cmdGenFunc_ck_moe_stage(
     is_splitk = splitk > 1 and not kernelName
     is_splitk = is_splitk or (bool(kernelName) and "Splitk" in kernelName)
     outtype = str2dtype_dict[dst_type] if is_splitk else out.dtype
+    from aiter.ops.moe_limits import normalize_swiglu_limit
+
+    runtime_swiglu_limit = (
+        swiglu_limit_enabled and normalize_swiglu_limit(swiglu_limit) is not None
+    )
     md_name, blob_gen_cmd = get_moe_stage_module(
         hidden_states.dtype,
         w1.dtype,
@@ -373,6 +378,7 @@ def cmdGenFunc_ck_moe_stage(
         is_shuffled,
         is_splitk,
         swiglustep,
+        runtime_swiglu_limit,
     )
     return {
         "md_name": md_name,
@@ -649,6 +655,7 @@ def get_moe_stage_module(
     preshuffle_mode=False,
     is_splitk=False,
     swiglustep=False,
+    runtime_swiglu_limit=False,
 ):
     if isinstance(activation, int):
         activation = ActivationType(activation)
@@ -672,6 +679,16 @@ def get_moe_stage_module(
         if act != "silu":
             raise ValueError(f"swiglustep requires Silu activation, got {act}")
         act = "swiglustep"
+    if runtime_swiglu_limit and (
+        Adtype != "f8"
+        or Bdtype != "f8"
+        or act != "silu"
+        or quant_type != QuantType.per_1x128
+        or is_splitk
+    ):
+        raise ValueError(
+            "Runtime SwiGLU limit requires non-split FP8 per_1x128 CK SiLU"
+        )
     quant_type = str(quant_type).split(".")[-1].lower()
 
     parts = [
@@ -687,9 +704,12 @@ def get_moe_stage_module(
     ]
     if is_splitk:
         parts.append("splitk")
+    if runtime_swiglu_limit:
+        parts.append("runtime_swiglu_limit")
     md_name = "_".join(parts)
+    runtime_limit_arg = " --runtime-swiglu-limit" if runtime_swiglu_limit else ""
     blob_gen_cmd = [
-        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} {splitk_str} -w {{}}"
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} {splitk_str}{runtime_limit_arg} -w {{}}"
     ]
 
     return md_name, blob_gen_cmd

@@ -21,7 +21,8 @@ template <typename A0DataType,
           bool PerTensorQuant,
           bool MulRoutedWeight,
           int ActOP,
-          bool NT>
+          bool NT,
+          bool RuntimeSwigluLimit>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -42,6 +43,14 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         [[maybe_unused]] float swiglu_limit,
                         [[maybe_unused]] bool swiglu_limit_enabled)
 {
+    TORCH_CHECK(swiglu_limit_enabled == RuntimeSwigluLimit,
+                "Runtime SwiGLU limit module does not match the requested clamp state");
+    if constexpr(RuntimeSwigluLimit)
+    {
+        TORCH_CHECK(ck::MoeSilu::ValidRuntimeLimit(swiglu_limit),
+                    "Runtime SwiGLU limit must be positive and finite");
+    }
+
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     using A1DataType       = F32;
     using B1DataType       = F32;
@@ -136,7 +145,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                 S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
                 S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
                 MXDLPerWave,    NXDLPerWave,   S<1, CSHUFFLE_M_THREADS, 1, CSHUFFLE_N_THREADS>, S<2, 1, 1, 1>,
-                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, IsSplitK, MulRoutedWeight, int32_t, A0DataType, A0DataType, A0DataType, A0DataType, NT>;
+                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, IsSplitK, MulRoutedWeight, int32_t, A0DataType, A0DataType, A0DataType, A0DataType, NT, RuntimeSwigluLimit>;
 
     // clang-format on
 
@@ -172,8 +181,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
         a_element_op,
         b_element_op,
         cde_element_op,
-        swiglu_limit,
-        swiglu_limit_enabled);
+        swiglu_limit);
 
     if(!device_op.IsSupportedArgument(argument))
     {
@@ -200,7 +208,8 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP>
+          int ActOP,
+          bool RuntimeSwigluLimit>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -242,7 +251,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                            PerTensorQuant,
                            MulRoutedWeight,
                            ActOP,
-                           true>(stream,
+                           true,
+                           RuntimeSwigluLimit>(stream,
                                  tokens,
                                  sorted_size,
                                  N,
@@ -280,7 +290,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                            PerTensorQuant,
                            MulRoutedWeight,
                            ActOP,
-                           false>(stream,
+                           false,
+                           RuntimeSwigluLimit>(stream,
                                   tokens,
                                   sorted_size,
                                   N,
@@ -319,7 +330,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                      Nswizzle,                                \
                                      PerTensorQuant,                          \
                                      MulRoutedWeight,                         \
-                                     ActOP>(const hipStream_t& stream,        \
+                                     ActOP,                                    \
+                                     AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(const hipStream_t& stream, \
                                             int tokens,                       \
                                             int sorted_size,                  \
                                             int N,                            \

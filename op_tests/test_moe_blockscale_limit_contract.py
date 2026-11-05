@@ -5,6 +5,9 @@
 
 import csv
 import importlib
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -192,7 +195,7 @@ def test_binding_canonicalizes_per_128x128_alias(monkeypatch):
     assert args[13] == QuantType.per_1x128.value
 
 
-def test_silu_and_legacy_codegen_modules_are_distinct():
+def test_silu_and_swiglustep_codegen_modules_are_distinct():
     args = (
         aiter.dtypes.fp8,
         aiter.dtypes.fp8,
@@ -202,25 +205,28 @@ def test_silu_and_legacy_codegen_modules_are_distinct():
         2,
     )
     silu, silu_cmd = ops.get_moe_stage_module(*args)
-    legacy, legacy_cmd = ops.get_moe_stage_module(*args, swiglustep=True)
-    assert "runtime_limit_v2" in silu
-    assert silu != legacy
+    swiglustep, swiglustep_cmd = ops.get_moe_stage_module(*args, swiglustep=True)
+    assert "runtime_limit_v3" in silu
+    assert silu != swiglustep
     assert "-act silu " in silu_cmd[0]
-    assert "-act swiglustep " in legacy_cmd[0]
+    assert "-act swiglustep " in swiglustep_cmd[0]
 
 
-def test_runtime_module_name_matches_prebuild_recipe():
+def test_default_and_limit_module_names_match_prebuild_recipes():
     recipe = importlib.import_module("aiter.jit.utils.moe_recipes")
-    runtime_name, _ = ops.get_moe_stage_module(
+    args = (
         aiter.dtypes.fp8,
         aiter.dtypes.fp8,
         aiter.dtypes.bf16,
         ActivationType.Silu,
         QuantType.per_1x128,
         2,
+    )
+    default_name, _ = ops.get_moe_stage_module(
+        *args,
         preshuffle_mode=True,
     )
-    prebuild_name, _ = recipe._build_moe_variant(
+    default_prebuild_name, _ = recipe._build_moe_variant(
         aiter_csrc_dir="csrc",
         a_dtype="f8",
         b_dtype="f8",
@@ -231,7 +237,118 @@ def test_runtime_module_name_matches_prebuild_recipe():
         preshuffle_mode=True,
         is_splitk=False,
     )
-    assert runtime_name == prebuild_name
+    limit_name, limit_cmd = ops.get_moe_stage_module(
+        *args,
+        preshuffle_mode=True,
+        runtime_swiglu_limit=True,
+    )
+    limit_prebuild_name, limit_prebuild_cmd = recipe._build_moe_variant(
+        aiter_csrc_dir="csrc",
+        a_dtype="f8",
+        b_dtype="f8",
+        c_dtype="b16",
+        activation="silu",
+        quant_type="per_1x128",
+        mul_routed_weight_stage=2,
+        preshuffle_mode=True,
+        is_splitk=False,
+        runtime_swiglu_limit=True,
+    )
+    assert default_name == default_prebuild_name
+    assert limit_name == limit_prebuild_name
+    assert default_name != limit_name
+    assert "--runtime-swiglu-limit" in limit_cmd[0]
+    assert "--runtime-swiglu-limit" in limit_prebuild_cmd[0]
+
+
+def test_limit_tag_prebuilds_default_stage2_module(monkeypatch):
+    recipe = importlib.import_module("aiter.jit.utils.moe_recipes")
+    monkeypatch.setattr(
+        recipe,
+        "_get_tuned_fmoe_rows",
+        lambda: [
+            {
+                "dtype": "torch.bfloat16",
+                "q_dtype_a": "torch.float8_e4m3fn",
+                "q_dtype_w": "torch.float8_e4m3fn",
+                "q_type": "per_1x128",
+                "act_type": "silu",
+                "_tag": "swiglu_limit=5",
+                "ksplit": "0",
+            }
+        ],
+    )
+    variants = recipe.get_moe_ck2stages_prebuild_variants("csrc")
+    names = {variant["md_name"] for variant in variants}
+    stage2_name, _ = ops.get_moe_stage_module(
+        aiter.dtypes.fp8,
+        aiter.dtypes.fp8,
+        aiter.dtypes.bf16,
+        ActivationType.Silu,
+        QuantType.per_1x128,
+        2,
+        preshuffle_mode=True,
+    )
+    limit_name, _ = ops.get_moe_stage_module(
+        aiter.dtypes.fp8,
+        aiter.dtypes.fp8,
+        aiter.dtypes.bf16,
+        ActivationType.Silu,
+        QuantType.per_1x128,
+        2,
+        preshuffle_mode=True,
+        runtime_swiglu_limit=True,
+    )
+    assert names == {stage2_name, limit_name}
+
+
+def test_runtime_limit_codegen_heuristic_uses_enabled_specialization(tmp_path):
+    generator = (
+        Path(__file__).resolve().parents[1]
+        / "csrc/ck_gemm_moe_2stages_codegen/gen_instances.py"
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(generator),
+            "-a",
+            "f8",
+            "-b",
+            "f8",
+            "-c",
+            "b16",
+            "-q",
+            "per_1x128",
+            "-act",
+            "silu",
+            "-m",
+            "2",
+            "-w",
+            str(tmp_path),
+            "--runtime-swiglu-limit",
+        ],
+        check=True,
+        cwd=generator.parent,
+        capture_output=True,
+        text=True,
+    )
+    dispatch = (tmp_path / "ck2stages_moe_stage1_heuristic_dispatch.hpp").read_text()
+    references = re.findall(r"ck_moe_stage1_gemm<([^;]+)>;", dispatch)
+    assert references
+    assert all(reference.strip().endswith(", true") for reference in references)
+
+
+def test_runtime_module_requires_fp8_blockscale():
+    with pytest.raises(ValueError, match="non-split FP8 per_1x128"):
+        ops.get_moe_stage_module(
+            aiter.dtypes.bf16,
+            aiter.dtypes.fp8,
+            aiter.dtypes.bf16,
+            ActivationType.Silu,
+            QuantType.per_1x128,
+            2,
+            runtime_swiglu_limit=True,
+        )
 
 
 @pytest.fixture

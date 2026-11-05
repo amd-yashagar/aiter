@@ -21,7 +21,8 @@ template <typename A0DataType,
           bool Nswizzle,
           bool PerTensorQuant,
           bool MulRoutedWeight,
-          int ActOP>
+          int ActOP,
+          bool RuntimeSwigluLimit>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -181,7 +182,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                      Nswizzle,                                \
                                      PerTensorQuant,                          \
                                      MulRoutedWeight,                         \
-                                     ActOP>(const hipStream_t& stream,        \
+                                     ActOP,                                    \
+                                     AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(const hipStream_t& stream, \
                                             int tokens,                       \
                                             int sorted_size,                  \
                                             int N,                            \

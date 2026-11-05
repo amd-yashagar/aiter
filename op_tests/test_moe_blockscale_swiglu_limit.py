@@ -124,7 +124,7 @@ def _reference(w, a1_qt, a1_scale, topk_weights, topk_ids, limit):
 
 # Limit 1 distinguishes clamp-before-SiLU from post-SiLU clamping.
 # None, zero and +infinity all retain the default unclamped behavior.
-@pytest.mark.parametrize("limit", [1.0, 7.0, 5.0, None, 0.0, float("inf")])
+@pytest.mark.parametrize("limit", [1.0, 7.0, 5.0, 1e100, None, 0.0, float("inf")])
 @pytest.mark.parametrize("tokens", [1, 32, 1024])
 def test_fused_moe_per_1x128_swiglu_limit(weights, tokens, limit):
     torch.manual_seed(tokens)
@@ -154,7 +154,7 @@ def test_fused_moe_per_1x128_swiglu_limit(weights, tokens, limit):
     expected = _reference(weights, a1_qt, a1_scale, topk_weights, topk_ids, limit)
     logits_diff = _calc_diff(expected, out)
     assert logits_diff < 1e-3, f"logits_diff={logits_diff}"
-    if limit is not None and 0 < limit < float("inf"):
+    if limit is not None and 0 < limit <= 7.0:
         unclamped = _reference(weights, a1_qt, a1_scale, topk_weights, topk_ids, None)
         assert (
             _calc_diff(unclamped, out) > 1e-2

@@ -8,7 +8,7 @@ def normalize_swiglu_limit(limit):
     """CK SiLU override: None/0/+inf disable; positive finite values clamp.
 
     Gate is upper-clamped and up is symmetrically clamped before SiLU.
-    This is not the legacy swiglustep activation.
+    This is distinct from the existing swiglustep activation.
     """
     if limit is None:
         return None

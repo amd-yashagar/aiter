@@ -153,12 +153,25 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
 
     activation = map_activation_to_ck_stage1(activation);
 
-    auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled, clamp_enabled);
+    auto kernel = moe_dispatch<1>(kernelName,
+                                  MPerBlock,
+                                  N,
+                                  hidden_states.dtype().toScalarType(),
+                                  w1.dtype().toScalarType(),
+                                  out.dtype().toScalarType(),
+                                  activation,
+                                  quant_type,
+                                  MulRoutedWeight,
+                                  is_shuffled);
 
     // A positive double must not underflow to the float sentinel (0 disables).
     // Such tiny clamps produce zero at the output precision, not an override bypass.
     const float ck_limit = clamp_enabled
-        ? std::max(static_cast<float>(swiglu_limit), std::numeric_limits<float>::denorm_min())
+        ? std::max(
+              static_cast<float>(std::min(
+                  swiglu_limit,
+                  static_cast<double>(std::numeric_limits<float>::max()))),
+              std::numeric_limits<float>::denorm_min())
         : static_cast<float>(swiglu_limit);
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,
