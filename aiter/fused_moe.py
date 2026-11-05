@@ -3815,15 +3815,15 @@ def get_2stage_cfgs(
         return result
 
     cfg = _lookup_cfg(active_cfg_2stages)
-    limit_tag = swiglu_limit_tag(swiglu_limit)
-    limit_tune_file = os.environ.get("AITER_CONFIG_FMOE_SWIGLU_LIMIT", "")
-    if (
-        limit_tag
-        and limit_tune_file
-        and config_file is None
+    limit_tag = (
+        swiglu_limit_tag(swiglu_limit)
+        if config_file is None
         and q_type == QuantType.per_1x128
         and activation == ActivationType.Silu
-    ):
+        else ""
+    )
+    if limit_tag:
+        limit_tune_file = AITER_CONFIGS.AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE
         # Rows tuned by gemm_moe_tune.py --swiglu_limit, tagged with the limit.
         limit_cfgs = cfg_2stages_by_limit_tag.get((limit_tune_file, limit_tag))
         if limit_cfgs is None:
@@ -3839,14 +3839,12 @@ def get_2stage_cfgs(
             ):
                 raise ValueError(
                     "Incompatible runtime SiLU limit tuning row; retune with "
-                    "non-split CK SiLU instances (not legacy swiglustep)"
+                    "non-split CK SiLU instances"
                 )
             cfg = limit_cfg
         else:
-            logger.warning(
-                f"[fused_moe] AITER_CONFIG_FMOE_SWIGLU_LIMIT={limit_tune_file!r} "
-                f"tag {limit_tag!r} has no row for {keys}; the default config is "
-                "used and does not carry a kernel tuned for this limit"
+            logger.info(
+                f"[fused_moe] no row for {keys} with {limit_tag}; using default config"
             )
     if (
         cfg is None

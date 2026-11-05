@@ -162,6 +162,11 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
+AITER_CONFIG_FMOE_SWIGLU_LIMIT = os.getenv(
+    "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_swiglu_limit_fmoe.csv",
+)
+
 AITER_CONFIG_FHMOE = os.getenv(
     "AITER_CONFIG_FHMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
@@ -358,6 +363,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+        )
+
+    @property
+    def AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE_SWIGLU_LIMIT",
+            AITER_CONFIG_FMOE_SWIGLU_LIMIT,
+            "tuned_swiglu_limit_fmoe",
         )
 
     @property
@@ -734,7 +747,7 @@ class AITER_CONFIG:
                         # Legacy config without a gfx column: infer the arch from
                         # cu_num (256->gfx950, 80/304->gfx942) so archs that share
                         # a cu_num stay distinguishable after the merge.
-                        from aiter.jit.utils.chip_info import gfx_from_cu_num
+                        from .utils.chip_info import gfx_from_cu_num
 
                         cu_num = pd.to_numeric(df["cu_num"], errors="coerce")
                         df[c] = cu_num.map(gfx_from_cu_num)

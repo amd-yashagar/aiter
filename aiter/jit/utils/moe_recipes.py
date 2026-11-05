@@ -128,19 +128,12 @@ def _get_mul_weight_stage(row: dict) -> int:
 
 
 def _get_tuned_fmoe_rows() -> list[dict]:
-    configs_dir = Path(__file__).resolve().parents[2] / "configs"
-    model_configs_dir = configs_dir / "model_configs"
-    tuned_paths = [configs_dir / "tuned_fmoe.csv"]
-    # NOTE: "*tuned_fmoe*.csv" also matches "*untuned_fmoe*.csv" (substring).
-    # Untuned CSVs list problem shapes to tune, not resolved kernels, and have
-    # no kernelName columns — so the flydsl-skip in the prebuild enumerator does
-    # not catch them and they get force-compiled as CK 2stages (e.g. GLM-5.2
-    # MXFP8 Silu per_1x32, which has no working CK instance). Exclude untuned.
-    tuned_paths.extend(
-        p
-        for p in sorted(model_configs_dir.glob("*tuned_fmoe*.csv"))
-        if "untuned" not in p.name
-    )
+    from ..core import AITER_CONFIGS
+
+    tuned_paths = [
+        Path(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE),
+        Path(AITER_CONFIGS.AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE),
+    ]
 
     rows: list[dict] = []
     for path in tuned_paths:
