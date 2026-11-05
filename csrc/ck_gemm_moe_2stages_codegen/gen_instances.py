@@ -831,9 +831,7 @@ heuristic_dispatch_dict = {
 }
 
 
-def generate_instance_and_lookUpTable_head(
-    working_path, activation=None, runtime_swiglu_limit=False
-):
+def generate_instance_and_lookUpTable_head(working_path, runtime_swiglu_limit=False):
     f_lookUpTable = os.path.join(working_path, "gemm_moe_ck2stages_lookup.h")
     if os.path.exists(f_lookUpTable):
         os.remove(f_lookUpTable)
@@ -1178,9 +1176,7 @@ if __name__ == "__main__":
     ):
         parser.error("--runtime-swiglu-limit requires non-split per_1x128 SiLU")
 
-    generate_instance_and_lookUpTable_head(
-        args.working_path, args.activation, args.runtime_swiglu_limit
-    )
+    generate_instance_and_lookUpTable_head(args.working_path, args.runtime_swiglu_limit)
     # build all
     if args.b_dtype is None:
         # quanted moe

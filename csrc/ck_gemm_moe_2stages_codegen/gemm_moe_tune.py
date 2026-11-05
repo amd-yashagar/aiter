@@ -950,9 +950,7 @@ class FmoeTuner(TunerCommon):
             if act_type == ActivationType.Silu or (
                 isinstance(act_type, str) and "silu" in act_type.lower()
             ):
-                aiter.silu_and_mul(
-                    out, valid_out.view(dtypes.fp32), swiglu_limit or 0.0
-                )
+                aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
             else:
                 aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
         if q_type == QuantType.per_1x128:
@@ -3548,7 +3546,6 @@ class FmoeTuner(TunerCommon):
             and q_dtype_w == dtypes.fp8
         )
         splitk_list = []
-        _ck_stage1_splitk_kernels = {}
         if is_fp8_blockscale:
             tilek = 128
             for _sk in range(2, 9):
@@ -3582,26 +3579,15 @@ class FmoeTuner(TunerCommon):
         stage1_kwargs = {"swiglu_limit": clamp_limit} if clamp_limit else {}
         for blockM in blockMs:
             if blockM in [16, 32, 64, 128] and use_g1u1:
-                # (tag name, kernel name, splitk); post_process reads ksplit from _skN.
-                stage1_candidates = [
-                    (k.name, k.name, 0)
+                for kernel, nt in [
+                    (k, n)
                     for k in ck_stage1_kernels.values()
                     if k.MPerBlock == blockM
-                ]
-                # CK blockscale split-K at block_m 64 (pipeline V3) writes up as zeros.
-                if clamp_limit is None and blockM <= 32:
-                    stage1_candidates += [
-                        (f"{k.name}_sk{sk}", k.name, sk)
-                        for k in _ck_stage1_splitk_kernels.values()
-                        if k.MPerBlock == blockM
-                        for sk in splitk_list
-                    ]
-                for (tag_name, kernel_name, splitk), nt in [
-                    (c, n) for c in stage1_candidates for n in nt_values
+                    for n in nt_values
                 ]:
                     tasks_ck.append(
                         (
-                            (info, "stage1", tag_name, blockM, 0, 0, nt),  # tag
+                            (info, "stage1", kernel.name, blockM, 0, 0, nt),  # tag
                             FmoeTuner.generate_data_2stages,
                             (
                                 token,
@@ -3634,16 +3620,12 @@ class FmoeTuner(TunerCommon):
                                 ],
                                 dtype,
                                 topk,
-                                kernel_name,
+                                kernel.name,
                                 blockM,
                                 q_type,
                                 act_type,
                             ),
-                            (
-                                {"use_nt": nt, "splitk": splitk, **stage1_kwargs}
-                                if splitk
-                                else {"use_nt": nt, **stage1_kwargs}
-                            ),
+                            {"use_nt": nt, **stage1_kwargs},
                             FmoeTuner.run_torch_moe_stage1,
                             (
                                 [
@@ -3669,7 +3651,7 @@ class FmoeTuner(TunerCommon):
                             (None),
                             0.01,
                             0.01,
-                            cosine_diff_compare if is_fp8_blockscale else None,
+                            cosine_diff_compare if clamp_limit else None,
                         )
                     )
 
@@ -3741,7 +3723,7 @@ class FmoeTuner(TunerCommon):
                             (None),
                             0.01,
                             0.01,
-                            cosine_diff_compare if is_fp8_blockscale else None,
+                            cosine_diff_compare if clamp_limit else None,
                         )
                     )
         return tasks_ck
