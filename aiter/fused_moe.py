@@ -1537,10 +1537,15 @@ def _fused_moe_impl(
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
-    if swiglu_limit is not None:
-        quant_type, quant_type_a, swiglu_limit = _normalize_moe_dispatch_contract(
-            quant_type, activation, swiglu_limit, quant_type_a
-        )
+    if swiglu_limit is not None and activation == ActivationType.Silu:
+        # vLLM sends 0.0 for "no limit"; for SiLU 0 and +inf mean no clamp on
+        # every path, so take the None path without extra calls.
+        if swiglu_limit == 0 or swiglu_limit == math.inf:
+            swiglu_limit = None
+        else:
+            quant_type, quant_type_a, swiglu_limit = _normalize_moe_dispatch_contract(
+                quant_type, activation, swiglu_limit, quant_type_a
+            )
     gate_mode = GateMode(gate_mode)
     if quant_type_a is not None and QuantType(quant_type_a) != quant_type:
         raise NotImplementedError(
@@ -5983,7 +5988,7 @@ def asm_stage1(
     sorted_weights=None,
     swiglu_limit=None,
 ):
-    if activation == ActivationType.Silu:
+    if swiglu_limit is not None and activation == ActivationType.Silu:
         swiglu_limit = normalize_swiglu_limit(swiglu_limit)
     if swiglu_limit is not None and activation == ActivationType.Silu and ksplit <= 0:
         raise NotImplementedError(

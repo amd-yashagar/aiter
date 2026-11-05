@@ -828,6 +828,88 @@ def test_disabled_ck_entry_points_skip_normalization(monkeypatch, limit, splitk)
     assert "runtime_swiglu_limit" not in module["md_name"]
 
 
+class _StopAfterLimitCheck(Exception):
+    pass
+
+
+def _stop(*args, **kwargs):
+    raise _StopAfterLimitCheck
+
+
+def _run_fused_entry(activation, quant_type, limit):
+    x = torch.empty(1, 128, dtype=dtypes.bf16)
+    w1 = torch.empty(1, 256, 128, dtype=dtypes.bf16)
+    w2 = torch.empty(1, 128, 128, dtype=dtypes.bf16)
+    topk_ids = torch.zeros(1, 1, dtype=torch.int32)
+    with pytest.raises(_StopAfterLimitCheck):
+        moe._fused_moe_impl(
+            x,
+            w1,
+            w2,
+            torch.ones(1, 1),
+            topk_ids,
+            activation=activation.value,
+            quant_type=quant_type.value,
+            swiglu_limit=limit,
+        )
+
+
+# vLLM passes 0.0 when a model has no limit, so this is the default eager path.
+@pytest.mark.parametrize(
+    "activation, quant_type, limit",
+    [
+        (ActivationType.Silu, QuantType.per_1x128, None),
+        (ActivationType.Silu, QuantType.per_1x128, 0.0),
+        (ActivationType.Silu, QuantType.per_1x128, -0.0),
+        (ActivationType.Silu, QuantType.per_128x128, 0),
+        (ActivationType.Silu, QuantType.per_1x128, float("inf")),
+        (ActivationType.Silu, QuantType.per_Token, 0.0),
+        (ActivationType.Silu, QuantType.No, float("inf")),
+        (ActivationType.Swiglu, QuantType.No, 0.0),
+        (ActivationType.Swiglu, QuantType.per_1x128, 7.0),
+        (ActivationType.Gelu, QuantType.per_1x128, 0.0),
+    ],
+)
+def test_fused_entry_disabled_limit_skips_normalization(
+    monkeypatch, activation, quant_type, limit
+):
+    def unexpected(*args, **kwargs):
+        pytest.fail("a disabled or non-SiLU limit must not need normalization")
+
+    monkeypatch.setattr(moe, "_normalize_moe_dispatch_contract", unexpected)
+    monkeypatch.setattr(moe, "normalize_swiglu_limit", unexpected)
+    # GateMode(...) is the first call after the limit check.
+    monkeypatch.setattr(moe, "GateMode", _stop)
+    _run_fused_entry(activation, quant_type, limit)
+
+
+@pytest.mark.parametrize("limit", [5.0, -1.0, float("nan"), -float("inf")])
+def test_fused_entry_normalizes_other_silu_limits(monkeypatch, limit):
+    calls = []
+
+    def record(quant_type, activation, swiglu_limit, quant_type_a=None):
+        calls.append(swiglu_limit)
+        raise _StopAfterLimitCheck
+
+    monkeypatch.setattr(moe, "_normalize_moe_dispatch_contract", record)
+    _run_fused_entry(ActivationType.Silu, QuantType.per_1x128, limit)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Gelu])
+def test_asm_stage1_without_limit_skips_normalization(monkeypatch, activation):
+    def unexpected(*args, **kwargs):
+        pytest.fail("ASM stage1 without a limit must not need normalization")
+
+    monkeypatch.setattr(moe, "normalize_swiglu_limit", unexpected)
+    # get_inter_dim(...) is the first call after the limit guard.
+    monkeypatch.setattr(moe, "get_inter_dim", _stop)
+    out = torch.empty(1, 1, 128, dtype=dtypes.bf16)
+    w = torch.empty(1, 256, 128, dtype=dtypes.bf16)
+    with pytest.raises(_StopAfterLimitCheck):
+        moe.asm_stage1(None, w, w, None, None, None, out, 1, 16, activation=activation)
+
+
 @pytest.mark.parametrize("limit", [-1.0, float("nan"), -float("inf")])
 def test_module_selection_rejects_invalid_direct_limit(limit):
     x = torch.empty(1, 128, dtype=CK_FP8)
