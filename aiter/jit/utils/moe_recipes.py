@@ -16,7 +16,8 @@ _DTYPE_MAP = {
 }
 
 _QUANT_ALIAS = {"per_128x128": "per_1x128"}
-MOE_MODULE_ABI_TAG = "runtime_limit_v3"
+# Bump when the MoeKernel launch signature changes.
+MOE_MODULE_ABI_TAG = "abi2"
 
 
 def _build_moe_variant(

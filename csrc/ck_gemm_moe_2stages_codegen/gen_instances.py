@@ -842,13 +842,6 @@ def generate_instance_and_lookUpTable_head(
             "#define AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT "
             f"{str(runtime_swiglu_limit).lower()}\n"
         )
-        if activation == "swiglustep":
-            # The runtime passes ActivationType::Silu; this module only holds
-            # swiglustep stage1 instances (SiLU then clamp at 7).
-            # Runtime SiLU overrides stay in the normal silu module/act value.
-            f_lookup.write(
-                f"#define AITER_CK_MOE_STAGE1_SILU_ACT_OP {ACT_OP_MAP['swiglustep']}\n"
-            )
         f_lookup.write(LOOKUP_head)
 
     f_gemm1_heuristic_dispatch = os.path.join(
@@ -1124,7 +1117,7 @@ if __name__ == "__main__":
         default="silu",
         required=False,
         type=str,
-        choices=["silu", "gelu", "swiglu", "gelutanh", "swiglustep"],
+        choices=["silu", "gelu", "swiglu", "gelutanh"],
         help="select activation",
     )
 

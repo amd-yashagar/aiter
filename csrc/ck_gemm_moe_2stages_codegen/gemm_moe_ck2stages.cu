@@ -15,18 +15,13 @@
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 
 // Map aiter ActivationType (stage1) to the CK stage1 activation op value.
-// CK act values: gelu=0, silu=1, swiglustep_and_mul=2, swiglu(OAI swiglu_oai)=3,
-// gelu_tanh_and_mul=4. The swiglustep module (generated with -act swiglustep)
-// defines AITER_CK_MOE_STAGE1_SILU_ACT_OP=2 so Silu selects its clamped instances.
-#ifndef AITER_CK_MOE_STAGE1_SILU_ACT_OP
-#define AITER_CK_MOE_STAGE1_SILU_ACT_OP 1
-#endif
+// CK act values: gelu=0, silu=1, swiglu(OAI swiglu_oai)=3, gelu_tanh_and_mul=4.
+// Value 2 is reserved.
 static inline int map_activation_to_ck_stage1(int activation)
 {
     switch (static_cast<ActivationType>(activation))
     {
-    case ActivationType::Silu:
-        return AITER_CK_MOE_STAGE1_SILU_ACT_OP;
+    case ActivationType::Silu: return 1;
     case ActivationType::Gelu:
         return 0;
     case ActivationType::Swiglu:
@@ -71,35 +66,33 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::
     }
 }
 
-void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
-                   torch::Tensor &w1,                // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
-                   torch::Tensor &w2,                // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
-                   torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                   torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
-                   torch::Tensor &num_valid_ids,     // [1]
-                   torch::Tensor &out,               // [m * topk, inter_dim]
-                   int topk,
-                   std::string &kernelName,
-                   std::optional<torch::Tensor> w1_scale = std::nullopt, // [e, 1, n], gate(up) scale
-                   std::optional<torch::Tensor> a1_scale = std::nullopt, // [m, 1], token scale
-                   std::optional<int> block_m = 32,
-                   std::optional<torch::Tensor> sorted_weights = std::nullopt,
-                   int quant_type = 0,
-                   int activation = 0,
-                   std::optional<int> splitk = 1,
-                   bool nt = false,
-                   std::optional<std::string> dst_type = std::nullopt,
-                   bool is_shuffled = true,
-                   double swiglu_limit,
-                   bool swiglu_limit_enabled)
+void ck_moe_stage1(
+    torch::Tensor& hidden_states,     // [m, k], input token
+    torch::Tensor& w1,                // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
+    torch::Tensor& w2,                // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
+    torch::Tensor& sorted_token_ids,  // [max_num_tokens_padded]
+    torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
+    torch::Tensor& num_valid_ids,     // [1]
+    torch::Tensor& out,               // [m * topk, inter_dim]
+    int topk,
+    std::string& kernelName,
+    std::optional<torch::Tensor> w1_scale       = std::nullopt, // [e, 1, n], gate(up) scale
+    std::optional<torch::Tensor> a1_scale       = std::nullopt, // [m, 1], token scale
+    std::optional<int> block_m                  = 32,
+    std::optional<torch::Tensor> sorted_weights = std::nullopt,
+    int quant_type                              = 0,
+    int activation                              = 0,
+    std::optional<int> splitk                   = 1,
+    bool nt                                     = false,
+    std::optional<std::string> dst_type         = std::nullopt,
+    bool is_shuffled                            = true,
+    double swiglu_limit)
 {
     TORCH_CHECK(!std::isnan(swiglu_limit) && swiglu_limit >= 0.0,
                 "swiglu_limit must be non-negative and not NaN");
-    const bool clamp_enabled = swiglu_limit_enabled && swiglu_limit > 0.0 &&
-                               std::isfinite(swiglu_limit);
+    const bool clamp_enabled = swiglu_limit > 0.0 && std::isfinite(swiglu_limit);
     TORCH_CHECK(!clamp_enabled ||
                     (activation == static_cast<int>(ActivationType::Silu) &&
-                     AITER_CK_MOE_STAGE1_SILU_ACT_OP == 1 &&
                      quant_type == static_cast<int>(QuantType::per_1x128) &&
                      splitk.value_or(1) <= 1 &&
                      (kernelName.empty() ||
@@ -162,7 +155,8 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                                   activation,
                                   quant_type,
                                   MulRoutedWeight,
-                                  is_shuffled);
+                                  is_shuffled,
+                                  clamp_enabled);
 
     // A positive double must not underflow to the float sentinel (0 disables).
     // Such tiny clamps produce zero at the output precision, not an override bypass.
@@ -174,8 +168,24 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
               std::numeric_limits<float>::denorm_min())
         : static_cast<float>(swiglu_limit);
     kernel(at::hip::getCurrentHIPStream(),
-           tokens, sorted_size, N, K, topk,
-           hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr, splitk_local, nt, ck_limit, clamp_enabled);
+           tokens,
+           sorted_size,
+           N,
+           K,
+           topk,
+           hidden_states_ptr,
+           w1_ptr,
+           w2_ptr,
+           sorted_token_ids_ptr,
+           sorted_expert_ids_ptr,
+           sorted_weights_ptr,
+           num_valid_ids_ptr,
+           out_ptr,
+           w1_scale_ptr,
+           a1_scale_ptr,
+           splitk_local,
+           nt,
+           ck_limit);
 }
 
 void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
@@ -237,6 +247,22 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
 
     kernel(at::hip::getCurrentHIPStream(),
-           tokens, sorted_size, N, K, topk,
-           inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr, splitk_local, nt, 0.f, false);
+           tokens,
+           sorted_size,
+           N,
+           K,
+           topk,
+           inter_states_ptr,
+           w1_ptr,
+           w2_ptr,
+           sorted_token_ids_ptr,
+           sorted_expert_ids_ptr,
+           sorted_weights_ptr,
+           num_valid_ids_ptr,
+           out_ptr,
+           w2_scale_ptr,
+           a2_scale_ptr,
+           splitk_local,
+           nt,
+           0.f);
 }

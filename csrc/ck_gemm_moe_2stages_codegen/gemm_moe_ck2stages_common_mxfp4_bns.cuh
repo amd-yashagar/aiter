@@ -41,8 +41,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<void*> a1_scale, // [m, 1], token scale
                         std::optional<int> splitk,     // splitk
                         std::optional<bool> nt,
-                        [[maybe_unused]] float swiglu_limit,
-                        [[maybe_unused]] bool swiglu_limit_enabled)
+                        [[maybe_unused]] float swiglu_limit)
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     using A1DataType                            = E8M0;
@@ -182,27 +181,27 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                      Nswizzle,                                \
                                      PerTensorQuant,                          \
                                      MulRoutedWeight,                         \
-                                     ActOP,                                    \
-                                     AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(const hipStream_t& stream, \
-                                            int tokens,                       \
-                                            int sorted_size,                  \
-                                            int N,                            \
-                                            int K,                            \
-                                            int topk,                         \
-                                            void*& hidden_states,             \
-                                            void*& w1,                        \
-                                            void*& w2,                        \
-                                            void*& sorted_token_ids,          \
-                                            void*& sorted_expert_ids,         \
-                                            void*& sorted_weights,            \
-                                            void*& num_valid_ids,             \
-                                            void*& out,                       \
-                                            std::optional<void*> w1_scale,    \
-                                            std::optional<void*> a1_scale,    \
-                                            std::optional<int> splitk,        \
-                                            std::optional<bool> nt,           \
-                                            [[maybe_unused]] float swiglu_limit, \
-                                            [[maybe_unused]] bool swiglu_limit_enabled);
+                                     ActOP,                                   \
+                                     AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(      \
+        const hipStream_t& stream,                                            \
+        int tokens,                                                           \
+        int sorted_size,                                                      \
+        int N,                                                                \
+        int K,                                                                \
+        int topk,                                                             \
+        void*& hidden_states,                                                 \
+        void*& w1,                                                            \
+        void*& w2,                                                            \
+        void*& sorted_token_ids,                                              \
+        void*& sorted_expert_ids,                                             \
+        void*& sorted_weights,                                                \
+        void*& num_valid_ids,                                                 \
+        void*& out,                                                           \
+        std::optional<void*> w1_scale,                                        \
+        std::optional<void*> a1_scale,                                        \
+        std::optional<int> splitk,                                            \
+        std::optional<bool> nt,                                               \
+        [[maybe_unused]] float swiglu_limit);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -238,8 +237,7 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
                         std::optional<void*> a2_scale, // [max_num_tokens_padded, 1], token scale
                         std::optional<int> splitk,     // splitk
                         std::optional<bool> nt,
-                        [[maybe_unused]] float swiglu_limit,
-                        [[maybe_unused]] bool swiglu_limit_enabled)
+                        [[maybe_unused]] float swiglu_limit)
 {
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     using A1DataType                            = E8M0;
@@ -378,5 +376,4 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
         std::optional<void *> w2_scale,                                                                                                                              \
         std::optional<void *> a2_scale,                                                                                                                              \
         std::optional<int>   splitk,                                                                                                                                 \
-        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit, \
-        [[maybe_unused]] bool swiglu_limit_enabled);
+        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit);

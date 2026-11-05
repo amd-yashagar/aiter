@@ -5864,8 +5864,7 @@ def ck_moe_stage1(
         splitk if is_splitk else 0,
         use_non_temporal_load,
         out.dtype,
-        swiglu_limit=float(swiglu_limit or 0.0),
-        swiglu_limit_enabled=runtime_limit,
+        swiglu_limit=float(swiglu_limit or 0.0) if runtime_limit else 0.0,
     )
     if is_splitk:
         valid_out = tmp_out[: token_num * topk, :]

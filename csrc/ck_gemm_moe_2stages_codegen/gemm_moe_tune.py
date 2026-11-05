@@ -46,7 +46,6 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.ops.moe_limits import normalize_swiglu_limit
 from aiter.fused_moe_registry import make_fused_moe_impl_kernel_name
 from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
@@ -81,6 +80,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
 )
+from aiter.ops.moe_limits import normalize_swiglu_limit
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.ops.shuffle import (
     pack_int8_to_packed_int4,
@@ -932,7 +932,6 @@ class FmoeTuner(TunerCommon):
             use_non_temporal_load=use_nt,
             dst_type=dtype if is_splitk else None,
             swiglu_limit=float(swiglu_limit or 0.0),
-            swiglu_limit_enabled=swiglu_limit is not None,
         )
         if is_splitk:
             out = torch.empty(

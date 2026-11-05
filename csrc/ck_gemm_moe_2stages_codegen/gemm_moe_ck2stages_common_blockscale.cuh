@@ -40,10 +40,10 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
                         std::optional<void*> a1_scale, // [m, 1], token scale
                         std::optional<int> splitk,     // splitk
-                        [[maybe_unused]] float swiglu_limit,
-                        [[maybe_unused]] bool swiglu_limit_enabled)
+                        [[maybe_unused]] float swiglu_limit)
 {
-    TORCH_CHECK(swiglu_limit_enabled == RuntimeSwigluLimit,
+    const bool enabled = swiglu_limit > 0.0f && std::isfinite(swiglu_limit);
+    TORCH_CHECK(enabled == RuntimeSwigluLimit,
                 "Runtime SwiGLU limit module does not match the requested clamp state");
     if constexpr(RuntimeSwigluLimit)
     {
@@ -228,8 +228,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<void*> a1_scale, // [m, 1], token scale
                         std::optional<int> splitk,     // splitk
                         std::optional<bool> nt,
-                        [[maybe_unused]] float swiglu_limit,
-                        [[maybe_unused]] bool swiglu_limit_enabled)
+                        [[maybe_unused]] float swiglu_limit)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt.value() <<
     // std::endl;
@@ -253,24 +252,23 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                            ActOP,
                            true,
                            RuntimeSwigluLimit>(stream,
-                                 tokens,
-                                 sorted_size,
-                                 N,
-                                 K,
-                                 topk,
-                                 hidden_states,
-                                 w1,
-                                 w2,
-                                 sorted_token_ids,
-                                 sorted_expert_ids,
-                                 sorted_weights,
-                                 num_valid_ids,
-                                 out,
-                                 w1_scale,
-                                 a1_scale,
-                                 splitk,
-                                 swiglu_limit,
-                                 swiglu_limit_enabled);
+                                               tokens,
+                                               sorted_size,
+                                               N,
+                                               K,
+                                               topk,
+                                               hidden_states,
+                                               w1,
+                                               w2,
+                                               sorted_token_ids,
+                                               sorted_expert_ids,
+                                               sorted_weights,
+                                               num_valid_ids,
+                                               out,
+                                               w1_scale,
+                                               a1_scale,
+                                               splitk,
+                                               swiglu_limit);
     }
     else
     {
@@ -292,24 +290,23 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                            ActOP,
                            false,
                            RuntimeSwigluLimit>(stream,
-                                  tokens,
-                                  sorted_size,
-                                  N,
-                                  K,
-                                  topk,
-                                  hidden_states,
-                                  w1,
-                                  w2,
-                                  sorted_token_ids,
-                                  sorted_expert_ids,
-                                  sorted_weights,
-                                  num_valid_ids,
-                                  out,
-                                  w1_scale,
-                                  a1_scale,
-                                  splitk,
-                                  swiglu_limit,
-                                  swiglu_limit_enabled);
+                                               tokens,
+                                               sorted_size,
+                                               N,
+                                               K,
+                                               topk,
+                                               hidden_states,
+                                               w1,
+                                               w2,
+                                               sorted_token_ids,
+                                               sorted_expert_ids,
+                                               sorted_weights,
+                                               num_valid_ids,
+                                               out,
+                                               w1_scale,
+                                               a1_scale,
+                                               splitk,
+                                               swiglu_limit);
     }
 }
 
@@ -330,27 +327,27 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                      Nswizzle,                                \
                                      PerTensorQuant,                          \
                                      MulRoutedWeight,                         \
-                                     ActOP,                                    \
-                                     AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(const hipStream_t& stream, \
-                                            int tokens,                       \
-                                            int sorted_size,                  \
-                                            int N,                            \
-                                            int K,                            \
-                                            int topk,                         \
-                                            void*& hidden_states,             \
-                                            void*& w1,                        \
-                                            void*& w2,                        \
-                                            void*& sorted_token_ids,          \
-                                            void*& sorted_expert_ids,         \
-                                            void*& sorted_weights,            \
-                                            void*& num_valid_ids,             \
-                                            void*& out,                       \
-                                            std::optional<void*> w1_scale,    \
-                                            std::optional<void*> a1_scale,    \
-                                            std::optional<int> splitk,        \
-                                            std::optional<bool> nt,           \
-                                            [[maybe_unused]] float swiglu_limit, \
-                                            [[maybe_unused]] bool swiglu_limit_enabled);
+                                     ActOP,                                   \
+                                     AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(      \
+        const hipStream_t& stream,                                            \
+        int tokens,                                                           \
+        int sorted_size,                                                      \
+        int N,                                                                \
+        int K,                                                                \
+        int topk,                                                             \
+        void*& hidden_states,                                                 \
+        void*& w1,                                                            \
+        void*& w2,                                                            \
+        void*& sorted_token_ids,                                              \
+        void*& sorted_expert_ids,                                             \
+        void*& sorted_weights,                                                \
+        void*& num_valid_ids,                                                 \
+        void*& out,                                                           \
+        std::optional<void*> w1_scale,                                        \
+        std::optional<void*> a1_scale,                                        \
+        std::optional<int> splitk,                                            \
+        std::optional<bool> nt,                                               \
+        [[maybe_unused]] float swiglu_limit);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -534,8 +531,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                         std::optional<void *> w2_scale, // [e, 1, n], gate(up) scale
                         std::optional<void *> a2_scale, // [max_num_tokens_padded, 1], token scale
                         std::optional<int>   splitk,    // splitk
-                        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit,
-                        [[maybe_unused]] bool swiglu_limit_enabled)
+                        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit)
 {
     // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt.value() << std::endl;
     if (nt.has_value() && nt.value()) {
@@ -596,5 +592,4 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
         std::optional<void *> w2_scale,                                                                                                                              \
         std::optional<void *> a2_scale,                                                                                                                              \
         std::optional<int>   splitk,                                                                                                                                 \
-        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit, \
-        [[maybe_unused]] bool swiglu_limit_enabled);
+        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit);

@@ -354,9 +354,7 @@ def cmdGenFunc_ck_moe_stage(
     use_non_temporal_load: bool = False,
     dst_type: str | None = None,
     is_shuffled: bool = True,
-    swiglu_limit: float = 7.0,
-    swiglu_limit_enabled: bool = False,
-    swiglustep: bool = False,
+    swiglu_limit: float | None = None,
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
@@ -365,9 +363,7 @@ def cmdGenFunc_ck_moe_stage(
     outtype = str2dtype_dict[dst_type] if is_splitk else out.dtype
     from aiter.ops.moe_limits import normalize_swiglu_limit
 
-    runtime_swiglu_limit = (
-        swiglu_limit_enabled and normalize_swiglu_limit(swiglu_limit) is not None
-    )
+    runtime_swiglu_limit = normalize_swiglu_limit(swiglu_limit) is not None
     md_name, blob_gen_cmd = get_moe_stage_module(
         hidden_states.dtype,
         w1.dtype,
@@ -377,7 +373,6 @@ def cmdGenFunc_ck_moe_stage(
         mul_routed_weight_stage,
         is_shuffled,
         is_splitk,
-        swiglustep,
         runtime_swiglu_limit,
     )
     return {
@@ -445,38 +440,7 @@ def ck_moe_stage1(
     use_non_temporal_load: bool = False,
     dst_type: str | None = None,
     is_shuffled: bool = True,
-    swiglu_limit: float = 7.0,
-    swiglu_limit_enabled: bool = False,
-) -> None: ...
-
-
-@compile_ops(
-    "module_moe_ck2stages",
-    fc_name="ck_moe_stage1",
-    gen_func=functools.partial(cmdGenFunc_ck_moe_stage, swiglustep=True),
-)
-def ck_moe_stage1_swiglustep(
-    hidden_states: Tensor,
-    w1: Tensor,
-    w2: Tensor,
-    sorted_token_ids: Tensor,
-    sorted_expert_ids: Tensor,
-    num_valid_ids: Tensor,
-    out: Tensor,
-    topk: int,
-    kernelName: str | None = None,
-    w1_scale: Tensor | None = None,
-    a1_scale: Tensor | None = None,
-    block_m: int | None = 32,
-    sorted_weights: Tensor | None = None,
-    quant_type: int = 0,
-    activation: int = 0,
-    splitk: int | None = 1,
-    use_non_temporal_load: bool = False,
-    dst_type: str | None = None,
-    is_shuffled: bool = True,
-    swiglu_limit: float = 7.0,
-    swiglu_limit_enabled: bool = False,
+    swiglu_limit: float = 0.0,
 ) -> None: ...
 
 
@@ -654,7 +618,6 @@ def get_moe_stage_module(
     mul_routed_weight_stage,
     preshuffle_mode=False,
     is_splitk=False,
-    swiglustep=False,
     runtime_swiglu_limit=False,
 ):
     if isinstance(activation, int):
@@ -675,10 +638,6 @@ def get_moe_stage_module(
         QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
     )
     act = str(activation).split(".")[-1].lower()
-    if swiglustep:
-        if act != "silu":
-            raise ValueError(f"swiglustep requires Silu activation, got {act}")
-        act = "swiglustep"
     if runtime_swiglu_limit and (
         Adtype != "f8"
         or Bdtype != "f8"
@@ -734,28 +693,23 @@ def ck_moe_stage1_fwd(
     splitk: int | None = 1,
     use_non_temporal_load: bool | None = False,
     dst_type: torch.dtype | None = None,
-    swiglustep: bool = False,
-    swiglu_limit: float = 7.0,
-    swiglu_limit_enabled: bool = False,
+    swiglu_limit: float | None = None,
 ):
     from aiter.ops.moe_limits import normalize_swiglu_limit
 
     if quant_type == QuantType.per_128x128:
         quant_type = QuantType.per_1x128
     limit = normalize_swiglu_limit(swiglu_limit)
-    if swiglu_limit_enabled and limit is not None:
-        if (
-            swiglustep
-            or activation != ActivationType.Silu
-            or quant_type not in (QuantType.per_1x128, QuantType.per_128x128)
+    if limit is not None:
+        if activation != ActivationType.Silu or quant_type not in (
+            QuantType.per_1x128,
+            QuantType.per_128x128,
         ):
             raise ValueError("Runtime clamp requires per_1x128 CK SiLU")
         if kernelName and ("Splitk" in kernelName or "_silu_" not in kernelName):
             raise ValueError("Runtime clamp requires a non-split CK SiLU kernel")
         splitk = 0
-    swiglu_limit_enabled = swiglu_limit_enabled and limit is not None
-    stage1 = ck_moe_stage1_swiglustep if swiglustep else ck_moe_stage1
-    stage1(
+    ck_moe_stage1(
         hidden_states,
         w1,
         w2,
@@ -776,7 +730,6 @@ def ck_moe_stage1_fwd(
         None if dst_type is None else dtype2str_dict[dst_type],
         is_shuffled=getattr(w1, "is_shuffled", False),
         swiglu_limit=float(limit or 0.0),
-        swiglu_limit_enabled=swiglu_limit_enabled,
     )
     return out
 
