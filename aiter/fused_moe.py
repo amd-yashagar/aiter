@@ -1537,13 +1537,14 @@ def _fused_moe_impl(
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
-    quant_type, quant_type_a, swiglu_limit = _normalize_moe_dispatch_contract(
-        quant_type, activation, swiglu_limit, quant_type_a
-    )
+    if swiglu_limit is not None:
+        quant_type, quant_type_a, swiglu_limit = _normalize_moe_dispatch_contract(
+            quant_type, activation, swiglu_limit, quant_type_a
+        )
     gate_mode = GateMode(gate_mode)
-    if quant_type_a is not None and quant_type_a != quant_type:
+    if quant_type_a is not None and QuantType(quant_type_a) != quant_type:
         raise NotImplementedError(
-            f"quant_type_a={quant_type_a!s} != quant_type={quant_type!s}: "
+            f"quant_type_a={QuantType(quant_type_a)!s} != quant_type={quant_type!s}: "
             "mixed activation/weight quant granularity is not supported"
         )
     if block_size_M == -1:
@@ -1621,6 +1622,7 @@ def _fused_moe_impl(
                 num_valid_rows=num_local_tokens,
             )
             herd_topk = 0
+    quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = resolve_activation_dtype(
         quant_type,
@@ -2148,7 +2150,8 @@ def _fused_moe_impl(
         if _stage2_override is not None:
             raise RuntimeError("_stage2_override requires a two-stage MoE config")
         if (
-            activation == ActivationType.Silu
+            swiglu_limit is not None
+            and activation == ActivationType.Silu
             and normalize_swiglu_limit(swiglu_limit) is not None
         ):
             raise NotImplementedError(
@@ -5732,7 +5735,7 @@ def fused_moe_2stages(
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     elif stage1_func is _mxfp4_a4w4_stage1_fw:
         extra_stage1_args["swiglu_limit"] = normalized_swiglu_limit
-    elif stage1_func in (ck_moe_stage1, asm_stage1):
+    elif swiglu_limit is not None and stage1_func in (ck_moe_stage1, asm_stage1):
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
         extra_stage1_args["v2_output_layout"] = True
