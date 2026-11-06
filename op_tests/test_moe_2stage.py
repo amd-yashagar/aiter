@@ -2571,6 +2571,763 @@ def run_blockscale_limit_cases():
     )
 
 
+def run_blockscale_host_contracts():
+    """CPU contracts for limit dispatch/codegen; never profile or launch a kernel."""
+    import csv
+    import functools
+    import importlib
+    import inspect
+    import re
+    import subprocess
+    import sys
+    import tempfile
+    from contextlib import contextmanager
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    import numpy as np
+
+    moe = importlib.import_module("aiter.fused_moe")
+    ops = importlib.import_module("aiter.ops.moe_op")
+    recipe = importlib.import_module("aiter.jit.utils.moe_recipes")
+    norm = moe.normalize_swiglu_limit
+    contract = moe._normalize_moe_dispatch_contract
+    act, quant = aiter.ActivationType, aiter.QuantType
+    fp8 = next(dtype for dtype, name in ops.dtype2str_dict.items() if name == "f8")
+    root = Path(__file__).resolve().parents[1]
+    csv_path = root / (
+        "aiter/configs/model_configs/"
+        "a8w8_blockscale_tuned_swiglu_limit_fmoe_gfx942.csv"
+    )
+    signature = inspect.signature(ops.ck_moe_stage1_fwd)
+    disabled = (None, 0.0, float("inf"))
+    invalid = (-1.0, float("nan"), -float("inf"))
+    invalid_message = "^swiglu_limit must be non-negative and not NaN$"
+    nonblock = (quant.No, quant.per_Token)
+    quants = (*nonblock, quant.per_1x32, quant.per_1x128)
+
+    class Stop(Exception):
+        """A recorded host boundary, not a successful GPU launch."""
+
+    def stop(*args, **kwargs):
+        raise Stop
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("disabled/non-SiLU path did extra work")
+
+    @contextmanager
+    def raises(error, match=""):
+        try:
+            yield
+        except error as exc:
+            assert re.search(match, str(exc)), str(exc)
+        else:
+            raise AssertionError(f"expected {error.__name__}: {match}")
+
+    def forwarded(call):
+        bound = signature.bind(*call[0], **call[1])
+        bound.apply_defaults()
+        return bound.arguments["swiglu_limit"] or 0.0
+
+    def record(calls, halt=False):
+        def capture(*args, **kwargs):
+            calls.append((args, kwargs))
+            if halt:
+                raise Stop
+
+        return capture
+
+    def inputs(tokens=1, mxfp4=False):
+        if mxfp4:
+            w1 = torch.empty(8, 2048, 2048, dtype=dtypes.fp4x2)
+            w2 = torch.empty(8, 4096, 512, dtype=dtypes.fp4x2)
+            w1.is_shuffled = w2.is_shuffled = True
+            dim = 4096
+        else:
+            w1 = torch.empty(1, 256, 128, dtype=dtypes.bf16)
+            w2 = torch.empty(1, 128, 128, dtype=dtypes.bf16)
+            dim = 128
+        return (
+            torch.empty(tokens, dim, dtype=dtypes.bf16),
+            w1,
+            w2,
+            torch.empty(tokens, dim, dtype=dtypes.bf16),
+        )
+
+    stage_defaults = {"activation": act.Silu, "quant_type": quant.per_1x128}
+
+    def ck(args=None, **kwargs):
+        args = ck_args if args is None else args
+        return moe.ck_moe_stage1(*args, None, None, **(stage_defaults | kwargs))
+
+    def binding(**kwargs):
+        return ops.ck_moe_stage1_fwd(*ck_args[:8], **(stage_defaults | kwargs))
+
+    def module(args=None, **kwargs):
+        return ops.cmdGenFunc_ck_moe_stage(
+            *(ck_args[:8] if args is None else args),
+            **(stage_defaults | {"splitk": 0} | kwargs),
+        )
+
+    def asm(**kwargs):
+        return moe.asm_stage1(*ck_args, **({"activation": act.Silu} | kwargs))
+
+    def two_stage(data, **kwargs):
+        x, w1, w2, out = data
+        topk = 2 if x.shape[1] == 4096 else 1
+        args = x, w1, w2, topk, *sort_args, out, True, 16
+        return moe.fused_moe_2stages(
+            *args, **({"activation": act.Silu, "quant_type": quant.No} | kwargs)
+        )
+
+    def a16w4(tokens, activation, limit, gate_mode):
+        return two_stage(
+            mxfp4[tokens],
+            activation=activation,
+            quant_type=quant.per_1x32,
+            q_dtype_a=dtypes.bf16,
+            q_dtype_w=dtypes.fp4x2,
+            swiglu_limit=limit,
+            gate_mode=gate_mode,
+        )
+
+    def entry(activation, q, limit, as_arg=lambda a: a.value):
+        return moe._fused_moe_impl(
+            *entry_args,
+            activation=as_arg(activation),
+            quant_type=q.value,
+            swiglu_limit=limit,
+        )
+
+    def metadata(stage, activation=act.Silu, q=quant.No, one_stage=False):
+        return moe.MOEMetadata(
+            functools.partial(stage, activation=activation, quant_type=q),
+            lambda *a, **k: a[6],
+            16,
+            0,
+            run_1stage=one_stage,
+            prequant=False,
+            skip_inter_quant=True,
+        )
+
+    @contextmanager
+    def pipeline(meta, **stubs):
+        selected = []
+
+        def select(*args, **kwargs):
+            selected.append(meta)
+            return meta
+
+        with patch.multiple(
+            moe,
+            get_2stage_cfgs=select,
+            get_quant=lambda _: lambda x, **k: (x, None),
+            **stubs,
+        ):
+            yield selected
+
+    def dispatch(tokens=32, shape=(2048, 768, 128, 8), limit=5.0):
+        types = dtypes.bf16, torch.float8_e4m3fnuz, torch.float8_e4m3fnuz
+        args = tokens, *shape, *types, quant.per_1x128, True, act.Silu, False, 0, 0
+        return moe.get_2stage_cfgs(*args, swiglu_limit=limit)
+
+    def normalization():
+        cases = 0
+        for limit in (None, 0, -0.0, float("inf"), 1e-100, 1.0, 5.0, 7.0, 1e100):
+            expected = (
+                None if limit is None or limit == 0 or limit == float("inf") else limit
+            )
+            assert norm(limit) == expected
+            assert moe.swiglu_limit_tag(limit) == (
+                "" if expected is None else f"swiglu_limit={limit:g}"
+            )
+            cases += 1
+        for limit in invalid:
+            for fn in (norm, moe.swiglu_limit_tag):
+                with raises(ValueError, "swiglu_limit"):
+                    fn(limit)
+            cases += 1
+        for q in quants:
+            for limit in (*invalid, 5.0):
+                if limit == 5.0:
+                    assert contract(q, act.Silu, limit) == (q, None, limit)
+                else:
+                    with raises(ValueError, invalid_message):
+                        contract(q, act.Silu, limit)
+                cases += 1
+            assert contract(q, act.Swiglu, -1.0) == (q, None, -1.0)
+            cases += 1
+        expected = quant.per_1x128, None, None
+        assert contract(quant.per_128x128, act.Silu, float("inf")) == expected
+        cases += 1
+        for qa in (quant.per_128x128, quant.per_1x128):
+            q, canonical, _ = contract(quant.per_128x128, act.Silu, None, qa)
+            assert q == canonical == quant.per_1x128
+            cases += 1
+        gate, up = torch.tensor([2.0]), torch.tensor([-3.0])
+        for limit, expected in (
+            (1e100, (gate, up)),
+            (1.0, (torch.tensor([1.0]), torch.tensor([-1.0]))),
+        ):
+            actual = moe._clamp_swiglu_gate_up(gate, up, limit)
+            for got, want in zip(actual, expected):
+                torch.testing.assert_close(got, want)
+            cases += 1
+        return cases
+
+    def ck_binding_tuner():
+        cases, launches, activations = 0, [], []
+        with patch.multiple(
+            aiter, ck_moe_stage1_fwd=record(launches), silu_and_mul=record(activations)
+        ):
+            for splitk, limit in itertools.product((0, 1, 4), (*disabled, 1.0)):
+                launches.clear()
+                activations.clear()
+                result = ck(splitk=splitk, swiglu_limit=limit)
+                assert result is ck_args[6] and len(launches) == 1
+                is_split = norm(limit) is None and splitk > 1
+                assert launches[0][0][15] == (splitk if is_split else 0)
+                assert bool(activations) is is_split
+                assert forwarded(launches[0]) == (limit if limit == 1.0 else 0.0)
+                cases += 1
+            launches.clear()
+            ck(quant_type=quant.per_128x128, swiglu_limit=1.0)
+            assert launches[0][0][13] == quant.per_1x128
+            assert forwarded(launches[0]) == 1.0
+            cases += 1
+        for kernel in ("stale_activation_F8", "old_silu_Splitk_F8"):
+            with raises(ValueError, "non-split CK SiLU"):
+                args = *([None] * 7), 1, 16
+                ck(args, kernelName=kernel, splitk=4, swiglu_limit=1.0)
+            cases += 1
+        with patch.object(ops, "ck_moe_stage1", record(launches)):
+            for limit in (*disabled, 1.0):
+                launches.clear()
+                enabled = norm(limit) is not None
+                binding(splitk=4 if enabled else 1, swiglu_limit=limit)
+                assert launches[0][0][19] == (1.0 if enabled else 0.0)
+                assert launches[0][0][15] == (0 if enabled else 1)
+                cases += 1
+            launches.clear()
+            binding(quant_type=quant.per_128x128, swiglu_limit=1.0)
+            assert launches[0][0][13] == quant.per_1x128.value
+            cases += 1
+        for limit in invalid:
+            # Preserve the original direct binding's omitted quant_type (No).
+            with raises(ValueError, "swiglu_limit"):
+                ops.ck_moe_stage1_fwd(*([None] * 7), 1, swiglu_limit=limit)
+            cases += 1
+            with raises(ValueError, "swiglu_limit"):
+                binding(swiglu_limit=limit)
+            cases += 1
+        x = torch.empty(1, 128, dtype=fp8)
+        module_args = x, x, None, None, None, None, small[3], 1
+        for limit in (*disabled, 1.0, *invalid):
+            if limit in invalid:
+                with raises(ValueError, "swiglu_limit"):
+                    module(module_args, swiglu_limit=limit)
+            else:
+                selected_module = module(module_args, swiglu_limit=limit)
+                enabled = limit == 1.0
+                assert ("runtime_swiglu_limit" in selected_module["md_name"]) is enabled
+            cases += 1
+        with raises(ValueError, "non-split FP8 per_1x128"):
+            args = dtypes.bf16, fp8, dtypes.bf16, act.Silu, quant.per_1x128, 2
+            ops.get_moe_stage_module(*args, runtime_swiglu_limit=True)
+        cases += 1
+        # Restore sys.path and the tuner module even if an assertion fails.
+        tuner_path = str(root / "csrc/ck_gemm_moe_2stages_codegen")
+        with patch.object(sys, "path", [tuner_path, *sys.path]), patch.dict(
+            sys.modules
+        ):
+            # Its CLI import sets a global CUDA default; retain our CPU scope.
+            with patch.object(torch, "set_default_device", lambda _: None):
+                tuner = importlib.import_module("gemm_moe_tune")
+            args = (
+                *small[:2],
+                *([None] * 7),
+                dtypes.bf16,
+                1,
+                "known_silu_F8",
+                16,
+                quant.per_1x128,
+                act.Silu,
+            )
+            tuner_call = functools.partial(tuner.FmoeTuner.ck_moe_stage1_fwd_out, *args)
+            with patch.object(
+                tuner, "ck_moe_stage1_fwd", record(launches)
+            ), patch.object(
+                aiter, "get_hip_quant", lambda _: lambda out, **k: (out, None)
+            ):
+                for limit in (*disabled, 1.0):
+                    launches.clear()
+                    tuner_call(swiglu_limit=limit)
+                    assert launches[0][0][15] == 0
+                    expected = 1.0 if limit == 1.0 else 0.0
+                    assert launches[0][1]["swiglu_limit"] == expected
+                    cases += 1
+                with raises(ValueError, "non-split CK"):
+                    tuner_call(splitk=4, swiglu_limit=1.0)
+                cases += 1
+        return cases
+
+    def recipes():
+        names = []
+        module_args = fp8, fp8, dtypes.bf16, act.Silu, quant.per_1x128, 2
+        prebuild_args = {
+            "aiter_csrc_dir": "csrc",
+            "a_dtype": "f8",
+            "b_dtype": "f8",
+            "c_dtype": "b16",
+            "activation": "silu",
+            "quant_type": "per_1x128",
+            "mul_routed_weight_stage": 2,
+            "preshuffle_mode": True,
+            "is_splitk": False,
+        }
+        for enabled in (False, True):
+            runtime_name, runtime_cmd = ops.get_moe_stage_module(
+                *module_args, preshuffle_mode=True, runtime_swiglu_limit=enabled
+            )
+            pre_name, pre_cmd = recipe._build_moe_variant(
+                **prebuild_args, runtime_swiglu_limit=enabled
+            )
+            assert runtime_name == pre_name
+            if enabled:
+                assert "--runtime-swiglu-limit" in runtime_cmd[0]
+                assert "--runtime-swiglu-limit" in pre_cmd[0]
+            names.append(runtime_name)
+        assert names[0] != names[1]
+        tagged = {
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float8_e4m3fn",
+            "q_dtype_w": "torch.float8_e4m3fn",
+            "q_type": "per_1x128",
+            "act_type": "silu",
+            "_tag": "swiglu_limit=5",
+            "ksplit": "0",
+        }
+        with patch.object(recipe, "_get_tuned_fmoe_rows", lambda: [tagged]):
+            variants = recipe.get_moe_ck2stages_prebuild_variants("csrc")
+            assert {v["md_name"] for v in variants} == set(names)
+        with csv_path.open() as stream:
+            rows = list(csv.DictReader(stream))
+        assert len(rows) == 16
+        found = recipe._get_tuned_fmoe_rows()
+        for row in rows:
+            assert "_silu_" in row["kernelName1"] and "Splitk" not in row["kernelName1"]
+            assert int(row["ksplit"]) == int(row["run_1stage"]) == 0
+            assert row["_tag"] in ("swiglu_limit=5", "swiglu_limit=7")
+            assert any(all(r.get(k) == v for k, v in row.items()) for r in found)
+        variants = recipe.get_moe_ck2stages_prebuild_variants("csrc")
+        assert set(names) <= {v["md_name"] for v in variants}
+        generator = root / "csrc/ck_gemm_moe_2stages_codegen/gen_instances.py"
+        with TemporaryDirectory() as tmp:
+            command = [sys.executable, str(generator)]
+            for flag, value in (
+                ("-a", "f8"),
+                ("-b", "f8"),
+                ("-c", "b16"),
+                ("-q", "per_1x128"),
+                ("-act", "silu"),
+                ("-m", "2"),
+                ("-w", tmp),
+            ):
+                command.extend((flag, value))
+            command.append("--runtime-swiglu-limit")
+            subprocess.run(
+                command,
+                check=True,
+                cwd=generator.parent,
+                capture_output=True,
+                text=True,
+            )
+            header = Path(tmp) / "ck2stages_moe_stage1_heuristic_dispatch.hpp"
+            dispatch_source = header.read_text()
+        references = re.findall(r"ck_moe_stage1_gemm<([^;]+)>;", dispatch_source)
+        assert references and all(
+            reference.strip().endswith(", true") for reference in references
+        )
+        import_code = (
+            f"import sys; sys.path.insert(0, {str(root / 'aiter')!r}); "
+            "from jit.utils.moe_recipes import _get_tuned_fmoe_rows; "
+            "assert _get_tuned_fmoe_rows(); assert 'aiter' not in sys.modules"
+        )
+        subprocess.run(
+            [sys.executable, "-c", import_code],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return 5
+
+    def configs():
+        cases, warnings, infos = 0, [], []
+        with patch.multiple(moe.logger, warning=record(warnings), info=record(infos)):
+            with override_env("AITER_CONFIG_FMOE_SWIGLU_LIMIT", str(csv_path)):
+                rows = pd.read_csv(csv_path)
+                for shape in ((4096, 1024, 289, 9), (2048, 768, 128, 8)):
+                    warnings.clear()
+                    infos.clear()
+                    meta = dispatch(shape=shape)
+                    assert not meta.run_1stage and int(meta.ksplit or 0) == 0
+                    assert meta.stage1.func is moe.ck_moe_stage1
+                    kernel = meta.stage1.keywords["kernelName"]
+                    keys = ["token", "model_dim", "inter_dim", "expert", "topk"]
+                    tuned = rows[
+                        (rows[keys] == (32, *shape)).all(axis=1)
+                        & (rows._tag == "swiglu_limit=5")
+                    ]
+                    assert len(tuned) == 1 and kernel == tuned.iloc[0].kernelName1
+                    assert "_silu_" in kernel and "Splitk" not in kernel
+                    assert not any("no row" in str(c) for c in warnings + infos)
+                    cases += 1
+                warnings.clear()
+                infos.clear()
+                dispatch(tokens=16)
+                assert not any("no row" in str(c) for c in warnings)
+                assert any("no row" in str(c) for c in infos)
+                cases += 1
+            for tokens, ksplit in itertools.product(
+                (1, 32, 1024), ("-1", "1", "4", "16")
+            ):
+                with override_env("AITER_KSPLIT", ksplit):
+                    moe.get_2stage_cfgs.cache_clear()
+                    meta = dispatch(tokens, (4096, 1024, 289, 9), 1.0)
+                    assert not meta.run_1stage and int(meta.ksplit or 0) == 0
+                cases += 1
+            with override_env("AITER_CONFIG_FMOE_SWIGLU_LIMIT", None):
+                moe.AITER_CONFIGS.get_config_file.cache_clear()
+                moe.get_2stage_cfgs.cache_clear()
+                warnings.clear()
+                config_path = moe.AITER_CONFIGS.AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE
+                merged = pd.read_csv(config_path)
+                assert len(merged) == 16
+                assert set(merged._tag) == {"swiglu_limit=5", "swiglu_limit=7"}
+                assert not warnings
+                assert "_silu_" in dispatch().stage1.keywords["kernelName"]
+                cases += 1
+            with TemporaryDirectory() as tmp:
+                paths = [Path(tmp) / f"{tag}.csv" for tag in ("five", "seven")]
+                for tag, path in zip(("swiglu_limit=5", "swiglu_limit=7"), paths):
+                    rows[rows._tag == tag].to_csv(path, index=False)
+                with override_env(
+                    "AITER_CONFIG_FMOE_SWIGLU_LIMIT", os.pathsep.join(map(str, paths))
+                ):
+                    moe.AITER_CONFIGS.get_config_file.cache_clear()
+                    config_path = moe.AITER_CONFIGS.AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE
+                    assert len(pd.read_csv(config_path)) == 16
+                    cases += 1
+                for kernel in ("stale_activation_F8", "known_silu_Splitk_F8"):
+                    stale = rows.copy()
+                    stale.loc[:, "kernelName1"] = kernel
+                    path = Path(tmp) / "stale.csv"
+                    stale.to_csv(path, index=False)
+                    with override_env("AITER_CONFIG_FMOE_SWIGLU_LIMIT", str(path)):
+                        moe.get_2stage_cfgs.cache_clear()
+                        moe.AITER_CONFIGS.get_config_file.cache_clear()
+                        moe.cfg_2stages_by_limit_tag.clear()
+                        with raises(
+                            ValueError, "Incompatible runtime SiLU limit tuning row"
+                        ):
+                            dispatch()
+                    cases += 1
+        moe.get_2stage_cfgs.cache_clear()
+        moe.AITER_CONFIGS.get_config_file.cache_clear()
+        moe.cfg_2stages_by_limit_tag.clear()
+        return cases
+
+    def forwarding_guards():
+        cases, launches = 0, []
+        for stage, q, limit in itertools.product(
+            ("ck_moe_stage1", "asm_stage1"), nonblock, (*disabled, 5.0)
+        ):
+            meta = metadata(getattr(moe, stage), q=q)
+            with pipeline(meta), patch.multiple(
+                aiter,
+                ck_moe_stage1_fwd=record(launches),
+                moe_stage1_g1u1=record(launches),
+            ):
+                launches.clear()
+                if limit == 5.0:
+                    with raises(NotImplementedError, "swiglu_limit"):
+                        two_stage(small, quant_type=q, swiglu_limit=limit)
+                    assert not launches
+                else:
+                    two_stage(small, quant_type=q, swiglu_limit=limit)
+                    assert len(launches) == 1
+                    if stage == "ck_moe_stage1":
+                        assert forwarded(launches[0]) == 0.0
+                cases += 1
+        with raises(NotImplementedError, "swiglu_limit"):
+            asm(ksplit=0, quant_type=quant.per_1x128, swiglu_limit=5.0)
+        cases += 1
+        for q in nonblock:
+            with raises(NotImplementedError, "swiglu_limit"):
+                ck(quant_type=q, splitk=1, swiglu_limit=5.0)
+            cases += 1
+        with patch.multiple(
+            aiter, moe_stage1_g1u1=lambda *a, **k: None, silu_and_mul=record(launches)
+        ):
+            for limit in (*disabled, 5.0, 1e-100, 1e100):
+                launches.clear()
+                asm(ksplit=1, quant_type=quant.No, swiglu_limit=limit)
+                expected = {
+                    5.0: 5.0,
+                    1e-100: 2.0**-149,
+                    1e100: torch.finfo(torch.float32).max,
+                }
+                assert launches[0][0][-1] == expected.get(limit, 0.0)
+                cases += 1
+        forwarding_cases = [
+            (act.Silu, 5.0, True),
+            *((act.Silu, limit, False) for limit in (None, 0.0, -0.0, 0, float("inf"))),
+            (act.Swiglu, 7.0, False),
+            (act.Swiglu, 0.0, False),
+            (act.Gelu, 0.0, False),
+            *((act.Silu, limit, True) for limit in invalid),
+        ]
+        for stage, (activation, limit, enabled) in itertools.product(
+            ("ck_moe_stage1", "asm_stage1"), forwarding_cases
+        ):
+            capture = record(launches, halt=True)
+            meta = metadata(capture, activation)
+            bad = (
+                activation == act.Silu
+                and limit is not None
+                and (limit < 0 or np.isnan(limit))
+            )
+            with pipeline(meta, **{stage: capture}):
+                launches.clear()
+                with raises(ValueError if bad else Stop):
+                    two_stage(small, activation=activation, swiglu_limit=limit)
+                if bad:
+                    assert not launches
+                else:
+                    assert len(launches) == 1
+                    assert ("swiglu_limit" in launches[0][1]) is enabled
+                    if enabled:
+                        assert launches[0][1]["swiglu_limit"] is limit
+                cases += 1
+        # Use the real entry/one-stage guard instead of extracting and exec'ing
+        # AST fragments. Stub selection/sort only; disabled cases reach stage1.
+        capture = record(launches, halt=True)
+        meta = metadata(capture, one_stage=True)
+        with pipeline(meta, moe_sorting=lambda *a, **k: (*sort_args, small[3])):
+            for q, limit in itertools.product(
+                (*nonblock, quant.per_1x128), (*disabled, 5.0, *invalid)
+            ):
+                launches.clear()
+                error = Stop
+                if limit in invalid:
+                    error = ValueError
+                elif limit == 5.0:
+                    error = NotImplementedError
+                messages = {
+                    ValueError: "swiglu_limit",
+                    NotImplementedError: "1-stage MoE",
+                }
+                with raises(error, messages.get(error, "")):
+                    entry(act.Silu, q, limit)
+                assert len(launches) == (1 if error is Stop else 0)
+                cases += 1
+        real_cfgs = moe.get_2stage_cfgs
+        selected = []
+
+        def select(*args, **kwargs):
+            selected.append(real_cfgs(*args, **kwargs))
+            return selected[-1]
+
+        for limit in (*invalid, None, 0, float("inf"), 5.0):
+            capture = record(launches, halt=True)
+            meta = metadata(capture)
+            with pipeline(meta, _flydsl_stage1_wrapper=capture) as fly_selected:
+                launches.clear()
+                bad = limit is not None and (limit < 0 or np.isnan(limit))
+                with raises(
+                    ValueError if bad else Stop, invalid_message if bad else ""
+                ):
+                    a16w4(1, act.Silu, limit, GateMode.INTERLEAVE)
+                assert fly_selected[0].stage1.func is moe._flydsl_stage1_wrapper
+                assert len(launches) == (0 if bad else 1)
+                if not bad:
+                    assert launches[0][1]["swiglu_limit"] is limit
+                cases += 1
+        tile_cases = [
+            (act.Silu, GateMode.INTERLEAVE, 5.0, NotImplementedError),
+            (act.Silu, GateMode.INTERLEAVE, 1e-100, NotImplementedError),
+            *((act.Silu, GateMode.INTERLEAVE, limit, ValueError) for limit in invalid),
+            *(
+                (act.Silu, GateMode.INTERLEAVE, limit, Stop)
+                for limit in (None, 0.0, -0.0, 0, float("inf"))
+            ),
+            (act.Swiglu, GateMode.SEPARATED, 7.0, Stop),
+            (act.Swiglu, GateMode.SEPARATED, 0.0, Stop),
+        ]
+        with patch.object(moe, "get_2stage_cfgs", select), patch.object(
+            aiter, "moe_cktile2stages_gemm1", record(launches, halt=True)
+        ):
+            for tokens, (activation, gate_mode, limit, error) in itertools.product(
+                (1, 2), tile_cases
+            ):
+                selected.clear()
+                launches.clear()
+                with raises(error, "" if error is Stop else "swiglu_limit"):
+                    a16w4(tokens, activation, limit, gate_mode)
+                assert selected[0].stage1.func is moe.cktile_moe_stage1
+                assert len(launches) == (1 if error is Stop else 0)
+                cases += 1
+        return cases
+
+    def fastpaths():
+        cases, launches = 0, []
+        with patch.object(moe, "normalize_swiglu_limit", unexpected), patch.multiple(
+            ops, normalize_swiglu_limit=unexpected, ck_moe_stage1=record(launches)
+        ):
+            for splitk, limit in itertools.product((None, 0, 1), (None, 0, 0.0, -0.0)):
+                launches.clear()
+                ck(quant_type=quant.No, swiglu_limit=limit, splitk=splitk)
+                binding(quant_type=quant.No, swiglu_limit=limit, splitk=splitk)
+                assert len(launches) == 2
+                assert all(args[19] == 0.0 for args, _ in launches)
+                selected_module = module(quant_type=quant.No, swiglu_limit=limit)
+                assert "runtime_swiglu_limit" not in selected_module["md_name"]
+                cases += 1
+        entry_cases = [
+            *(
+                (act.Silu, q, limit)
+                for q in (quant.per_1x128, quant.per_Token, quant.No)
+                for limit in (None, 0.0, -0.0, 0, float("inf"))
+            ),
+            (act.Silu, quant.per_128x128, 0),
+            (act.Swiglu, quant.No, 0.0),
+            (act.Swiglu, quant.per_1x128, 7.0),
+            (act.Gelu, quant.per_1x128, 0.0),
+        ]
+        with ExitStack() as stack:
+            for name in ("_normalize_moe_dispatch_contract", "normalize_swiglu_limit"):
+                stack.enter_context(patch.object(moe, name, unexpected))
+            stack.enter_context(patch.object(moe, "GateMode", stop))
+            comparisons = []
+            for enum in (act, quant):
+                eq = enum.__eq__
+
+                def record_eq(self, other, eq=eq):
+                    comparisons.append((self, other))
+                    return eq(self, other)
+
+                stack.enter_context(patch.object(enum, "__eq__", record_eq))
+            for activation, q, limit in entry_cases:
+                comparisons.clear()
+                with raises(Stop):
+                    entry(activation, q, limit)
+                assert not comparisons
+                cases += 1
+        with patch.multiple(
+            moe,
+            _normalize_moe_dispatch_contract=record(launches, halt=True),
+            GateMode=stop,
+        ):
+            for as_arg, limit in itertools.product(
+                (lambda a: a.value, lambda a: a, lambda a: np.int64(a.value)),
+                (5.0, *invalid),
+            ):
+                launches.clear()
+                with raises(Stop):
+                    entry(act.Silu, quant.per_1x128, limit, as_arg)
+                assert len(launches) == 1
+                cases += 1
+        with patch.multiple(moe, normalize_swiglu_limit=unexpected, get_inter_dim=stop):
+            for activation in (act.Silu, act.Gelu):
+                with raises(Stop):
+                    asm(activation=activation)
+                cases += 1
+        with patch.object(moe, "normalize_swiglu_limit", unexpected), patch.object(
+            aiter, "moe_stage1_g1u1", record(launches)
+        ):
+            launches.clear()
+            result = asm(activation=act.Swiglu, swiglu_limit=7.0, ksplit=0)
+            assert result.data_ptr() == ck_args[6].data_ptr()
+            assert result.shape == ck_args[6].shape and len(launches) == 1
+            cases += 1
+        with raises(ValueError, "swiglu_limit"):
+            asm(swiglu_limit=float("nan"), ksplit=0)
+        cases += 1
+        with patch.multiple(
+            aiter, ck_moe_stage1_fwd=record(launches), silu_and_mul=unexpected
+        ), patch.object(torch, "empty", unexpected):
+            launches.clear()
+            args = small[0], *([None] * 5), ck_args[6], 1, 16
+            result = ck(args, quant_type=quant.per_128x128, splitk=2, swiglu_limit=None)
+            assert result is ck_args[6] and len(launches) == 1
+            assert launches[0][0][6] is ck_args[6]
+            assert launches[0][0][13] == quant.per_128x128
+            assert launches[0][0][15] == 0 and forwarded(launches[0]) == 0.0
+            cases += 1
+        return cases
+
+    # Private caches preserve the warmed dispatch/config caches from the sweep.
+    # All env/device/enum/module patches unwind on failure as well as success.
+    with ExitStack() as stack:
+        stack.enter_context(torch.device("cpu"))
+        tmp = stack.enter_context(TemporaryDirectory())
+        stack.enter_context(patch.object(tempfile, "tempdir", tmp))
+        stack.enter_context(patch.object(moe.os, "system", unexpected))
+        for name, value in (
+            ("AITER_BYPASS_TUNE_CONFIG", "0"),
+            ("AITER_ONLINE_TUNE", "0"),
+            ("AITER_KSPLIT", None),
+            ("AITER_CONFIG_FMOE_SWIGLU_LIMIT", None),
+        ):
+            stack.enter_context(override_env(name, value))
+        for name, value in (
+            ("get_gfx", "gfx942"),
+            ("get_gfx_runtime", "gfx942"),
+            ("get_cu_num", 304),
+        ):
+            stack.enter_context(patch.object(moe, name, lambda value=value: value))
+        private_dispatch = functools.lru_cache(maxsize=2048)(
+            moe.get_2stage_cfgs.__wrapped__
+        )
+        stack.enter_context(patch.object(moe, "get_2stage_cfgs", private_dispatch))
+        cfg = moe.AITER_CONFIGS
+        private_config = functools.lru_cache(maxsize=64)(
+            cfg.get_config_file.__wrapped__.__get__(cfg)
+        )
+        stack.enter_context(patch.object(cfg, "get_config_file", private_config))
+        stack.enter_context(patch.object(moe, "cfg_2stages_by_limit_tag", {}))
+        small = inputs()
+        x, w1, w2, out = small
+        sort_args = (
+            torch.zeros(16, dtype=torch.int32),
+            None,
+            torch.zeros(1, dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+        )
+        ck_args = x, w1, w2, *sort_args[:3], out.unsqueeze(1), 1, 16
+        entry_args = x, w1, w2, torch.ones(1, 1), torch.zeros(1, 1, dtype=torch.int32)
+        mxfp4 = {tokens: inputs(tokens, mxfp4=True) for tokens in (1, 2)}
+        counts = {}
+        for group in (
+            normalization,
+            ck_binding_tuner,
+            recipes,
+            configs,
+            forwarding_guards,
+            fastpaths,
+        ):
+            counts[group.__name__] = group()
+        executed = sum(counts.values())
+        # 237 migrated cases + 9 real-entry invalid guards + 3 blockscale guards.
+        assert executed == 249, counts
+    aiter.logger.info(
+        "blockscale host contracts: executed %d cases (%s)", executed, counts
+    )
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -2704,3 +3461,5 @@ aiter.logger.info(
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+if not args.bm16_scale_boundary:
+    run_blockscale_host_contracts()
