@@ -2524,11 +2524,11 @@ def test_blockscale_swiglu_limit(token, swiglu_limit):
             output=out,
         )
     }
-    flops = 6 * token * topk * model_dim * inter_dim
-    nbytes = sum(t.numel() * t.element_size() for t in (x, w1, w2, out, s1, s2))
     ret = {"gfx": get_gfx(), "swapped logits_diff": swapped_diff}
     for name, fn in candidates.items():
-        actual, us = run_perftest(fn, num_iters=5, num_warmup=2)
+        # This is an accuracy regression, not a performance benchmark. Starting
+        # extra profiler sessions here perturbs the subsequent CLI perf sweep.
+        actual = fn()
         err = checkAllclose(
             ref.float(),
             actual.float(),
@@ -2546,9 +2546,6 @@ def test_blockscale_swiglu_limit(token, swiglu_limit):
         ret[f"{name} logits_diff"] = logits_diff
         ret.update(
             {
-                f"{name} us": us,
-                f"{name} TFLOPS": flops / us / 1e6,
-                f"{name} TB/s": nbytes / us / 1e6,
                 f"{name} err": err,
             }
         )
