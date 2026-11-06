@@ -1546,7 +1546,7 @@ def _fused_moe_impl(
     # and errors) clears it.
     presorted_aux = pop_presorted_moe()
     # vLLM sends 0.0 for "no limit". Check floats and the raw int first:
-    # a pybind enum comparison costs about 0.4 us per call.
+    # pybind enum comparisons are much slower than int compares.
     silu_limit = (
         swiglu_limit is not None
         and swiglu_limit != 0
@@ -2625,7 +2625,7 @@ def _normalize_moe_dispatch_contract(
     quant_type = quant_remap.get(quant_type, quant_type)
     if quant_type_a is not None:
         quant_type_a = quant_remap.get(QuantType(quant_type_a), QuantType(quant_type_a))
-    if quant_type == QuantType.per_1x128 and activation == ActivationType.Silu:
+    if activation == ActivationType.Silu:
         swiglu_limit = normalize_swiglu_limit(swiglu_limit)
     return quant_type, quant_type_a, swiglu_limit
 
@@ -5784,6 +5784,11 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
+    active_silu_limit = (
+        normalize_swiglu_limit(swiglu_limit)
+        if swiglu_limit and activation.value == _SILU_VALUE
+        else None
+    )
     if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
         # Hand these two the caller's limit unchanged. They clamp silu whenever a
         # finite limit is configured (runtime_swiglu_limit in moe_kernels.py), and
@@ -5792,13 +5797,10 @@ def fused_moe_2stages(
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     elif stage1_func is _mxfp4_a4w4_stage1_fw:
         extra_stage1_args["swiglu_limit"] = normalized_swiglu_limit
-    elif swiglu_limit and swiglu_limit != math.inf and activation.value == _SILU_VALUE:
+    elif active_silu_limit is not None:
         if stage1_func in (ck_moe_stage1, asm_stage1):
-            extra_stage1_args["swiglu_limit"] = swiglu_limit
-        elif (
-            stage1_func is cktile_moe_stage1
-            and normalize_swiglu_limit(swiglu_limit) is not None
-        ):
+            extra_stage1_args["swiglu_limit"] = active_silu_limit
+        elif stage1_func is cktile_moe_stage1:
             raise NotImplementedError(
                 f"CK-Tile MoE stage1 cannot apply swiglu_limit={swiglu_limit!r}; "
                 "the selected kernel has no clamp."

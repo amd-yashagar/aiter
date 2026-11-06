@@ -67,6 +67,33 @@ def test_positive_limit(limit):
     assert moe.swiglu_limit_tag(limit) == f"swiglu_limit={limit:g}"
 
 
+@pytest.mark.parametrize(
+    "quant_type",
+    [QuantType.No, QuantType.per_Token, QuantType.per_1x32, QuantType.per_1x128],
+)
+@pytest.mark.parametrize("limit", [-1.0, float("nan"), -float("inf"), 5.0])
+def test_dispatch_validates_silu_limit_for_every_quant_type(quant_type, limit):
+    if limit == 5.0:
+        assert moe._normalize_moe_dispatch_contract(
+            quant_type, ActivationType.Silu, limit
+        ) == (quant_type, None, limit)
+    else:
+        with pytest.raises(
+            ValueError, match="^swiglu_limit must be non-negative and not NaN$"
+        ):
+            moe._normalize_moe_dispatch_contract(quant_type, ActivationType.Silu, limit)
+
+
+@pytest.mark.parametrize(
+    "quant_type",
+    [QuantType.No, QuantType.per_Token, QuantType.per_1x32, QuantType.per_1x128],
+)
+def test_dispatch_does_not_validate_swiglu_limit(quant_type):
+    assert moe._normalize_moe_dispatch_contract(
+        quant_type, ActivationType.Swiglu, -1.0
+    ) == (quant_type, None, -1.0)
+
+
 def test_dispatch_normalizes_infinite_limit_for_per_128x128_alias():
     quant_type, quant_type_a, limit = moe._normalize_moe_dispatch_contract(
         QuantType.per_128x128, ActivationType.Silu, float("inf")
@@ -1019,7 +1046,11 @@ def test_two_stage_limit_forwarding(monkeypatch, stage, activation, limit, forwa
     )
     monkeypatch.setattr(moe, "get_2stage_cfgs", lambda *a, **k: metadata)
     monkeypatch.setattr(moe, "get_quant", lambda _: lambda x, **k: (x, None))
-    with pytest.raises(_StopAfterLimitCheck):
+    invalid_silu_limit = activation == ActivationType.Silu and (
+        limit is not None and (limit < 0 or np.isnan(limit))
+    )
+    error = ValueError if invalid_silu_limit else _StopAfterLimitCheck
+    with pytest.raises(error):
         moe.fused_moe_2stages(
             torch.empty(1, 128, dtype=dtypes.bf16, device="cpu"),
             torch.empty(1, 256, 128, dtype=dtypes.bf16, device="cpu"),
@@ -1036,6 +1067,9 @@ def test_two_stage_limit_forwarding(monkeypatch, stage, activation, limit, forwa
             quant_type=QuantType.No,
             swiglu_limit=limit,
         )
+    if invalid_silu_limit:
+        assert not calls
+        return
     assert len(calls) == 1
     assert ("swiglu_limit" in calls[0]) is forwarded
     if forwarded:
@@ -1086,6 +1120,48 @@ def _run_a16w4_two_stage(tokens, activation, limit, gate_mode):
         swiglu_limit=limit,
         gate_mode=gate_mode,
     )
+
+
+@pytest.mark.parametrize(
+    "limit", [-1.0, float("nan"), -float("inf"), None, 0, float("inf"), 5.0]
+)
+def test_flydsl_two_stage_validates_silu_limit_before_launch(
+    monkeypatch, cktile_launches, limit
+):
+    selected, launches = cktile_launches
+
+    def capture(*args, **kwargs):
+        launches.append(kwargs)
+        raise _StopAfterLimitCheck
+
+    monkeypatch.setattr(moe, "_flydsl_stage1_wrapper", capture)
+    metadata = moe.MOEMetadata(
+        functools.partial(capture, activation=ActivationType.Silu),
+        lambda *a, **k: a[6],
+        16,
+        0,
+        prequant=False,
+        skip_inter_quant=True,
+    )
+
+    def select(*args, **kwargs):
+        selected.append(metadata)
+        return metadata
+
+    monkeypatch.setattr(moe, "get_2stage_cfgs", select)
+    invalid = limit is not None and (limit < 0 or np.isnan(limit))
+    if invalid:
+        with pytest.raises(
+            ValueError, match="^swiglu_limit must be non-negative and not NaN$"
+        ):
+            _run_a16w4_two_stage(1, ActivationType.Silu, limit, GateMode.INTERLEAVE)
+        assert not launches
+    else:
+        with pytest.raises(_StopAfterLimitCheck):
+            _run_a16w4_two_stage(1, ActivationType.Silu, limit, GateMode.INTERLEAVE)
+        assert len(launches) == 1
+        assert launches[0]["swiglu_limit"] is limit
+    assert selected[0].stage1.func is moe._flydsl_stage1_wrapper
 
 
 # CK-Tile has no clamp, so a SiLU limit it cannot apply must fail, not vanish.
