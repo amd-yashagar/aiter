@@ -43,6 +43,8 @@ CK_FP8 = next(dtype for dtype, name in ops.dtype2str_dict.items() if name == "f8
 
 @pytest.fixture(autouse=True)
 def fresh_dispatch(monkeypatch):
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", "0")
+    monkeypatch.setenv("AITER_ONLINE_TUNE", "0")
     monkeypatch.setattr(moe, "get_gfx", lambda: "gfx942")
     monkeypatch.setattr(moe, "get_gfx_runtime", lambda: "gfx942")
     monkeypatch.setattr(moe, "get_cu_num", lambda: 304)
