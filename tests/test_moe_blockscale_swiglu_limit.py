@@ -571,17 +571,39 @@ def _dispatch(token, model_dim, inter_dim, expert, topk, limit):
     )
 
 
-def test_limit_5_uses_the_epilogue():
+def test_limit_5_uses_the_epilogue(monkeypatch):
+    monkeypatch.setenv("AITER_CONFIG_FMOE_SWIGLU_LIMIT", str(_swiglu_limit_csv()))
     meta = _dispatch(32, 4096, 1024, 289, 9, 5.0)
     assert meta.run_1stage is False
     assert int(meta.ksplit or 0) == 0
+    assert meta.stage1.func is moe.ck_moe_stage1
+    kernel_name = meta.stage1.keywords["kernelName"]
+    assert "_silu_" in kernel_name
+    assert "Splitk" not in kernel_name
+    assert kernel_name == _tuned_limit_row(32, 4096, 1024, 289, 9)["kernelName1"]
 
 
 def _swiglu_limit_csv():
     return (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[1]
         / "aiter/configs/model_configs/a8w8_blockscale_tuned_swiglu_limit_fmoe_gfx942.csv"
     )
+
+
+def _tuned_limit_row(token, model_dim, inter_dim, expert, topk):
+    with _swiglu_limit_csv().open() as stream:
+        rows = [
+            row
+            for row in csv.DictReader(stream)
+            if tuple(
+                int(row[key])
+                for key in ("token", "model_dim", "inter_dim", "expert", "topk")
+            )
+            == (token, model_dim, inter_dim, expert, topk)
+            and row["_tag"] == "swiglu_limit=5"
+        ]
+    assert len(rows) == 1
+    return rows[0]
 
 
 def _capture_warnings(monkeypatch):
@@ -596,11 +618,18 @@ def _capture_warnings(monkeypatch):
 def test_tuned_cohere_row_uses_the_epilogue(monkeypatch):
     monkeypatch.setenv("AITER_CONFIG_FMOE_SWIGLU_LIMIT", str(_swiglu_limit_csv()))
     messages = _capture_warnings(monkeypatch)
+    infos = []
+    monkeypatch.setattr(moe.logger, "info", lambda msg, *a, **k: infos.append(str(msg)))
     meta = _dispatch(32, 2048, 768, 128, 8, 5.0)
     assert not int(meta.run_1stage or 0)
     assert int(meta.ksplit or 0) == 0
     assert "_silu_" in meta.stage1.keywords["kernelName"]
+    assert (
+        meta.stage1.keywords["kernelName"]
+        == _tuned_limit_row(32, 2048, 768, 128, 8)["kernelName1"]
+    )
     assert not any("no row" in msg for msg in messages)
+    assert not any("no row" in msg for msg in infos)
 
 
 def test_missing_limit_row_logs_at_default_level(monkeypatch):
