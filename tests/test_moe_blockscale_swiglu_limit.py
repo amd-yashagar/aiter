@@ -24,6 +24,7 @@ from aiter.ops.moe_limits import normalize_swiglu_limit
 
 moe = importlib.import_module("aiter.fused_moe")
 ops = importlib.import_module("aiter.ops.moe_op")
+GateMode = moe.GateMode
 
 # Bind recorded launches to the real defaults, independent of positional/keyword
 # spelling or an omitted disabled limit. Capture before tests monkeypatch them.
@@ -1039,6 +1040,96 @@ def test_two_stage_limit_forwarding(monkeypatch, stage, activation, limit, forwa
     assert ("swiglu_limit" in calls[0]) is forwarded
     if forwarded:
         assert calls[0]["swiglu_limit"] is limit
+
+
+@pytest.fixture
+def cktile_launches(monkeypatch):
+    """Record the real selection and stop at the first CK-Tile GEMM1 launch."""
+    real_cfgs = moe.get_2stage_cfgs
+    selected, launches = [], []
+
+    def select(*args, **kwargs):
+        selected.append(real_cfgs(*args, **kwargs))
+        return selected[-1]
+
+    def launch(*args, **kwargs):
+        launches.append(args)
+        raise _StopAfterLimitCheck
+
+    monkeypatch.setattr(moe, "get_2stage_cfgs", select)
+    monkeypatch.setattr(aiter, "moe_cktile2stages_gemm1", launch)
+    return selected, launches
+
+
+def _run_a16w4_two_stage(tokens, activation, limit, gate_mode):
+    # bf16 activations with shuffled MXFP4 weights: at decode sizes the default
+    # split-K heuristic hands these to CK-Tile.
+    w1 = torch.empty(8, 2048, 2048, dtype=dtypes.fp4x2)
+    w2 = torch.empty(8, 4096, 512, dtype=dtypes.fp4x2)
+    w1.is_shuffled = w2.is_shuffled = True
+    return moe.fused_moe_2stages(
+        torch.empty(tokens, 4096, dtype=dtypes.bf16),
+        w1,
+        w2,
+        2,
+        torch.zeros(16, dtype=torch.int32),
+        None,
+        torch.zeros(1, dtype=torch.int32),
+        torch.ones(1, dtype=torch.int32),
+        torch.empty(tokens, 4096, dtype=dtypes.bf16),
+        True,
+        16,
+        activation=activation,
+        quant_type=QuantType.per_1x32,
+        q_dtype_a=dtypes.bf16,
+        q_dtype_w=dtypes.fp4x2,
+        swiglu_limit=limit,
+        gate_mode=gate_mode,
+    )
+
+
+# CK-Tile has no clamp, so a SiLU limit it cannot apply must fail, not vanish.
+@pytest.mark.parametrize("tokens", [1, 2])
+@pytest.mark.parametrize(
+    "limit, error",
+    [
+        (5.0, NotImplementedError),
+        (1e-100, NotImplementedError),
+        (-1.0, ValueError),
+        (float("nan"), ValueError),
+        (-float("inf"), ValueError),
+    ],
+)
+def test_cktile_stage1_rejects_unapplied_silu_limit(
+    cktile_launches, tokens, limit, error
+):
+    selected, launches = cktile_launches
+    with pytest.raises(error, match="swiglu_limit"):
+        _run_a16w4_two_stage(tokens, ActivationType.Silu, limit, GateMode.INTERLEAVE)
+    assert selected[0].stage1.func is moe.cktile_moe_stage1
+    assert not launches
+
+
+@pytest.mark.parametrize("tokens", [1, 2])
+@pytest.mark.parametrize(
+    "activation, gate_mode, limit",
+    [
+        (ActivationType.Silu, GateMode.INTERLEAVE, limit)
+        for limit in (None, 0.0, -0.0, 0, float("inf"))
+    ]
+    + [
+        (ActivationType.Swiglu, GateMode.SEPARATED, 7.0),
+        (ActivationType.Swiglu, GateMode.SEPARATED, 0.0),
+    ],
+)
+def test_cktile_stage1_launches_without_a_finite_silu_limit(
+    cktile_launches, tokens, activation, gate_mode, limit
+):
+    selected, launches = cktile_launches
+    with pytest.raises(_StopAfterLimitCheck):
+        _run_a16w4_two_stage(tokens, activation, limit, gate_mode)
+    assert selected[0].stage1.func is moe.cktile_moe_stage1
+    assert len(launches) == 1
 
 
 @pytest.mark.parametrize("limit", [-1.0, float("nan"), -float("inf")])

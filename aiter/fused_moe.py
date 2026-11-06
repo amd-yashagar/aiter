@@ -5792,13 +5792,17 @@ def fused_moe_2stages(
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     elif stage1_func is _mxfp4_a4w4_stage1_fw:
         extra_stage1_args["swiglu_limit"] = normalized_swiglu_limit
-    elif (
-        swiglu_limit
-        and swiglu_limit != math.inf
-        and stage1_func in (ck_moe_stage1, asm_stage1)
-        and activation.value == _SILU_VALUE
-    ):
-        extra_stage1_args["swiglu_limit"] = swiglu_limit
+    elif swiglu_limit and swiglu_limit != math.inf and activation.value == _SILU_VALUE:
+        if stage1_func in (ck_moe_stage1, asm_stage1):
+            extra_stage1_args["swiglu_limit"] = swiglu_limit
+        elif (
+            stage1_func is cktile_moe_stage1
+            and normalize_swiglu_limit(swiglu_limit) is not None
+        ):
+            raise NotImplementedError(
+                f"CK-Tile MoE stage1 cannot apply swiglu_limit={swiglu_limit!r}; "
+                "the selected kernel has no clamp."
+            )
     if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
         extra_stage1_args["v2_output_layout"] = True
     if stage1_func is _flydsl_stage1_wrapper:
