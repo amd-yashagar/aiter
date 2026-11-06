@@ -641,7 +641,7 @@ def test_two_stage_forwards_limit_for_every_quant_type(
             assert _forwarded_limit(*launches[0]) == 0.0
 
 
-@pytest.mark.parametrize("limit", [None, 0.0, float("inf"), 5.0])
+@pytest.mark.parametrize("limit", [None, 0.0, float("inf"), 5.0, 1e-100, 1e100])
 def test_asm_splitk_normalizes_limit(monkeypatch, limit):
     calls = []
     monkeypatch.setattr(aiter, "moe_stage1_g1u1", lambda *a, **k: None)
@@ -661,7 +661,9 @@ def test_asm_splitk_normalizes_limit(monkeypatch, limit):
         activation=ActivationType.Silu,
         swiglu_limit=limit,
     )
-    assert calls[0][-1] == (5.0 if limit == 5.0 else 0.0)
+    # A limit outside float32 range must not narrow to 0 (no clamp) or inf.
+    expected = {5.0: 5.0, 1e-100: 2.0**-149, 1e100: torch.finfo(torch.float32).max}
+    assert calls[0][-1] == expected.get(limit, 0.0)
 
 
 @pytest.mark.parametrize("limit", [-1.0, float("nan"), -float("inf")])

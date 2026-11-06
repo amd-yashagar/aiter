@@ -6092,7 +6092,14 @@ def asm_stage1(
     )
     if ksplit > 0:
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32), swiglu_limit or 0.0)
+            # silu_and_mul takes a float32 limit. Keep a positive limit from
+            # narrowing to 0 (no clamp) or inf, like the CK launcher does.
+            limit = (
+                min(max(swiglu_limit, 2.0**-149), torch.finfo(dtypes.fp32).max)
+                if swiglu_limit
+                else 0.0
+            )
+            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32), limit)
         elif activation == ActivationType.Swiglu:
             aiter.swiglu_and_mul(out, tmp_out.view(dtypes.fp32))
         elif activation == ActivationType.Gelu:
