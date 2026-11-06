@@ -888,7 +888,7 @@ def _row_to_kwargs(row):
         "intermediate_pad": 0,
         "preshuffle": True,
         "swiglu_limit": _effective_swiglu_limit(
-            q_type, aq_dtype, wq_dtype, args.swiglu_limit
+            q_type, aq_dtype, wq_dtype, args.swiglu_limit, act_type
         ),
     }
 
@@ -1038,12 +1038,14 @@ def _effective_gate_mode(q_type, aq_dtype, wq_dtype):
     return GateMode.SEPARATED.value
 
 
-def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
+def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit, act_type):
     if (
         quant_type in (aiter.QuantType.per_1x128, aiter.QuantType.per_128x128)
         and aq_dtype == wq_dtype == dtypes.fp8
     ):
-        return swiglu_limit
+        # Only SiLU applies the limit here; the torch reference would still
+        # clamp the gate and up inputs of any other activation.
+        return swiglu_limit if act_type == aiter.ActivationType.Silu else None
     if (quant_type, aq_dtype, wq_dtype) in (
         _PER1X32_BF16_FP4,
         _PER1X32_FP8_FP4,
@@ -1274,7 +1276,7 @@ def _iter_legacy_cases():
             strict_accuracy=False,
             check_aot_cache=False,
             swiglu_limit=_effective_swiglu_limit(
-                quant_type, aq_dtype, wq_dtype, args.swiglu_limit
+                quant_type, aq_dtype, wq_dtype, args.swiglu_limit, act_type
             ),
             **over,
         )
@@ -2553,6 +2555,14 @@ def test_blockscale_swiglu_limit(token, swiglu_limit):
     return ret
 
 
+def test_effective_swiglu_limit_blockscale_activation():
+    fp8, q = dtypes.fp8, aiter.QuantType.per_1x128
+    act = aiter.ActivationType
+    assert _effective_swiglu_limit(q, fp8, fp8, 5.0, act.Silu) == 5.0
+    for other in (act.Gelu, act.Swiglu):
+        assert _effective_swiglu_limit(q, fp8, fp8, 5.0, other) is None
+
+
 def run_blockscale_limit_cases():
     rows = [
         test_blockscale_swiglu_limit(token, limit)
@@ -2581,6 +2591,7 @@ if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     test_output_buffer_contract()
+    test_effective_swiglu_limit_blockscale_activation()
     if get_gfx() in ("gfx942", "gfx950"):
         run_blockscale_limit_cases()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
