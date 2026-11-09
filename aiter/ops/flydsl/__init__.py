@@ -144,6 +144,10 @@ _LAZY_IMPORTS = {
         ".sparse_mla_qblock_kernels",
         "sparse_mla_qblock_fwd_flydsl",
     ),
+    "sparse_mla_pingpong_fwd_flydsl": (
+        ".sparse_mla_pp_kernels",
+        "sparse_mla_pingpong_fwd_flydsl",
+    ),
     "gather_kv_b_proj_flydsl_fp8_supported": (
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_fp8_supported",
@@ -248,6 +252,7 @@ __all__ = [
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
     "sparse_mla_one_query_fwd_flydsl",
+    "sparse_mla_pingpong_fwd_flydsl",
     "sparse_mla_qblock_fwd_flydsl",
 ]
 

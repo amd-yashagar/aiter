@@ -19,6 +19,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.sparse_mla_pp_kernels import sparse_mla_pingpong_fwd_flydsl
 from aiter.ops.flydsl.sparse_mla_qblock_kernels import (
     sparse_mla_one_query_fwd_flydsl,
     sparse_mla_qblock_fwd_flydsl,
@@ -77,6 +78,11 @@ def test_sparse_mla_qblock(n_tok, num_heads, head_dim, topk, pool, pattern, dtyp
         return sparse_mla_qblock_fwd_flydsl(q, kv, indices, out_qb, kv_indptr=kv_indptr)
 
     candidates = {"flydsl_one_q": _flydsl_one_q, "flydsl_qblock": _flydsl_qblock}
+    if topk % 32 == 0:
+        out_pp = torch.empty_like(q)
+        candidates["flydsl_pingpong"] = lambda: sparse_mla_pingpong_fwd_flydsl(
+            q, kv, indices, out_pp, kv_indptr=kv_indptr
+        )
     flops = 4.0 * n_tok * num_heads * head_dim * topk
     elem = q.element_size()
     nbytes = (n_tok * topk * head_dim + 2 * n_tok * num_heads * head_dim) * elem

@@ -22,6 +22,9 @@ KERNELS = SRC + "_triton_kernels/"
 GLUON_KERNELS = SRC + "_gluon_kernels/"
 CONFIGS = SRC + "configs/"
 SPARSE_MLA_FLYDSL_PATHS = (
+    "aiter/ops/flydsl/__init__.py",
+    "aiter/ops/flydsl/sparse_mla_pp_kernels.py",
+    "aiter/ops/flydsl/kernels/sparse_mla_pp.py",
     "aiter/ops/flydsl/sparse_mla_qblock_kernels.py",
     "aiter/ops/flydsl/kernels/sparse_mla_qblock.py",
     "op_tests/test_sparse_mla_qblock.py",

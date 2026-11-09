@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from aiter import dtypes
+from aiter.ops.flydsl.sparse_mla_pp_kernels import sparse_mla_pingpong_fwd_flydsl
 from aiter.ops.flydsl.sparse_mla_qblock_kernels import (
     sparse_mla_one_query_fwd_flydsl,
     sparse_mla_qblock_fwd_flydsl,
@@ -72,7 +73,7 @@ def _torch_csr(q, kv, indices, indptr, scale, sink):
 
 @pytest.mark.parametrize("n_tok", [7, 16])
 @pytest.mark.parametrize("pattern", ["shared", "random"])
-@pytest.mark.parametrize("kernel", ["one_q", "qblock"])
+@pytest.mark.parametrize("kernel", ["one_q", "qblock", "pingpong"])
 def test_flydsl_matches_torch(n_tok, pattern, kernel):
     torch.manual_seed(0)
     topk, pool = 2048, 8192
@@ -83,13 +84,15 @@ def test_flydsl_matches_torch(n_tok, pattern, kernel):
     indptr = _indptr(n_tok, topk)
     if kernel == "one_q":
         sparse_mla_one_query_fwd_flydsl(q, kv, indices, out, kv_indptr=indptr)
+    elif kernel == "pingpong":
+        sparse_mla_pingpong_fwd_flydsl(q, kv, indices, out, kv_indptr=indptr)
     else:
         sparse_mla_qblock_fwd_flydsl(q, kv, indices, out, kv_indptr=indptr)
     ref = _torch_flat(q, kv, indices, topk)
     _check_accuracy(ref.to(dtypes.fp32), out.to(dtypes.fp32), rtol=2e-3, atol=2e-3)
 
 
-@pytest.mark.parametrize("kernel", ["one_q", "qblock"])
+@pytest.mark.parametrize("kernel", ["one_q", "qblock", "pingpong"])
 def test_flydsl_attn_sink(kernel):
     torch.manual_seed(3)
     n_tok, topk, pool = 8, 64, 8192
@@ -106,6 +109,8 @@ def test_flydsl_attn_sink(kernel):
     }
     if kernel == "one_q":
         sparse_mla_one_query_fwd_flydsl(q, kv, indices, out, **common)
+    elif kernel == "pingpong":
+        sparse_mla_pingpong_fwd_flydsl(q, kv, indices, out, **common)
     else:
         sparse_mla_qblock_fwd_flydsl(q, kv, indices, out, block_q=4, **common)
     ref = _torch_flat(q, kv, indices, topk, sink, scale)
@@ -285,16 +290,21 @@ def test_gfx942_rejects_output_epilogue(argument, block_h):
 
 @pytest.mark.parametrize("scale", [0.0, -1.0, float("nan"), float("inf")])
 @pytest.mark.parametrize(
-    "wrapper", [sparse_mla_one_query_fwd_flydsl, sparse_mla_qblock_fwd_flydsl]
+    "wrapper",
+    [
+        sparse_mla_one_query_fwd_flydsl,
+        sparse_mla_qblock_fwd_flydsl,
+        sparse_mla_pingpong_fwd_flydsl,
+    ],
 )
 def test_flydsl_rejects_invalid_scale(scale, wrapper):
     q = torch.ones(1, H, D, dtype=torch.bfloat16, device="cuda")
-    kv = torch.ones(16, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.ones(32, D, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="finite and positive"):
         wrapper(
             q,
             kv,
-            _indices("shared", 1, 16, 16),
+            _indices("shared", 1, 32, 32),
             torch.empty_like(q),
             softmax_scale=scale,
         )
@@ -434,11 +444,14 @@ def test_flydsl_odd_tail_sink(block_q):
     torch.testing.assert_close(ref.float(), out.float(), rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize("kernel", ["one_q", "qblock"])
+@pytest.mark.parametrize(
+    "kernel,n_tok",
+    [("one_q", 7), ("qblock", 7), ("pingpong", 7), ("pingpong", 4097)],
+)
 @pytest.mark.parametrize("case", ["sharp", "large_v", "duplicates_sink"])
-def test_flydsl_finite_stress(kernel, case):
+def test_flydsl_finite_stress(kernel, n_tok, case):
     torch.manual_seed(1215)
-    n_tok, topk, pool = 7, 2048, 131072
+    topk, pool = 2048, 131072
     q = torch.randn(n_tok, H, D, dtype=torch.bfloat16, device="cuda")
     kv = torch.randn(pool, D, dtype=torch.bfloat16, device="cuda")
     indices = _indices("shared", n_tok, pool, topk)
@@ -459,16 +472,230 @@ def test_flydsl_finite_stress(kernel, case):
         )
         sink = torch.linspace(-2, 2, H, dtype=torch.float32, device="cuda")
     out = torch.empty_like(q)
-    fn = (
-        sparse_mla_one_query_fwd_flydsl
-        if kernel == "one_q"
-        else sparse_mla_qblock_fwd_flydsl
-    )
+    fn = {
+        "one_q": sparse_mla_one_query_fwd_flydsl,
+        "qblock": sparse_mla_qblock_fwd_flydsl,
+        "pingpong": sparse_mla_pingpong_fwd_flydsl,
+    }[kernel]
     fn(q, kv, indices, out, kv_indptr=_indptr(n_tok, topk), attn_sink=sink)
-    ref = _torch_flat(q, kv, indices, topk, sink)
+    ref = torch.cat(
+        [
+            _torch_flat(
+                q[t : t + 64], kv, indices[t * topk : (t + 64) * topk], topk, sink
+            )
+            for t in range(0, n_tok, 64)
+        ]
+    )
     assert torch.isfinite(ref).all()
     assert torch.isfinite(out).all()
     _check_accuracy(ref.float(), out.float(), rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("topk", [16, 48])
+def test_pingpong_rejects_unpaired_tiles(topk):
+    q = torch.ones(1, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.ones(64, D, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="divisible by 32"):
+        sparse_mla_pingpong_fwd_flydsl(
+            q, kv, _indices("shared", 1, 64, topk), torch.empty_like(q)
+        )
+
+
+def test_pingpong_rejects_arch_and_index_span(monkeypatch):
+    import aiter.ops.flydsl.sparse_mla_pp_kernels as pp
+    import aiter.ops.flydsl.sparse_mla_qblock_kernels as common
+
+    q = torch.ones(1, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.ones(32, D, dtype=torch.bfloat16, device="cuda")
+    idx = _indices("shared", 1, 32, 32)
+    monkeypatch.setattr(common, "get_gfx_runtime", lambda: "gfx950")
+    with pytest.raises(RuntimeError, match="gfx942-only"):
+        sparse_mla_pingpong_fwd_flydsl(q, kv, idx, torch.empty_like(q))
+    monkeypatch.setattr(common, "get_gfx_runtime", lambda: "gfx942")
+    # Metadata-only overflow: reject before dtype conversion or kernel dispatch.
+    monkeypatch.setattr(pp, "_require_contract", lambda *args: (16384, 32))
+    monkeypatch.setattr(pp, "_uniform_topk", lambda *args, **kwargs: (idx, 65536))
+    with pytest.raises(ValueError, match="index byte span"):
+        sparse_mla_pingpong_fwd_flydsl(q, kv, idx, torch.empty_like(q))
+
+
+def test_pingpong_public_lazy_export():
+    from aiter.ops.flydsl import sparse_mla_pingpong_fwd_flydsl as exported
+
+    assert exported is sparse_mla_pingpong_fwd_flydsl
+
+
+@pytest.mark.parametrize(
+    "operand", ["q", "kv", "out", "kv_indices", "kv_indptr", "attn_sink"]
+)
+def test_pingpong_rejects_cpu_operands(operand, monkeypatch):
+    import aiter.ops.flydsl.sparse_mla_pp_kernels as pp
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "device validation must precede CSR handling and compilation"
+        )
+
+    monkeypatch.setattr(pp, "_uniform_topk", forbidden)
+    monkeypatch.setattr(pp, "compile_sparse_mla_pp", forbidden)
+    monkeypatch.setattr(pp, "_run_compiled", forbidden)
+    values = {}
+    for name, shape, dtype in (
+        ("q", (1, H, D), torch.bfloat16),
+        ("kv", (32, D), torch.bfloat16),
+        ("out", (1, H, D), torch.bfloat16),
+        ("kv_indices", (32,), torch.int32),
+        ("kv_indptr", (2,), torch.int32),
+        ("attn_sink", (H,), torch.float32),
+    ):
+        values[name] = torch.empty(
+            shape, dtype=dtype, device="cpu" if name == operand else "cuda"
+        )
+    with pytest.raises(ValueError, match="GPU"):
+        sparse_mla_pingpong_fwd_flydsl(**values)
+
+
+@pytest.mark.parametrize(
+    "operand", ["kv", "out", "kv_indices", "kv_indptr", "attn_sink"]
+)
+def test_pingpong_rejects_cross_device_metadata(operand, monkeypatch):
+    from types import SimpleNamespace
+
+    import aiter.ops.flydsl.sparse_mla_pp_kernels as pp
+
+    # Metadata only: do not touch or require a second physical GPU.
+    monkeypatch.setattr(pp, "_require_contract", lambda *args: (1, 32))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(
+            "device validation must precede CSR handling and compilation"
+        )
+
+    monkeypatch.setattr(pp, "_uniform_topk", forbidden)
+    monkeypatch.setattr(pp, "compile_sparse_mla_pp", forbidden)
+    monkeypatch.setattr(pp, "_run_compiled", forbidden)
+    values = {
+        name: SimpleNamespace(device=torch.device("cuda", int(name == operand)))
+        for name in ("q", "kv", "out", "kv_indices", "kv_indptr", "attn_sink")
+    }
+    with pytest.raises(ValueError, match=f"{operand} must be on the same GPU"):
+        sparse_mla_pingpong_fwd_flydsl(**values)
+
+
+@pytest.mark.parametrize(
+    "scale",
+    [1e-50, 1e-46, 2.0**-150, 2.3586576387363357e38, 3e38, 3.4028234663852886e38, 1e39],
+)
+@pytest.mark.parametrize("has_sink", [False, True])
+def test_pingpong_rejects_fp32_scale_edges(scale, has_sink, monkeypatch):
+    import aiter.ops.flydsl.sparse_mla_pp_kernels as pp
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unsupported scale reached compilation or launch")
+
+    monkeypatch.setattr(pp, "compile_sparse_mla_pp", forbidden)
+    monkeypatch.setattr(pp, "_run_compiled", forbidden)
+    q = torch.zeros(1, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.ones(32, D, dtype=torch.bfloat16, device="cuda")
+    sink = torch.zeros(H, dtype=torch.float32, device="cuda") if has_sink else None
+    with pytest.raises(ValueError, match="finite and positive in FP32"):
+        sparse_mla_pingpong_fwd_flydsl(
+            q,
+            kv,
+            _indices("shared", 1, 32, 32),
+            torch.empty_like(q),
+            softmax_scale=scale,
+            attn_sink=sink,
+        )
+
+
+@pytest.mark.parametrize("scale", [2.0**-149, 2.0**-126, 0.037, 2.3586574359122396e38])
+@pytest.mark.parametrize("has_sink", [False, True])
+def test_pingpong_representable_scale_edges(scale, has_sink, monkeypatch):
+    import struct
+
+    import aiter.ops.flydsl.sparse_mla_pp_kernels as pp
+
+    checked = struct.unpack("f", struct.pack("f", scale))[0]
+    assert pp._checked_scale(scale) == checked
+    run = pp._run_compiled
+
+    def capture(*args):
+        assert args[7] == checked  # The validated FP32 scale is the launch argument.
+        return run(*args)
+
+    monkeypatch.setattr(pp, "_run_compiled", capture)
+    q = torch.zeros(1, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.ones(32, D, dtype=torch.bfloat16, device="cuda")
+    indices = _indices("shared", 1, 32, 32)
+    sink = (
+        torch.linspace(-2, 2, H, dtype=torch.float32, device="cuda")
+        if has_sink
+        else None
+    )
+    out = sparse_mla_pingpong_fwd_flydsl(
+        q, kv, indices, torch.empty_like(q), softmax_scale=scale, attn_sink=sink
+    )
+    assert torch.isfinite(out).all()
+    ref = _torch_flat(q, kv, indices, 32, sink, checked)
+    _check_accuracy(ref.float(), out.float(), rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("n_tok", [1, 3, 7])
+@pytest.mark.parametrize("topk", [32, 64])
+@pytest.mark.parametrize("has_sink", [False, True])
+def test_pingpong_minimum_tiles_and_output_bounds(n_tok, topk, has_sink):
+    torch.manual_seed(1215)
+    q = torch.randn(n_tok, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(256, D, dtype=torch.bfloat16, device="cuda")
+    indices = _indices("random", n_tok, 256, topk)
+    sink = (
+        torch.linspace(-2, 2, H, dtype=torch.float32, device="cuda")
+        if has_sink
+        else None
+    )
+    guarded = torch.full((n_tok + 2, H, D), 42, dtype=q.dtype, device=q.device)
+    out = guarded[1:-1]
+    result = sparse_mla_pingpong_fwd_flydsl(
+        q, kv, indices, out, attn_sink=sink, kv_indptr=_indptr(n_tok, topk)
+    )
+    assert result is out
+    assert (guarded[0] == 42).all() and (guarded[-1] == 42).all()
+    ref = _torch_flat(q, kv, indices, topk, sink)
+    _check_accuracy(ref.float(), out.float(), rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("case", ["dtype", "heads", "dim", "out", "strides"])
+def test_pingpong_rejects_geometry(case):
+    q = torch.ones(1, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.ones(32, D, dtype=torch.bfloat16, device="cuda")
+    if case == "dtype":
+        q = q.float()
+    elif case == "heads":
+        q = q[:, :8]
+    elif case == "dim":
+        q = q[..., :256]
+    elif case == "strides":
+        q = q.expand(2, -1, -1)
+    out = torch.empty_like(q)
+    if case == "out":
+        out = out.float()
+    with pytest.raises((TypeError, ValueError)):
+        sparse_mla_pingpong_fwd_flydsl(q, kv, _indices("shared", 1, 32, 32), out)
+
+
+@pytest.mark.parametrize("capacity", ["tokens", "kv"])
+def test_pingpong_rejects_offset_capacity(capacity):
+    import aiter.ops.flydsl.sparse_mla_qblock_kernels as common
+
+    n_tok = common._MAX_TOKENS if capacity == "tokens" else 1
+    n_kv = common._MAX_KV_ROWS if capacity == "kv" else 32
+    # Metadata-only tensors exercise overflow rejection without huge allocations.
+    q = torch.empty(n_tok, H, D, dtype=torch.bfloat16, device="meta")
+    kv = torch.empty(n_kv, D, dtype=torch.bfloat16, device="meta")
+    indices = torch.empty(32, dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="int32 offsets"):
+        sparse_mla_pingpong_fwd_flydsl(q, kv, indices, torch.empty_like(q))
 
 
 def test_flydsl_prefill_odd_tail_sink():

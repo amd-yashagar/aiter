@@ -20,6 +20,9 @@ def selector():
 @pytest.mark.parametrize(
     "path",
     [
+        "aiter/ops/flydsl/__init__.py",
+        "aiter/ops/flydsl/sparse_mla_pp_kernels.py",
+        "aiter/ops/flydsl/kernels/sparse_mla_pp.py",
         "aiter/ops/flydsl/sparse_mla_qblock_kernels.py",
         "aiter/ops/flydsl/kernels/sparse_mla_qblock.py",
         "op_tests/test_sparse_mla_qblock.py",
@@ -40,6 +43,9 @@ def test_sparse_mla_selection(selector, path):
 @pytest.mark.parametrize(
     "path,expected",
     [
+        ("aiter/ops/flydsl/__init__.py", "true"),
+        ("aiter/ops/flydsl/sparse_mla_pp_kernels.py", "true"),
+        ("aiter/ops/flydsl/kernels/sparse_mla_pp.py", "true"),
         ("aiter/ops/flydsl/kernels/sparse_mla_qblock.py", "true"),
         ("aiter/ops/flydsl/sparse_mla_qblock_kernels.py", "true"),
         ("aiter/ops/triton/attention/pa_decode_sparse.py", "true"),
