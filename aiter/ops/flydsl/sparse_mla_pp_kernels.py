@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942 FlyDSL absorbed sparse MLA 8-wave ping-pong host wrapper. bf16, H=16, D=512."""
+"""gfx942 FlyDSL absorbed sparse MLA PP backend host wrapper (4 full-D waves). bf16, H=16, D=512."""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ def sparse_mla_pingpong_fwd_flydsl(
     """Explicit experimental gfx942 backend; never selected automatically.
 
     BF16 contiguous q[T,16,512], kv[N,512], packed valid KV indices,
-    positive T and topk divisible by 32. Four queries per 512-thread workgroup,
+    positive T and topk divisible by 32. Four queries per 256-thread workgroup,
     64 KiB LDS; odd T is masked. Sinks affect only the denominator.
     No Q-block packing or block_q option: lists may differ between queries.
     All operands must share q's GPU. Scale and scale * LOG2E must remain

@@ -501,6 +501,28 @@ def test_pingpong_rejects_unpaired_tiles(topk):
         )
 
 
+@pytest.mark.parametrize("d_start", [0, 256])
+@pytest.mark.parametrize("topk", [32, 2048])
+@pytest.mark.parametrize("has_sink", [False, True])
+def test_pingpong_full_d_ownership(d_start, topk, has_sink):
+    # Exercise both sides of the old D-half boundary, including the LDS swizzle
+    # source bit that changes when a private row grows from 256 to 512 elements.
+    torch.manual_seed(1215)
+    n_tok, pool = 5, 8192
+    q = torch.zeros(n_tok, H, D, dtype=torch.bfloat16, device="cuda")
+    q[..., d_start : d_start + 256] = torch.randn(
+        n_tok, H, 256, dtype=torch.bfloat16, device="cuda"
+    )
+    kv = torch.randn(pool, D, dtype=torch.bfloat16, device="cuda")
+    indices = _indices("random", n_tok, pool, topk)
+    indices = indices.view(n_tok, topk).sort(dim=1).values.reshape(-1)
+    sink = torch.randn(H, dtype=torch.float32, device="cuda") if has_sink else None
+    out = torch.empty_like(q)
+    sparse_mla_pingpong_fwd_flydsl(q, kv, indices, out, attn_sink=sink)
+    ref = _torch_flat(q, kv, indices, topk, sink)
+    _check_accuracy(ref.float(), out.float(), rtol=2e-3, atol=2e-3)
+
+
 def test_pingpong_rejects_arch_and_index_span(monkeypatch):
     import aiter.ops.flydsl.sparse_mla_pp_kernels as pp
     import aiter.ops.flydsl.sparse_mla_qblock_kernels as common
