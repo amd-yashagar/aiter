@@ -364,7 +364,10 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                     # warp_v absorbs the wave's rows; row it is an immediate.
                     _lds_store(fx.Vector(frags[it]), kv_tile[fx.crd2idx((it, warp_v), gather_rows), lane, None], VEC)
 
-        def _k_a(pr):
+        def _k_a(pr, frags):
+            if const_expr(ONE_Q):
+                # Per-lane gathers already have the MFMA A fragment layout.
+                return _halves(frags[pr], halves)
             # A operands for MFMAs 2pr, 2pr+1: K[token = lane_row][d of q_frags[pr]].
             sub, blk = _py(fx.get_flat_coord(pr, k_pairs))
             k_op = (storage.kv.ptr + fx.crd2idx((qk_w, blk, 0), k_cols)).view(k_rows)
@@ -434,7 +437,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
             fx.rocdl.s_setprio(1)
             for b in range_constexpr(_ext(qk_batches, 1)):
                 pairs = [_py(fx.crd2idx((p, b), qk_batches)) for p in range_constexpr(_ext(qk_batches, 0))]
-                buf = [_k_a(pr) for pr in pairs]
+                buf = [_k_a(pr, prefetched) for pr in pairs]
                 fx.rocdl.sched_barrier(0)
                 for pr, k in zip(pairs, buf):
                     for h in range_constexpr(HALVES):
