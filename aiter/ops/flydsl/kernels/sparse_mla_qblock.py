@@ -340,7 +340,14 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
             fx.copy(atom, idx_lane, r)
             return fx.Int32(fx.Vector(r.load())[0])
 
+        def _gather_chunk(pr):
+            # Lane (r, g) loads row idx[r], D-half warp, 16 B per QK pair.
+            return warp * fx.Int32(QK_PAIRS * 4) + fx.Int32(pr * 4) + lane_g
+
         def _gather(idx_vec):
+            if const_expr(ONE_Q):
+                return [kv_g[idx_vec, _gather_chunk(pr), None].load()
+                        for pr in range_constexpr(QK_PAIRS)]
             frags = []
             for it in range_constexpr(N_GATHER):
                 lane_sel = fx.get_scalar(fx.crd2idx((it, warp), gather_rows))
@@ -349,9 +356,13 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
             return frags
 
         def _store_kv(frags):
-            for it in range_constexpr(N_GATHER):
-                # warp_v (VGPR): the lane base absorbs the wave's rows, so row `it` is an immediate.
-                _lds_store(fx.Vector(frags[it]), kv_tile[fx.crd2idx((it, warp_v), gather_rows), lane, None], VEC)
+            if const_expr(ONE_Q):
+                for pr in range_constexpr(QK_PAIRS):
+                    _lds_store(fx.Vector(frags[pr]), kv_tile[lane_row, _gather_chunk(pr), None], VEC)
+            else:
+                for it in range_constexpr(N_GATHER):
+                    # warp_v absorbs the wave's rows; row it is an immediate.
+                    _lds_store(fx.Vector(frags[it]), kv_tile[fx.crd2idx((it, warp_v), gather_rows), lane, None], VEC)
 
         def _k_a(pr):
             # A operands for MFMAs 2pr, 2pr+1: K[token = lane_row][d of q_frags[pr]].

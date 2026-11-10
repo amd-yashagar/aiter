@@ -78,6 +78,13 @@ def test_sparse_mla_qblock(n_tok, num_heads, head_dim, topk, pool, pattern, dtyp
         return sparse_mla_qblock_fwd_flydsl(q, kv, indices, out_qb, kv_indptr=kv_indptr)
 
     candidates = {"flydsl_one_q": _flydsl_one_q, "flydsl_qblock": _flydsl_qblock}
+    # Exercise both real Q-block specializations (including the T=7 pad tail),
+    # rather than only the heuristic's BQ4 choice for identical sparse lists.
+    if pattern == "shared":
+        for bq in (2, 4):
+            candidates[f"flydsl_bq{bq}"] = lambda bq=bq: sparse_mla_qblock_fwd_flydsl(
+                q, kv, indices, out_qb, kv_indptr=kv_indptr, block_q=bq
+            )
     if topk % 32 == 0:
         out_pp = torch.empty_like(q)
         candidates["flydsl_pingpong"] = lambda: sparse_mla_pingpong_fwd_flydsl(
