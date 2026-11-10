@@ -3,8 +3,9 @@
 
 """gfx942 FlyDSL absorbed sparse MLA.
 
-One CTA, two modes. BLOCK_Q==1 uses two waves that split D. BLOCK_Q==2/4 uses
-one wave per query for QK and softmax over a shared KV tile, then each wave
+One CTA, two modes. BLOCK_Q==1 uses a D-split wave pair per independent
+query (two queries per CTA for prefill, one otherwise). BLOCK_Q==2/4 uses one
+wave per query for QK and softmax over a shared KV tile, then each wave
 computes a D/BLOCK_Q slice of the output for every query. Both modes:
 
 * gather the next 16 KV rows with coalesced dwordx4 loads while the current
@@ -144,25 +145,29 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
     HAS_SINK = bool(has_sink)
     ONE_Q = BLOCK_Q == 1
     PREFILL = bool(prefill)
-    # The bf16 one-query path uses two waves to split the 512-wide contraction
-    # and output. Q-block keeps one wave per query over a shared KV tile.
-    NWARP = 2 if ONE_Q else BLOCK_Q
+    # Each one-query pair splits the 512-wide contraction and output. Prefill
+    # groups two pairs to bound tile-progress drift while retaining two CTAs/CU.
+    # The queries keep independent sparse lists and private LDS regions.
+    # Q-block keeps one wave per query over a shared KV tile.
+    TOKENS_PER_WG = 2 if ONE_Q and PREFILL else 1
+    NWARP = 2 * TOKENS_PER_WG if ONE_Q else BLOCK_Q
     # arithmetic: the launch shape is needed before tracing, where no layout exists yet
     BLOCK_THREADS = NWARP * WAVE
     BLOCK_K = 16
     # D splits into 16-wide MFMA tiles: QK over NQK waves (one-query), PV over NPV waves.
     # Q-block: each wave owns a D/NWARP slice of the output for every query,
     # so one V^T operand feeds BLOCK_Q MFMAs; P^T and alpha go through LDS.
-    NQK = NWARP if ONE_Q else 1
-    NPV = NWARP
+    NQK = 2 if ONE_Q else 1
+    NPV = 2 if ONE_Q else NWARP
     QK_BATCH = QK_BATCH_PAIRS_ONE_Q if ONE_Q else QK_BATCH_PAIRS_QBLOCK
     IDX_AHEAD = 0 if ONE_Q else IDX_AHEAD_QBLOCK
     module_name = (
         f"sparse_mla_mfma_bq{BLOCK_Q}_sink{int(HAS_SINK)}_d{HEAD_DIM}_h{NUM_HEADS}"
-        f"{'_prefill' if PREFILL else ''}"
+        f"{'_prefill_g2' if ONE_Q and PREFILL else '_prefill' if PREFILL else ''}"
     )
 
-    # One-query fits 16 KB (4 CTAs/CU on gfx942): unpadded rows with the 16-B
+    # One-query uses 16 KiB/query: 32 KiB and two CTAs/CU for prefill,
+    # 16 KiB and four CTAs/CU otherwise. Rows are unpadded with the 16-B
     # column XORed by row & 7. Q-block keeps the padded row plus the exchange.
     SWZ = ONE_Q
     LD = HEAD_DIM if SWZ else LD_KV
@@ -223,7 +228,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         acc_l = _colmajor(H4, PV_GROUPS, 1 if ONE_Q else BLOCK_Q)
         N_ACC = _py(fx.size(acc_l))
         # this wave's gather rows: (row it, wave) -> KV-tile row
-        gather_rows = fx.zipped_divide(fx.make_layout(BLOCK_K, 1), (_py(fx.ceil_div(BLOCK_K, NWARP)),))
+        gather_rows = fx.zipped_divide(fx.make_layout(BLOCK_K, 1), (_py(fx.ceil_div(BLOCK_K, NQK if ONE_Q else NWARP)),))
         N_GATHER = _ext(gather_rows, 0)
 
         tid = fx.Int32(gpu.thread_id("x"))
@@ -244,13 +249,9 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         # Q-block: token of (query j, tile)
         tokens = _colmajor(BLOCK_Q, BIG)
         if const_expr(ONE_Q and PREFILL):
-            # Interleave eight contiguous token runs. The resulting locality
-            # is measured on gfx942; a block-to-XCD placement is not assumed.
-            per = fx.get_scalar(fx.size(fx.get_(fx.get_shape(
-                fx.zipped_divide(_rowmajor(1, n_tok_i), (1, 8))
-            ), [1, 1])))
-            group_pos = fx.idx2crd(tile, _colmajor(8, BIG))
-            t_idx = fx.get_scalar(fx.crd2idx(group_pos, _rowmajor(8, per)))
+            # Two independent queries advance through their sparse lists together.
+            # This bounds intra-CU tile drift, without assuming WG-to-XCD placement.
+            t_idx = tile * fx.Int32(TOKENS_PER_WG) + warp // fx.Int32(2)
         elif const_expr(ONE_Q):
             t_idx = tile
         else:
@@ -258,7 +259,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         live = t_idx < n_tok_i
         # A dead Q-block wave (past the last token) reads token 0's Q; its P is zeroed below.
         q_row = live.select(t_idx, fx.Int32(0))
-        qk_w = warp if const_expr(ONE_Q) else fx.Int32(0)
+        qk_w = warp % fx.Int32(2) if const_expr(ONE_Q) else fx.Int32(0)
 
         # ---- memory layouts: every address below is a coordinate into one of these (elements)
         # q[token, head, qk wave, pair, k-group, 8]: MFMAs 2p, 2p+1 from one 16-B load
@@ -283,7 +284,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         if const_expr(ONE_Q):
             @fx.struct
             class SharedStorage:
-                kv: fx.Array[fx.BFloat16, _py(fx.cosize(kv_tile_l)), 16]
+                kv: fx.Array[fx.BFloat16, TOKENS_PER_WG * _py(fx.cosize(kv_tile_l)), 16]
         else:
             @fx.struct
             class SharedStorage:
@@ -296,7 +297,10 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         # (qk wave, pair // 2); V^T rows: [(e, k-group), lane_row, 4] (token 4 k-group + e) at
         # block (pv wave, group).
         rows = fx.make_layout(BLOCK_K, LD)
-        kv_tile = storage.kv.view(_swz(kv_tile_l))
+        kv_base = storage.kv.ptr
+        if const_expr(ONE_Q):
+            kv_base = fx.add_offset(kv_base, (warp // fx.Int32(2)) * fx.Int32(BLOCK_K * HEAD_DIM))
+        kv_tile = kv_base.view(_swz(kv_tile_l))
         k_cols = _rowmajor(NQK, _ext(k_pairs, 1), 64)
         k_in = _rowmajor(2, 4, VEC)  # (pair % 2, k-group, 8) within a row
         k_rows = _swz(fx.make_layout((BLOCK_K, fx.get_shape(k_in)), (LD, fx.get_stride(k_in))))
@@ -304,7 +308,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         vt_tok = fx.flat_divide(rows, (4,))  # token (e, k-group) -> row offset
         vt_rows = _swz(fx.make_layout((fx.get_shape(vt_tok), 16, 4), (fx.get_stride(vt_tok), 4, 1)))
         # one-query QK partials [(lane % 32, lane // 32), wave, 8], over the V^T rows already read
-        part = storage.kv.view(fx.make_ordered_layout(((32, 2), NWARP, VEC), ((1, 3), 2, 0)))
+        part = kv_base.view(fx.make_ordered_layout(((32, 2), NQK, VEC), ((1, 3), 2, 0)))
         # wave w's peer, 1 - w (one-query: two waves)
         peer_of = fx.make_composed_layout(fx.make_layout(2, 1), 1, fx.make_layout(2, -1))
         # Q-block: (m, l) per lane after the loop [wave, lane, 4], and the P^T/alpha exchange [wave, lane, 8]
@@ -320,7 +324,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         zero_f = fx.Float32(arith.constant(0.0, type=T.f32))
         one_f = fx.Float32(arith.constant(1.0, type=T.f32))
         idx_row = q_row if const_expr(ONE_Q) else tile
-        pv_w = warp
+        pv_w = qk_w if const_expr(ONE_Q) else warp
         mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
 
         # QK pairs MFMAs 2p, 2p+1 over one 16-B load per lane: lane (g, s)
@@ -341,8 +345,8 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
             return fx.Int32(fx.Vector(r.load())[0])
 
         def _gather_chunk(pr):
-            # Lane (r, g) loads row idx[r], D-half warp, 16 B per QK pair.
-            return warp * fx.Int32(QK_PAIRS * 4) + fx.Int32(pr * 4) + lane_g
+            # Lane (r, g) loads row idx[r], D-half qk_w, 16 B per QK pair.
+            return qk_w * fx.Int32(QK_PAIRS * 4) + fx.Int32(pr * 4) + lane_g
 
         def _gather(idx_vec):
             if const_expr(ONE_Q):
@@ -370,11 +374,11 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                 return _halves(frags[pr], halves)
             # A operands for MFMAs 2pr, 2pr+1: K[token = lane_row][d of q_frags[pr]].
             sub, blk = _py(fx.get_flat_coord(pr, k_pairs))
-            k_op = (storage.kv.ptr + fx.crd2idx((qk_w, blk, 0), k_cols)).view(k_rows)
+            k_op = (kv_base + fx.crd2idx((qk_w, blk, 0), k_cols)).view(k_rows)
             return _halves(_lds_load(k_op[lane_row, (sub, lane_g, None)], VEC), halves)
 
         def _vt_rows(g):
-            vt_op = (storage.kv.ptr + fx.crd2idx((pv_w, g, 0), vt_cols)).view(vt_rows)
+            vt_op = (kv_base + fx.crd2idx((pv_w, g, 0), vt_cols)).view(vt_rows)
             return [_lds_load(vt_op[(e, lane_g), lane_row, None], 4) for e in range_constexpr(4)]
 
         def _vt_group(g, raw=None):
@@ -454,9 +458,9 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
                 # rows 0-1 of the same D half (LDS ops retire in order per wave).
                 v_raw = [_vt_rows(g) for g in range_constexpr(PV_GROUPS)]
 
-                part[lane, warp, None].store(fx.Vector(s_acc).bitcast(fx.BFloat16))
+                part[lane, qk_w, None].store(fx.Vector(s_acc).bitcast(fx.BFloat16))
                 gpu.barrier()
-                peer_w = fx.get_scalar(fx.crd2idx(warp, peer_of))
+                peer_w = fx.get_scalar(fx.crd2idx(qk_w, peer_of))
                 peer = fx.Vector(part[lane, peer_w, None].load()).bitcast(fx.Float32)
                 s_acc = fx.Vector.from_elements(
                     [_elem(s_acc, i) + peer[i] for i in range_constexpr(4)], fx.Float32
@@ -601,7 +605,7 @@ def compile_sparse_mla_qblock(block_q, has_sink=False, prefill=False):
         n_tiles: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_blocks = (n_tiles + 7) // 8 * 8 if const_expr(ONE_Q and PREFILL) else n_tiles
+        grid_blocks = (n_tiles + TOKENS_PER_WG - 1) // TOKENS_PER_WG if const_expr(ONE_Q) else n_tiles
         sparse_mla_qblock_kernel(
             q_ptr,
             kv_ptr,

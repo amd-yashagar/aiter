@@ -210,7 +210,10 @@ def sparse_mla_one_query_fwd_flydsl(
     uniform_topk: int | None = None,
     verify_csr: bool = True,
 ):
-    """One CTA per query. `uniform_topk` must describe a packed CSR."""
+    """Independent per-query wave pairs; prefill groups two queries per CTA.
+
+    `uniform_topk` must describe a packed CSR.
+    """
     _require_gfx942()
     n_tok, _n_kv = _require_contract(q, kv, out)
     flat, topk = _uniform_topk(
