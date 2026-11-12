@@ -20,6 +20,7 @@ MAX_WARM_ITERS = 200
 MIN_ITERS = 50
 MIN_MS = 200.0
 MAX_ITERS = 5000
+EVENT_CHUNK = 100  # thousands of queued events and replays segfault torch.cuda.Event.record on gfx950
 
 
 class Timer:
@@ -72,16 +73,21 @@ class Timer:
             self.hidden_static.copy_(self.hidden_pool[i % len(self.hidden_pool)])
 
     def _measure(self, n, cold):
-        starts = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
-        ends = [torch.cuda.Event(enable_timing=True) for _ in range(n)]
-        for i in range(n):
-            if cold:
-                self._prepare_cold(i)
-            starts[i].record()
-            self.replay()
-            ends[i].record()
-        torch.cuda.synchronize()
-        return [s.elapsed_time(e) * 1000.0 for s, e in zip(starts, ends)]
+        out = []
+        chunk = EVENT_CHUNK
+        for lo in range(0, n, chunk):
+            m = min(chunk, n - lo)
+            starts = [torch.cuda.Event(enable_timing=True) for _ in range(m)]
+            ends = [torch.cuda.Event(enable_timing=True) for _ in range(m)]
+            for i in range(m):
+                if cold:
+                    self._prepare_cold(lo + i)
+                starts[i].record()
+                self.replay()
+                ends[i].record()
+            torch.cuda.synchronize()
+            out += [s.elapsed_time(e) * 1000.0 for s, e in zip(starts, ends)]
+        return out
 
     def time(self, cold=False, quick=False):
         """Warm up until stable, then time. Returns a dict of stats in microseconds.
