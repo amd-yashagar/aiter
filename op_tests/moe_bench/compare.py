@@ -237,6 +237,11 @@ def gpu_key(name):
 ACC_GATE = [f"{ref}_{k}" for ref in ("path", "exact") for k in ("rel_l2", "max_norm")]
 
 
+def _same_rounding(a, b):
+    """Equal act_quant and inter; ``combine`` is not modeled by the references."""
+    return bool(a) and bool(b) and a.split(";")[:2] == b.split(";")[:2]
+
+
 def acc_ok(bar, new):
     """Accuracy rule of the plan: mean(new) <= mean(bar) + 2 * std(bar) + 1% of mean(bar)
     for rel_l2 and max_norm (mean and std over seeds and repeats). When the new kernel's
@@ -247,9 +252,7 @@ def acc_ok(bar, new):
     """
     if str(new.get("new_acc_pass", "")) != "True":
         return (None if new.get("new_acc_pass", "") == "" else False), ""
-    same = bool(bar.get("bar_numerics")) and bar.get("bar_numerics") == new.get(
-        "new_numerics"
-    )
+    same = _same_rounding(bar.get("bar_numerics"), new.get("new_numerics"))
     form = "both" if same else "exact"
     names = ACC_GATE if same else [n for n in ACC_GATE if n.startswith("exact_")]
     ok = True

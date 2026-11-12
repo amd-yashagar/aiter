@@ -68,6 +68,17 @@ def _is_gpu_fault(msg):
     )
 
 
+def _declared_numerics(moe, last_route, kid):
+    """Numerics of the kernel that served the last call: ``last_route().numerics``, else
+    ``aiter.moe.numerics(id)``; None when aiter's own path served it."""
+    if kid in ("", "aiter"):
+        return None
+    declared = getattr(last_route, "numerics", None)
+    if declared is None and hasattr(moe, "numerics"):
+        declared = moe.numerics(kid)
+    return declared
+
+
 def _parse_route(v):
     """aiter.moe.last_route() -> (kernel id or "aiter", reason). Tuple, dict or str."""
     if v is None:
@@ -95,6 +106,7 @@ class RoutedFusedMoe(DispatchCandidate):
         self.kernel_id = ""
         self.reason = ""
         self.route_changed = False
+        self.declared_numerics = None  # None: aiter's own path served the call
 
     def probe_route(self, stage):
         """Record the route of the last call: after the eager call and after capture.
@@ -102,9 +114,12 @@ class RoutedFusedMoe(DispatchCandidate):
         try:
             from aiter import moe
 
-            kid, reason = _parse_route(moe.last_route())
+            lr = moe.last_route()
+            kid, reason = _parse_route(lr)
+            declared = _declared_numerics(moe, lr, kid)
         except Exception:  # noqa: BLE001  (tree without aiter.moe)
             return
+        self.declared_numerics = declared
         if stage == "capture" and self.kernel_id and kid != self.kernel_id:
             self.route_changed = True
         self.kernel_id, self.reason = kid, reason
@@ -190,11 +205,22 @@ class Measurer:
                     base, modes, status="no-reference", detail=self.acc_err or ""
                 )
                 return res
-            num = accuracy.numerics_of(ctx.S, cand, route)
+            num = accuracy.numerics_of(ctx.S, cand, route, ctx)
             nkey = accuracy.numerics_key(num)
             base["numerics"] = nkey
             res["numerics"] = nkey
-            refs = self.refs_for(num)
+            try:
+                refs = self.refs_for(num)
+            except NotImplementedError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                self._emit(
+                    base,
+                    modes,
+                    status="no-reference",
+                    detail=f"reference error (not the candidate): {_err(e)}",
+                )
+                return res
             acc = accuracy.evaluate(
                 ctx.S,
                 ctx,
@@ -371,6 +397,7 @@ def run_bar_group(cases, spec, fh):
     ident = _gpu_identity()
     specs = {c.id: workload.resolve(c) for c in cases}
     live = []
+    dry_routes = {}
     for c in cases:
         want = [m for m in c.modes if m in modes_req] or ["warm"]
         st = dispatch_status.get(c.id)
@@ -388,6 +415,7 @@ def run_bar_group(cases, spec, fh):
                 )
             continue
         r = routes.dry_route(c, specs[c.id])
+        dry_routes[c.id] = r
         if r.get("route_error") and mode_kind == "bar":
             for m in want:
                 emit(
@@ -466,6 +494,7 @@ def run_bar_group(cases, spec, fh):
             c, S, aw, bias, mask, hidden, tw, ti, nlt, n_valid, kw, tmpdir
         )
         ctx.dispatch_meta = ident
+        ctx.dispatch_route = dry_routes.get(c.id)
         ctx.group_cache = group_cache
         ctx.hidden_static = hidden.clone()
         ctx.outbuf = (

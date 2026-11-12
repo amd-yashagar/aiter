@@ -128,6 +128,16 @@ def _path_quant(S, x, scale=None):
         raise NotImplementedError(
             "ref_path for MX activation quant (a4w4/a8w4/mxfp8) is not implemented"
         )
+    if x.dtype == torch.float32:
+        # the HIP quant kernels take bf16/fp16; fp32 aborts inside the op. fp32 here
+        # is the fp32_direct intermediate (an in-kernel quantize of fp32 accumulators),
+        # which aiter's torch quant reproduces.
+        quant = aiter.get_torch_quant(qT)
+        return (
+            quant(x, scale=scale, quant_dtype=S.aq)
+            if scale is not None
+            else quant(x, quant_dtype=S.aq)
+        )
     quant = aiter.get_hip_quant(qT)
     return quant(x, scale=scale, quant_dtype=S.aq)
 
@@ -218,44 +228,139 @@ def _local_ids(ti, mask):
     return local[ti.long()].to(torch.int32)
 
 
-DEFAULT_NUMERICS = {"act": "hip", "inter": "bf16"}
+ACT_QUANT = ("none", "per_token_fp8", "per_1x128_fp8", "mx_fp4", "mx_fp8")
+INTER = ("bf16", "fp32_direct")  # or bf16_then_<quant>
+COMBINE = ("bf16_atomic", "fp32_reduce")
+
+
+class NumericsError(ValueError):
+    """A kernel's declared numerics are not in core's vocabulary or do not fit the case."""
+
+
+def quant_name(S):
+    """Core's name for the activation quant the case's quant type implies (None: none)."""
+    import aiter
+
+    q = S.qtype
+    if q == aiter.QuantType.per_Token:
+        return "per_token_fp8"
+    if q == aiter.QuantType.per_1x128:
+        return "per_1x128_fp8"
+    if q == aiter.QuantType.per_Tensor:
+        return "per_tensor_fp8"
+    if q == aiter.QuantType.per_1x32:
+        from aiter import dtypes
+
+        if S.aq == dtypes.fp4x2:
+            return "mx_fp4"
+        if S.aq == dtypes.fp8:
+            return "mx_fp8"
+    return None
+
+
+def normalize_numerics(S, declared, derived=False):
+    """Validate a declared numerics dict against core's vocabulary and the case.
+
+    Core's keys: ``act_quant`` (none, per_token_fp8, per_1x128_fp8, mx_fp4, mx_fp8),
+    ``inter`` (bf16, fp32_direct, bf16_then_<quant>) and ``combine`` (bf16_atomic,
+    fp32_reduce). Anything else raises NumericsError: a guess would score the kernel
+    against the wrong reference. ``per_tensor_fp8`` is accepted for per-tensor cases
+    (aiter paths round there; core has no name for it yet). ``combine`` is recorded and
+    validated but not modeled: the references sum in fp64.
+    """
+    if not isinstance(declared, dict):
+        raise NumericsError(f"numerics must be a dict, got {declared!r}")
+    allowed_keys = {"act_quant", "inter", "combine", "source"}
+    extra = set(declared) - allowed_keys
+    if extra:
+        raise NumericsError(
+            f"unknown numerics key(s) {sorted(extra)}; core's keys are "
+            "act_quant, inter, combine"
+        )
+    missing = [k for k in ("act_quant", "inter", "combine") if k not in declared]
+    if missing:
+        raise NumericsError(f"numerics missing {missing}: {declared!r}")
+    qn = quant_name(S)
+    quants = set(ACT_QUANT) | ({qn} if qn else set())
+    act, inter, comb = declared["act_quant"], declared["inter"], declared["combine"]
+    if act not in quants:
+        raise NumericsError(f"unknown act_quant {act!r}; core knows {ACT_QUANT}")
+    if act not in ("none", qn):
+        raise NumericsError(
+            f"act_quant {act!r} does not fit this case (quant type implies {qn!r})"
+        )
+    if inter not in INTER:
+        if not (isinstance(inter, str) and inter.startswith("bf16_then_")):
+            raise NumericsError(
+                f"unknown inter {inter!r}; core knows {INTER} and bf16_then_<quant>"
+            )
+        q = inter[len("bf16_then_") :]
+        if q not in quants or q == "none" or q != qn:
+            raise NumericsError(
+                f"inter {inter!r} does not fit this case (quant type implies {qn!r})"
+            )
+    if comb not in COMBINE and not (derived and comb == "n/a"):
+        raise NumericsError(f"unknown combine {comb!r}; core knows {COMBINE}")
+    return {"act_quant": act, "inter": inter, "combine": comb}
 
 
 def numerics_key(n):
-    n = dict(DEFAULT_NUMERICS, **(n or {}))
-    return f"act={n['act']};inter={n['inter']}"
+    return f"act_quant={n['act_quant']};inter={n['inter']};combine={n['combine']}"
 
 
-def numerics_of(S, cand, route):
-    """Rounding points of the path that serves a candidate (the ref_path it is scored on).
+def same_rounding(key_a, key_b):
+    """Equal act_quant and inter (``combine`` is not modeled by the references)."""
+    if not key_a or not key_b:
+        return False
+    return key_a.split(";")[:2] == key_b.split(";")[:2]
 
-    ``act``: ``hip`` = activations quantized with aiter's ``get_hip_quant``, ``none`` =
-    bf16 activations into the GEMM. ``inter``: ``bf16`` = stage-1 output rounded to the
-    output dtype, then re-quantized (CK 2-stage, torch_moe_stage1); ``fp32`` = quantized
-    from the fp32 accumulators in-kernel (ASM 1-stage, MXMOE g1); ``none`` = bf16
-    intermediate, no quantization (a16 paths, gfx942 FlyDSL whole-graph decode).
-    New kernels declare their own ``numerics`` class attribute; aiter candidates are
-    mapped from the route:
 
-    * CK 2-stage, ck_tile, ASM stage1 + CK, FlyDSL stage pairs: act hip, inter bf16
-    * ASM 1-stage: act none for the a16/xbf16 kernels, else hip; inter fp32
-    * FlyDSL whole-graph (impl__flydsl_gfx942): act none, inter none
-    * MXMOE: act hip, inter fp32
+def numerics_from_route(S, route):
+    """Rounding points of the aiter path that served a call (the ref_path it is scored on).
+
+    * CK 2-stage, ck_tile, ASM stage1 + CK, FlyDSL stage pairs: act quantized, stage-1
+      output rounded to bf16 and then quantized (bf16_then_<quant>)
+    * ASM 1-stage: act none for the a16/xbf16 kernels, else quantized; fp32_direct
+    * FlyDSL whole-graph (impl__flydsl_gfx942): act none, bf16 intermediate unquantized
+    * MXMOE: act quantized, fp32_direct
     """
-    declared = getattr(cand, "numerics", None)
-    if isinstance(declared, dict) and declared:
-        return dict(DEFAULT_NUMERICS, **declared)
     route = route or {}
+    qn = quant_name(S) or "none"
+    then = f"bf16_then_{qn}" if qn != "none" else "bf16"
     full = route.get("full_impl", "") or ""
     k1 = route.get("kernel1", "") or ""
     if "flydsl_gfx942" in full:
-        return {"act": "none", "inter": "none"}
-    if route.get("stages") == "1-stage" or str(route.get("backend1", "")) == "asm":
+        act, inter = "none", "bf16"
+    elif route.get("stages") == "1-stage" or str(route.get("backend1", "")) == "asm":
         a16 = bool(route.get("flat")) or "a16" in k1 or "xbf16" in k1
-        return {"act": "none" if a16 else "hip", "inter": "fp32"}
-    if k1.startswith("flydsl_mxmoe"):
-        return {"act": "hip", "inter": "fp32"}
-    return dict(DEFAULT_NUMERICS)
+        act, inter = ("none" if a16 else qn), "fp32_direct"
+    elif k1.startswith("flydsl_mxmoe"):
+        act, inter = qn, "fp32_direct"
+    else:
+        act, inter = qn, then
+    return {"act_quant": act, "inter": inter, "combine": "n/a"}
+
+
+def numerics_of(S, cand, route, ctx=None):
+    """Rounding points to score a candidate on.
+
+    A new kernel that served the call declares them (read from ``last_route()`` by the
+    candidate); {"same_as": ...} means the dispatched aiter path's. A call that fell
+    back to aiter (declined, or the off pass) is scored on the path that actually ran,
+    taken from the route recorded during the call.
+    """
+    declared = getattr(cand, "declared_numerics", None)
+    if declared is None:
+        return numerics_from_route(S, route)
+    if "same_as" in declared:
+        base = getattr(ctx, "dispatch_route", None)
+        if not base:
+            raise NumericsError(
+                "kernel declares same_as the dispatched path but the case's "
+                "dispatch route is unknown"
+            )
+        return numerics_from_route(S, base)
+    return normalize_numerics(S, declared)
 
 
 def exact_ref(S, ref_w, bias, hidden, tw, ti, mask, rows):
@@ -283,17 +388,28 @@ def exact_ref(S, ref_w, bias, hidden, tw, ti, mask, rows):
 def path_ref(S, ref_w, bias, hidden, tw, ti, mask, rows, numerics=None):
     """ref_path at the given rounding points (see ``numerics_of``), fp64 elsewhere.
 
-    Raises NotImplementedError where aiter's activation quant is not reproduced (MX).
+    ``numerics`` is a normalized dict (act_quant, inter, combine); None means the CK
+    2-stage path. Raises NotImplementedError where aiter's activation quant is not
+    reproduced (MX), NumericsError for values outside core's vocabulary.
     """
     import aiter
 
-    n = dict(DEFAULT_NUMERICS, **(numerics or {}))
+    n = numerics_from_route(S, {}) if numerics is None else numerics
+    n = normalize_numerics(S, n, derived=n.get("combine") == "n/a")
+    act_none = n["act_quant"] == "none"
+    inter = n["inter"]
+    if n["act_quant"].startswith("mx_") or inter.endswith(("mx_fp4", "mx_fp8")):
+        raise NotImplementedError(
+            "ref_path for MX activation quant (a4w4/a8w4/mxfp8) is not implemented"
+        )
+    qn = quant_name(S)
+    quant_inter = qn is not None and inter != "bf16"
     E = S.E_local
     ids = _local_ids(ti, mask)
     h_rows, tw_rows, ids_rows = hidden[rows], tw[rows], ids[rows]
     r = len(rows)
     with fp64_math():
-        if n["act"] == "none":
+        if act_none:
             a1q, a1s = h_rows, _ones_scale(S, r, S.D)
         else:
             a1q_all, a1s_all = _path_quant(S, hidden)
@@ -305,22 +421,20 @@ def path_ref(S, ref_w, bias, hidden, tw, ti, mask, rows, numerics=None):
                 a1q, a1s = a1q_all[rows], a1s_all[rows]
             del a1q_all
         out1 = _stage1(S, ref_w, bias, a1q, a1s, tw_rows, ids_rows, E)
-        flat_src = out1 if n["inter"] == "fp32" else out1.to(S.dtype)
-        flat = flat_src.reshape(r * S.topk, S.I)
-        if n["inter"] == "none" or S.qtype in (aiter.QuantType.No,):
+        flat = _inter_values(S, out1, inter).reshape(r * S.topk, S.I)
+        if not quant_inter or S.qtype in (aiter.QuantType.No,):
             a2q = flat.reshape(r, S.topk, S.I)
             a2s = _ones_scale3(S, r)
-            if S.qtype == aiter.QuantType.No:
-                a2s = None
         elif S.qtype == aiter.QuantType.per_Tensor:
             # the intermediate scale is a function of the whole batch
             a1q_f, a1s_f = (
                 (hidden, _ones_scale(S, hidden.shape[0], S.D))
-                if n["act"] == "none"
+                if act_none
                 else _path_quant(S, hidden)
             )
-            full = _stage1(S, ref_w, bias, a1q_f, a1s_f, tw, ids, E)
-            full = full if n["inter"] == "fp32" else full.to(S.dtype)
+            full = _inter_values(
+                S, _stage1(S, ref_w, bias, a1q_f, a1s_f, tw, ids, E), inter
+            )
             _, a2s_t = _path_quant(S, full.reshape(-1, S.I))
             a2q, a2s_f = _path_quant(S, flat, scale=a2s_t)
             a2s = a2s_f if a2s_f is not None else a2s_t
@@ -331,6 +445,13 @@ def path_ref(S, ref_w, bias, hidden, tw, ti, mask, rows, numerics=None):
             a2s = None if a2s_f is None else a2s_f.reshape(r, S.topk, -1)
             a2q = a2q.reshape(r, S.topk, S.I)
         return _stage2(S, ref_w, bias, a2q, a2s, tw_rows, ids_rows, E)
+
+
+def _inter_values(S, out1, inter):
+    """Stage-1 output as the kernel hands it on: fp32 for fp32_direct, else rounded to
+    the output dtype. Never fp64: aiter's quant ops take at most fp32, and the kernels
+    that quantize in-kernel see fp32 accumulators anyway."""
+    return out1.float() if inter == "fp32_direct" else out1.to(S.dtype)
 
 
 def _ones_scale3(S, r):
