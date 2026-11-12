@@ -4330,6 +4330,16 @@ def _can_reroute_bf16_to_a16wmix(
     return _swiglu_limit_is_active(swiglu_limit)
 
 
+def _require_gated_2stage(use_g1u1, keys):
+    if not use_g1u1:
+        raise NotImplementedError(
+            "No 2-stage MoE kernel supports non-gated (g1u0) weights for "
+            f"{keys}: the CK and asm stage-1 kernels compute gate and up together "
+            "and would return wrong results. Use a quantization with a 1-stage "
+            "g1u0 kernel (bf16/fp16 no-quant, int8 per-token) or g1u1 weights."
+        )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -5133,6 +5143,10 @@ def get_2stage_cfgs(
                 run_1stage = token > 16 or inter_dim % 128 != 0
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
+            if not use_g1u1:
+                # Stage 1 of the CK and asm 2-stage paths is gate+up only, so g1u0
+                # has no 2-stage path: the 1-stage kernel serves every token count.
+                run_1stage = True
 
         block_m = (
             BLOCK_SIZE_M
@@ -5941,6 +5955,8 @@ def get_2stage_cfgs(
                     "CK blockscale Swiglu clamps at 7.0; "
                     f"swiglu_limit={swiglu_limit} is not supported."
                 )
+
+        _require_gated_2stage(use_g1u1, keys)
         if kernelName2 and kernelName2.startswith("flydsl_"):
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
@@ -5989,6 +6005,8 @@ def get_2stage_cfgs(
             run_1stage,
             **route_bucket_metadata,
         )
+
+    _require_gated_2stage(use_g1u1, keys)
 
     # TODO: remove when stage2 support more size
     tmpList = [16, 32, 64, 128]
