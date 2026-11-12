@@ -29,8 +29,11 @@ class TileMap:
 
     ``live_tiles[t] = (local expert id, first sorted row, real rows)`` for
     ``t < num_live_tiles[0]``; rows ``>= num_valid_ids[0]`` and tiles
-    ``>= num_live_tiles[0]`` hold garbage. ``ready_flags`` is reserved for a
-    single persistent launch over both stages (not allocated today).
+    ``>= num_live_tiles[0]`` hold garbage. ``loc_ids[t * topk + k]`` (when
+    requested) is route (t, k)'s sorted row, -1 for a dropped route (masked,
+    -1 id, or a repeated expert's earlier slot); tokens at or past the token
+    count are not written. ``ready_flags`` is reserved for a single persistent
+    launch over both stages (not allocated today).
     """
 
     tile_m: int
@@ -40,6 +43,7 @@ class TileMap:
     num_valid_ids: torch.Tensor
     live_tiles: torch.Tensor
     num_live_tiles: torch.Tensor
+    loc_ids: torch.Tensor | None = None
     ready_flags: torch.Tensor | None = None
 
     @property
@@ -96,6 +100,7 @@ def route_to_tiles(
     expert_mask: torch.Tensor | None = None,
     num_local_tokens: torch.Tensor | None = None,
     zero_output: torch.Tensor | None = None,
+    with_loc_ids: bool = False,
 ) -> TileMap:
     """Sort routes into tiles of ``tile_m`` rows and zero ``zero_output``'s rows
     below the token count (``num_local_tokens`` when given), as aiter's sort does.
@@ -128,6 +133,9 @@ def route_to_tiles(
         live_tiles=torch.empty((tiles, 3), dtype=torch.int32, device=dev),
         num_live_tiles=torch.empty(1, dtype=torch.int32, device=dev),
     )
+    if with_loc_ids:
+        tm.loc_ids = torch.empty((m, topk), dtype=torch.int32, device=dev)
+    loc = tm.loc_ids if with_loc_ids else _empty_i32(dev)
     mask = expert_mask if expert_mask is not None else _empty_i32(dev)
     ltok = num_local_tokens if num_local_tokens is not None else _empty_i32(dev)
     if zero_output is not None:
@@ -154,6 +162,7 @@ def route_to_tiles(
         expert_mask is not None,
         num_local_tokens is not None,
         rounds=min(8, max(1, -(-n_routes // 256))),
+        with_loc=with_loc_ids,
     )
     stream = torch.cuda.current_stream(dev)
     if n_routes <= ONESHOT_MAX_ROUTES:
@@ -167,6 +176,7 @@ def route_to_tiles(
             tm.num_valid_ids,
             tm.live_tiles,
             tm.num_live_tiles,
+            loc,
             mask,
             ltok,
             zbuf,
@@ -208,6 +218,7 @@ def route_to_tiles(
         tm.num_valid_ids,
         tm.live_tiles,
         tm.num_live_tiles,
+        loc,
         mask,
         ltok,
         counts,

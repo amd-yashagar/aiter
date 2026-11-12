@@ -348,9 +348,25 @@ def _write_padding(
 
 @flyc.jit
 def _rank_round(
-    run, tbl, wave, k, e, valid, w, i, sids_it, sw_it, topk, key_bits, e_cap
+    run,
+    tbl,
+    wave,
+    k,
+    e,
+    valid,
+    w,
+    i,
+    sids_it,
+    sw_it,
+    topk,
+    key_bits,
+    e_cap,
+    loc_it,
+    end,
+    with_loc,
 ):
-    """Scatter one 256-route round; tbl half k % 2 is zero on entry and left zero."""
+    """Scatter one 256-route round; tbl half k % 2 is zero on entry and left zero.
+    With ``with_loc``, loc_ids[i] gets the route's sorted row (-1 if dropped)."""
     c0, cK = fx.Int32(0), fx.Int32(topk)
     half = fx.Int32((k % 2) * WAVES * e_cap)
     below, cnt = _peer_rank(e, valid, key_bits)
@@ -366,6 +382,12 @@ def _rank_round(
     tok = i // cK
     _st(sids_it, ((i - tok * cK) << fx.Int32(24)) | tok, pos)
     _st(sw_it, w, pos)
+    if with_loc:
+        _st(
+            loc_it,
+            valid.select(pre + below, fx.Int32(-1)),
+            (i < end).select(i, fx.Int32(OOB)),
+        )
     gpu.barrier()
     if lead:
         fx.atomic_add(run + fx.Int64(e), cnt, syncscope="workgroup")
@@ -390,6 +412,8 @@ def _rank_and_scatter(
     has_mask,
     key_bits,
     e_cap,
+    loc_it,
+    with_loc,
 ):
     """Scatter routes [begin, end) in route order; run[e] holds each expert's
     next row. Rounds alternate tbl halves, so each needs two barriers; rounds
@@ -434,6 +458,9 @@ def _rank_and_scatter(
                     topk,
                     key_bits,
                     e_cap,
+                    loc_it,
+                    end,
+                    with_loc,
                 )
         gpu.barrier()
 
@@ -466,6 +493,8 @@ def _oneshot_body(
     ept,
     e_cap,
     rounds,
+    loc_it,
+    with_loc,
 ):
     """The whole sort in one workgroup, for at most ``rounds`` * BLOCK routes
     (``rounds`` <= STAGE_ROUNDS, from the static token count): every route's id
@@ -540,6 +569,9 @@ def _oneshot_body(
                 topk,
                 key_bits,
                 e_cap,
+                loc_it,
+                n,
+                with_loc,
             )
 
 
@@ -578,9 +610,12 @@ def _store_counts(hist, c_it, tid, bid, num_experts, e_cap):
 
 
 @functools.lru_cache(maxsize=128)
-def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
+def build(
+    num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS, with_loc=False
+):
     """Compile-time specialisation; returns (oneshot, count, scatter) launchers.
-    ``rounds`` bounds the one-shot's 256-route rounds (from M * topk)."""
+    ``rounds`` bounds the one-shot's 256-route rounds (from M * topk);
+    ``with_loc`` also writes loc_ids (each route's sorted row)."""
     E = num_experts
     key_bits = max(1, (E - 1).bit_length())
     ept = -(-E // BLOCK)  # experts per thread in the expert scan
@@ -606,6 +641,7 @@ def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
         num_valid: fx.Tensor,
         live_tiles: fx.Tensor,
         num_live: fx.Tensor,
+        loc_ids: fx.Tensor,
         mask: fx.Tensor,
         ltok: fx.Tensor,
         zbuf: fx.Tensor,
@@ -661,6 +697,8 @@ def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
                 ept,
                 e_cap,
                 rounds,
+                _it(loc_ids),
+                with_loc,
             )
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
@@ -715,6 +753,7 @@ def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
         num_valid: fx.Tensor,
         live_tiles: fx.Tensor,
         num_live: fx.Tensor,
+        loc_ids: fx.Tensor,
         mask: fx.Tensor,
         ltok: fx.Tensor,
         counts: fx.Tensor,
@@ -817,6 +856,8 @@ def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
                 has_mask,
                 key_bits,
                 e_cap,
+                _it(loc_ids),
+                with_loc,
             )
 
     @flyc.jit
@@ -829,6 +870,7 @@ def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
         num_valid: fx.Tensor,
         live_tiles: fx.Tensor,
         num_live: fx.Tensor,
+        loc_ids: fx.Tensor,
         mask: fx.Tensor,
         ltok: fx.Tensor,
         zbuf: fx.Tensor,
@@ -846,6 +888,7 @@ def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
             num_valid,
             live_tiles,
             num_live,
+            loc_ids,
             mask,
             ltok,
             zbuf,
@@ -881,6 +924,7 @@ def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
         num_valid: fx.Tensor,
         live_tiles: fx.Tensor,
         num_live: fx.Tensor,
+        loc_ids: fx.Tensor,
         mask: fx.Tensor,
         ltok: fx.Tensor,
         counts: fx.Tensor,
@@ -901,6 +945,7 @@ def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
             num_valid,
             live_tiles,
             num_live,
+            loc_ids,
             mask,
             ltok,
             counts,

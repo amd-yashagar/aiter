@@ -81,6 +81,30 @@ def compare(a, b, tile_m, out_a, out_b, slots=True):
     return bad
 
 
+def check_loc_ids(tm, ti, expert_mask, num_local_tokens):
+    """loc_ids against the tile map itself: each kept route's row holds that
+    route; dropped routes (masked, -1, a repeated expert's earlier slot) are -1."""
+    m, topk = ti.shape
+    rows = m if num_local_tokens is None else int(num_local_tokens[0])
+    loc = tm.loc_ids[:rows].flatten().long()
+    ids = ti[:rows].flatten()
+    kept = loc >= 0
+    route = torch.arange(rows * topk, device=ti.device)
+    packed = ((route % topk) << 24) | (route // topk)
+    if not torch.equal(tm.sorted_token_ids[loc[kept]], packed[kept].int()):
+        return ["loc_ids rows"]
+    valid = ids >= 0
+    if expert_mask is not None:
+        valid &= expert_mask[ids.clamp(min=0).long()] != 0
+    later = torch.zeros_like(valid)
+    v = ti[:rows]
+    for j in range(1, topk):
+        later.view(rows, topk)[:, :-j] |= v[:, j:] == v[:, :-j]
+    if not torch.equal(kept, valid & ~later):
+        return ["loc_ids kept set"]
+    return []
+
+
 def test_tile_map(token, E, topk, tile_m, case, mask, local, model_dim=4096):
     """route_to_tiles against Opus (via reference_tile_map), output zero-fill included."""
     ti, tw, em = routing(token, E, topk, case, mask)
@@ -90,11 +114,12 @@ def test_tile_map(token, E, topk, tile_m, case, mask, local, model_dim=4096):
     out_a = torch.full((token, model_dim), 3.0, dtype=dtypes.bf16)
     out_b = out_a.clone()
     kw = {"num_experts": E, "tile_m": tile_m, "expert_mask": em, "num_local_tokens": nl}
-    a = route_to_tiles(ti, tw, zero_output=out_a, **kw)
+    a = route_to_tiles(ti, tw, zero_output=out_a, with_loc_ids=True, **kw)
     b = reference_tile_map(ti, tw, zero_output=out_b, **kw)
     srt = ti.sort(dim=1).values
     repeats = bool(((srt[:, 1:] == srt[:, :-1]) & (srt[:, 1:] >= 0)).any())
     bad = compare(a, b, tile_m, out_a, out_b, slots=not repeats)
+    bad += check_loc_ids(a, ti, em, nl)
     assert not bad, f"M={token} E={E} topk={topk} tile_m={tile_m} {case}: {bad}"
     return {"exact": True}
 
