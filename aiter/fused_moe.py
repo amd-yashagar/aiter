@@ -102,7 +102,7 @@ _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") ==
 # Adaptive sort has no shape fallback, so output_aux is limited to generated shapes.
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _USE_TOPK_SOFTMAX_HIP = os.environ.get("AITER_TOPK_SOFTMAX_HIP", "0") == "1"
-_USE_TOPK_SOFTMAX_SHIFT = os.environ.get("AITER_TOPK_SOFTMAX_SHIFT", "1") == "1"
+_USE_TOPK_SOFTMAX_SHIFT = os.environ.get("AITER_TOPK_SOFTMAX_SHIFT", "0") == "1"
 
 AUX_SORT_OPUS = "opus"
 
