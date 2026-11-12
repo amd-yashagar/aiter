@@ -15,6 +15,7 @@ Tile configs are data: configs/<gpu>/fp8-token.json.
 import functools
 import json
 import os
+from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
@@ -27,7 +28,6 @@ from aiter.ops.flydsl.moe_common import GateMode
 _CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
 _ACTS = {ActivationType.Silu: "silu", ActivationType.Swiglu: "swiglu"}
 _QUANTS = {QuantType.per_Token: "ptpc", QuantType.per_Tensor: "per_tensor"}
-TILE_M = 64
 _DOWN_LDS_A = 48 * 1024
 
 
@@ -40,14 +40,51 @@ def _configs(gpu):
         return json.load(f)
 
 
-def _tile(config, gpu, model_dim):
+@dataclass(frozen=True)
+class _Tile:
+    tile_m: int
+    block_n: int
+    block_k: int
+    own_gateup: bool
+    atomic: bool
+
+
+def _tile(config, gpu, model_dim, inter_dim):
     cfg = dict(_configs(gpu).get("default", {}))
     cfg.update(_configs(gpu).get(config or "default", {}))
-    block_n = int(cfg.get("gateup_block_n", 128))
+    own = cfg.get("gateup", "own") == "own"
+    block_n = int(cfg.get("gateup_block_n", 256))
+    # A workgroup owns block_n // 2 gate and as many up channels.
+    while block_n > 128 and inter_dim % (block_n // 2):
+        block_n //= 2
     block_k = int(cfg.get("gateup_block_k", 256))
     while block_k > 64 and model_dim % (2 * block_k):
         block_k //= 2
-    return block_n, block_k, cfg.get("combine", "atomic") == "atomic"
+    return _Tile(
+        tile_m=int(cfg.get("tile_m", 128)) if own else 64,
+        block_n=block_n,
+        block_k=block_k,
+        own_gateup=own,
+        atomic=cfg.get("combine", "atomic") == "atomic",
+    )
+
+
+@functools.cache
+def _own_gateup(N, K, topk, tile_m, block_n, per_tensor, act, swiglu_limit):
+    from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token.gateup import (
+        compile_gateup,
+    )
+
+    return compile_gateup(
+        N=N,
+        K=K,
+        TOPK=topk,
+        BLOCK_M=tile_m,
+        BLOCK_N=block_n,
+        activation=act,
+        PER_TENSOR=per_tensor,
+        swiglu_limit=swiglu_limit,
+    )
 
 
 @functools.cache
@@ -60,7 +97,7 @@ def _gateup(N, K, topk, block_n, block_k, quant, act, swiglu_limit):
         weight_dtype="fp8",
         weight_quant_type=quant,
         TOPK=topk,
-        BLOCK_TILE_SIZE_M=TILE_M,
+        BLOCK_TILE_SIZE_M=64,
         BLOCK_TILE_SIZE_N=block_n,
         tile_k=block_k,
         stage="gateup",
@@ -73,11 +110,11 @@ def _gateup(N, K, topk, block_n, block_k, quant, act, swiglu_limit):
 
 
 @functools.cache
-def _down(N, K, topk, per_tensor, atomic):
+def _down(N, K, topk, tile_m, per_tensor, atomic):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token.down import compile_down
 
     return compile_down(
-        N=N, K=K, TOPK=topk, BLOCK_M=TILE_M, PER_TENSOR=per_tensor, ATOMIC=atomic
+        N=N, K=K, TOPK=topk, BLOCK_M=tile_m, PER_TENSOR=per_tensor, ATOMIC=atomic
     )
 
 
@@ -136,8 +173,8 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
         D, I = spec.model_dim, spec.inter_dim
         if D % 256 or I % 64:
             return "model_dim % 256 and inter_dim % 64"
-        if TILE_M * I > _DOWN_LDS_A:
-            return "inter_dim > 768 not implemented yet"
+        if 128 * I > _DOWN_LDS_A:
+            return "inter_dim > 384 not implemented yet"
         if topk > 255:
             return "topk"
         if call is not None:
@@ -175,26 +212,33 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
 
         spec = weights.spec
         D, I = spec.model_dim, spec.inter_dim
-        block_n, block_k, atomic = _tile(config, self._gpu(weights), D)
-        quant = _QUANTS[spec.quant]
+        t = _tile(config, self._gpu(weights), D, I)
+        per_tensor = spec.quant == QuantType.per_Tensor
         with compile_only():
-            gu = _gateup(
-                2 * I,
-                D,
-                topk,
-                block_n,
-                block_k,
-                quant,
-                _ACTS[spec.act],
-                _swiglu_limit(spec),
-            )
-            types = (fx.Uint8, fx.Uint8, fx.BFloat16) + (fx.Int32,) * 2
-            types += (fx.Int32,) * 2 + (fx.Float32,) * 2
+            gu = self._gateup_fn(spec, topk, t)
+            if t.own_gateup:
+                types = (fx.Uint8, fx.Uint8, fx.BFloat16) + (fx.Int32,) * 3
+            else:
+                types = (fx.Uint8, fx.Uint8, fx.BFloat16, fx.Int32, fx.Float32)
+                types += (fx.Int32,) * 2
+            types += (fx.Float32,) * 2
             gu(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
-            dn = _down(D, I, topk, quant == "per_tensor", atomic)
+            dn = _down(D, I, topk, t.tile_m, per_tensor, t.atomic)
             types = (fx.Uint8, fx.Uint8, fx.BFloat16, fx.Int32, fx.Float32)
             types += (fx.Int32, fx.Int32, fx.Float32, fx.Float32)
             dn(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
+
+    def _gateup_fn(self, spec, topk, t):
+        D, I = spec.model_dim, spec.inter_dim
+        act, limit = _ACTS[spec.act], _swiglu_limit(spec)
+        if t.own_gateup:
+            per_tensor = spec.quant == QuantType.per_Tensor
+            return _own_gateup(
+                2 * I, D, topk, t.tile_m, t.block_n, per_tensor, act, limit
+            )
+        return _gateup(
+            2 * I, D, topk, t.block_n, t.block_k, _QUANTS[spec.quant], act, limit
+        )
 
     def __call__(self, call):
         from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
@@ -203,8 +247,8 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
         x = call.hidden_states
         M, D, I, topk = call.m, spec.model_dim, spec.inter_dim, call.topk
         per_tensor = spec.quant == QuantType.per_Tensor
-        quant = _QUANTS[spec.quant]
-        block_n, block_k, atomic = _tile(call.config, self._gpu(call.weights), D)
+        t = _tile(call.config, self._gpu(call.weights), D, I)
+        atomic = t.atomic
         dev = x.device
         nlt = call.num_local_tokens
 
@@ -217,7 +261,7 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
             call.global_experts,
             D,
             torch.bfloat16,
-            TILE_M,
+            t.tile_m,
             call.expert_mask,
             nlt,
             0,
@@ -239,29 +283,12 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
         # including the route slots Gate/Up skips.
         alloc = torch.zeros if per_tensor else torch.empty
         inter = alloc((M, topk, I), dtype=torch.bfloat16, device=dev)
-        _launch(
-            _gateup(
-                2 * I,
-                D,
-                topk,
-                block_n,
-                block_k,
-                quant,
-                _ACTS[spec.act],
-                _swiglu_limit(spec),
-            ),
-            xq,
-            call.w1,
-            inter,
-            sorted_ids,
-            sorted_w,
-            sorted_eids,
-            num_valid,
-            call.w1_scale,
-            xs,
-            M,
-            tasks,
-        )
+        gu = self._gateup_fn(spec, topk, t)
+        if t.own_gateup:
+            gu_args = (sorted_ids, sorted_eids, num_valid)
+        else:
+            gu_args = (sorted_ids, sorted_w, sorted_eids, num_valid)
+        _launch(gu, xq, call.w1, inter, *gu_args, call.w1_scale, xs, M, tasks)
         if per_tensor:
             aq, as_ = quant_fn(inter.view(M * topk, I), quant_dtype=dtypes.fp8)
         else:
@@ -273,9 +300,9 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
             )
         rows = out
         if not atomic:
-            rows = torch.empty((tasks * TILE_M, D), dtype=torch.bfloat16, device=dev)
+            rows = torch.empty((tasks * t.tile_m, D), dtype=torch.bfloat16, device=dev)
         _launch(
-            _down(D, I, topk, per_tensor, atomic),
+            _down(D, I, topk, t.tile_m, per_tensor, atomic),
             aq,
             call.w2,
             rows,

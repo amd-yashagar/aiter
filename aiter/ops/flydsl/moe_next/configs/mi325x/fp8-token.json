@@ -1,16 +1,20 @@
 {
   "default": {
-    "gateup_block_n": 128,
-    "gateup_block_k": 256,
+    "gateup": "own",
+    "tile_m": 128,
+    "gateup_block_n": 256,
     "combine": "atomic"
   },
-  "bn256_bk128": {
-    "gateup_block_n": 256,
-    "gateup_block_k": 128
+  "bn128": {
+    "gateup_block_n": 128
   },
-  "bn128_bk128": {
+  "m64": {
+    "tile_m": 64
+  },
+  "gfx9": {
+    "gateup": "gfx9",
     "gateup_block_n": 128,
-    "gateup_block_k": 128
+    "gateup_block_k": 256
   },
   "rows": {
     "combine": "rows"
