@@ -61,6 +61,48 @@ class DispatchCandidate:
         pass
 
 
+def _parse_route(v):
+    """aiter.moe.last_route() -> (kernel id or "aiter", reason). Tuple, dict or str."""
+    if v is None:
+        return "", ""
+    if isinstance(v, dict):
+        return str(v.get("route") or v.get("kernel") or ""), str(v.get("reason", ""))
+    if isinstance(v, (tuple, list)):
+        return str(v[0]), str(v[3]) if len(v) > 3 else ""
+    return str(v), ""
+
+
+class RoutedFusedMoe(DispatchCandidate):
+    """``aiter.fused_moe.fused_moe`` of the tree under test, with routing on (new) or
+    switched off by AITER_MOE_DISABLE (off). The router inside fused_moe sends covered
+    cases to the new kernels; ``aiter.moe.last_route()`` says what ran."""
+
+    source = "new"
+    measure_host = True
+
+    def __init__(self, off=False):
+        self.id = "off|fused_moe" if off else "new|fused_moe"
+        self.entry = "aiter.fused_moe.fused_moe" + (
+            " (AITER_MOE_DISABLE=1)" if off else " (routing on)"
+        )
+        self.kernel_id = ""
+        self.reason = ""
+        self.route_changed = False
+
+    def probe_route(self, stage):
+        """Record the route of the last call: after the eager call and after capture.
+        The capture's wins: a bucket skipped during capture shows up as ``aiter``."""
+        try:
+            from aiter import moe
+
+            kid, reason = _parse_route(moe.last_route())
+        except Exception:  # noqa: BLE001  (tree without aiter.moe)
+            return
+        if stage == "capture" and self.kernel_id and kid != self.kernel_id:
+            self.route_changed = True
+        self.kernel_id, self.reason = kid, reason
+
+
 class Measurer:
     """Correctness plus timing of one candidate over the shared timed region."""
 
@@ -73,6 +115,8 @@ class Measurer:
     def measure(self, cand, quick=False, modes=("warm",)):
         """Returns {"ok", "us", ...}; emits one ``cand`` event per mode."""
         import torch
+
+        from aiter import dtypes
 
         from . import accuracy, routes
         from .timing import Timer
@@ -101,6 +145,8 @@ class Measurer:
             with routes.RouteRecorder() as rec:
                 call()
                 torch.cuda.synchronize()
+            if hasattr(cand, "probe_route"):
+                cand.probe_route("eager")
             route = routes.route_from_record(rec.last()) if rec.records else {}
             if getattr(cand, "id", "") == "dispatch":
                 ctx.dispatch_args = rec.last()[0]
@@ -124,6 +170,9 @@ class Measurer:
                 seeds=accuracy.SEEDS[:1] if quick else accuracy.SEEDS,
                 sentinel=not quick,
                 repeats=1 if quick else accuracy.REPEATS,
+                flat_mxfp4=bool(route.get("flat"))
+                and ctx.S.qtype.name == "per_1x32"
+                and ctx.S.wq == dtypes.fp4x2,
             )
             res["acc"] = acc
             cols = accuracy.flat_columns(acc)
@@ -141,7 +190,11 @@ class Measurer:
                 return res
             timer = Timer(call, ctx.hidden_static, self.pool)
             timer.prepare_graph()
+            if hasattr(cand, "probe_route"):
+                cand.probe_route("capture")
             res["timing_mode"] = timer.mode
+            if getattr(cand, "measure_host", False):
+                res["host_us"] = _host_us(call)
             for m in modes:
                 st = timer.time(cold=(m == "cold"), quick=quick)
                 res.setdefault("by_mode", {})[m] = st
@@ -153,6 +206,8 @@ class Measurer:
                     **st,
                     **cols,
                     new_kernel_id=getattr(cand, "kernel_id", ""),
+                    reason=getattr(cand, "reason", ""),
+                    host_us=res.get("host_us", ""),
                     kernel1=route.get("kernel1", ""),
                     kernel2=route.get("kernel2", ""),
                     route_key=route.get("route_key", ""),
@@ -179,6 +234,25 @@ class Measurer:
     def _emit(self, base, modes, **kw):
         for m in modes:
             emit(self.fh, dict(base, mode=m, **kw))
+
+
+def _host_us(call, n=50):
+    """Host time of an eager call: CPU time from entry to return, GPU drained between calls."""
+    import statistics
+    import time
+
+    import torch
+
+    for _ in range(5):
+        call()
+    torch.cuda.synchronize()
+    ts = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        call()
+        ts.append((time.perf_counter() - t0) * 1e6)
+        torch.cuda.synchronize()
+    return statistics.median(ts)
 
 
 def _gpu_identity():
@@ -292,7 +366,6 @@ def run_bar_group(cases, spec, fh):
         except Exception as e:  # noqa: BLE001
             refs[c.id] = (None, f"reference error: {_err(e)}", rows)
         torch.cuda.empty_cache()
-    ref_weights = rw if mode_kind == "new" else None
     rw = None
     torch.cuda.empty_cache()
     group_cache = {}
@@ -319,7 +392,6 @@ def run_bar_group(cases, spec, fh):
         )
         ctx.dispatch_meta = ident
         ctx.group_cache = group_cache
-        ctx.ref_weights = ref_weights
         ctx.hidden_static = hidden.clone()
         ctx.outbuf = (
             torch.empty((M, S.D), dtype=S.dtype, device="cuda")
@@ -337,8 +409,11 @@ def run_bar_group(cases, spec, fh):
         if mode_kind == "bar":
             d = meas.measure(DispatchCandidate(), quick=False, modes=modes)
             results["dispatch"] = d
+        elif mode_kind in ("new", "off"):
+            cand = RoutedFusedMoe(off=mode_kind == "off")
+            results[cand.id] = meas.measure(cand, quick=False, modes=modes)
         for src in sources:
-            if (mode_kind == "new") != (src.name == "new"):
+            if mode_kind in ("new", "off") or src.name == "new":
                 continue
             reason = src.skip_reason(ctx)
             if reason:
@@ -358,10 +433,6 @@ def run_bar_group(cases, spec, fh):
                         "detail": reason,
                     },
                 )
-                continue
-            if mode_kind == "new" and src.name != "new":
-                continue
-            if mode_kind == "bar" and src.name == "new":
                 continue
             try:
                 cands = [x for x in src.enumerate(ctx) if x.id not in bad.get(c.id, ())]
@@ -441,6 +512,8 @@ def _gate(who, acc):
             if name in acc["mean"]:
                 out[f"{who}_{name}_mean"] = acc["mean"][name]
                 out[f"{who}_{name}_std"] = acc["std"][name]
+        if f"{ref}_allclose" in acc["mean"]:
+            out[f"{who}_{ref}_allclose_mean"] = acc["mean"][f"{ref}_allclose"]
     return out
 
 
@@ -470,16 +543,22 @@ def _emit_summary(fh, c, S, mode, results, ident, skipped, kind, main_failure=No
         for k in ("route_key", "kernel1", "kernel2", "route_family"):
             row["dispatch_" + k] = disp.get("route", {}).get(k, "")
         row.update(_gate("dispatch", disp.get("acc")))
-    if kind == "new":
+    if kind in ("new", "off"):
+        who = kind
         if ok:
             r = next(iter(ok.values()))
             row.update(
-                new_us=r["by_mode"][mode]["median_us"],
-                new_id=r["cand"].id,
-                new_kernel_id=getattr(r["cand"], "kernel_id", ""),
-                status="ok",
+                {
+                    f"{who}_us": r["by_mode"][mode]["median_us"],
+                    f"{who}_id": r["cand"].id,
+                    f"{who}_kernel_id": getattr(r["cand"], "kernel_id", ""),
+                    f"{who}_host_us": r.get("host_us", ""),
+                    f"{who}_reason": getattr(r["cand"], "reason", ""),
+                    "route_changed": int(getattr(r["cand"], "route_changed", False)),
+                    "status": "ok",
+                }
             )
-            row.update(_gate("new", r.get("acc")))
+            row.update(_gate(who, r.get("acc")))
         else:
             row.update(status="no-correct-candidate")
     elif ok:

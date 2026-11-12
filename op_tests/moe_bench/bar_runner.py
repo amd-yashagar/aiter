@@ -59,6 +59,12 @@ BAR_COLS = (
         "new_us",
         "new_id",
         "new_kernel_id",
+        "new_host_us",
+        "new_reason",
+        "route_changed",
+        "off_us",
+        "off_kernel_id",
+        "off_host_us",
         "roofline_us",
         "roofline_staged_us",
         "roofline_serial_us",
@@ -101,6 +107,8 @@ CAND_COLS = [
     "kernel1",
     "kernel2",
     "new_kernel_id",
+    "reason",
+    "host_us",
     *accuracy.seed_columns(),
     "node",
     "gpu",
@@ -149,6 +157,27 @@ def _row(case, ev, meta, cols):
     return r
 
 
+def dispatch_lookup(path):
+    """Dispatch results -> ({case_id: status}, {(case_id, mode): median_us})."""
+    status, us = {}, {}
+    for r in schema.read_csv(path):
+        prev = status.get(r["case_id"])
+        if prev is None or r["status"] == "ok":
+            status[r["case_id"]] = r["status"]
+        if r["status"] == "ok" and r.get("median_us"):
+            us[(r["case_id"], r["mode"])] = float(r["median_us"])
+    return status, us
+
+
+def fill_dispatch(ev, us_map, case_id):
+    """Put the base tree's dispatch_us on a new/off row (they never time dispatch)."""
+    if ev.get("dispatch_us") in (None, ""):
+        v = us_map.get((case_id, ev.get("mode")))
+        if v is not None:
+            ev["dispatch_us"] = v
+    return ev
+
+
 class BarGroupJob(runner.GroupJob):
     worker_name = "bar_worker"
 
@@ -170,6 +199,7 @@ class BarGroupJob(runner.GroupJob):
         self.source_modules = list(source_modules)
         self.bad = {}
         self.main_failures = {}
+        self.dispatch_us = {}
 
     def extra_spec(self):
         return {
@@ -189,7 +219,9 @@ class BarGroupJob(runner.GroupJob):
         }
 
     def handle_row(self, c, ev):
-        self.results.add(_row(c, ev, self.meta, BAR_COLS))
+        self.results.add(
+            _row(c, fill_dispatch(ev, self.dispatch_us, c.id), self.meta, BAR_COLS)
+        )
 
     def handle_other(self, ev):
         if ev.get("event") != "cand" or self.cand_table is None:
@@ -269,39 +301,167 @@ def tier_name(cases_arg):
 
 
 def cmd_bar(args):
+    """bar mode, or new mode: routing on, routing off (AITER_MOE_DISABLE), first calls."""
+    if args.kind != "new":
+        return _run_pass(args, args.kind)
+    if getattr(args, "new_routes", None):
+        os.environ["AITER_MOE_ROUTES"] = args.new_routes
+        os.environ["AITER_MOE_STRICT"] = "1"
+    rc = _run_pass(args, "new")
+    if not args.no_off:
+        os.environ["AITER_MOE_DISABLE"] = "1"
+        try:
+            rc = _run_pass(args, "off") or rc
+        finally:
+            os.environ.pop("AITER_MOE_DISABLE", None)
+        merge_off(args)
+    if args.first:
+        run_first_calls(args)
+    summarize_new(args)
+    if getattr(args, "inner", False):
+        open(os.path.join(args.out_dir, ".done"), "w").close()
+    return rc
+
+
+def _tier(args):
+    return args.tier_name or tier_name(args.cases)
+
+
+def merge_off(args):
+    """Add the routing-off timings to new-<tier>.csv as off_us, off_kernel_id, off_host_us."""
+    tier = _tier(args)
+    new_path = os.path.join(args.out_dir, f"new-{tier}.csv")
+    off = {
+        (r["case_id"], r["mode"]): r
+        for r in schema.read_csv(os.path.join(args.out_dir, f"off-{tier}.csv"))
+    }
+    rows = schema.read_csv(new_path)
+    for r in rows:
+        o = off.get((r["case_id"], r["mode"]))
+        if o:
+            r["off_us"] = o.get("off_us", "")
+            r["off_kernel_id"] = o.get("off_kernel_id", "")
+            r["off_host_us"] = o.get("off_host_us", "")
+    with open(new_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=BAR_COLS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+
+def run_first_calls(args):
+    """first-call.csv: first eager call per weight set (lazy state and compiles), with a
+    warm and an empty FlyDSL cache. Outside the timed region: in serving it is warmup.
+    """
+    tree = os.path.abspath(args.new_aiter or args.aiter)
+    tmpdir = args.tmpdir or os.path.join(tempfile.gettempdir(), "moe-bench-tmp")
+    cases = runner.select_cases(args.cases.split(","), args.filter)
+    seen, picked = set(), []
+    for c in cases:
+        if c.kind != "fused" or c.token <= 0:
+            continue
+        g = schema.group_id(schema.weight_group_key(c))
+        if g in seen:
+            continue
+        seen.add(g)
+        c.row["modes"] = "first"
+        picked.append(c)
+        if len(picked) >= args.first:
+            break
+    meta = runner.probe_meta(
+        tree, args.node or socket.gethostname(), args.launcher, tmpdir
+    )
+    res = runner.Results(os.path.join(args.out_dir, "first-call.csv"), args.resume)
+    runner.run_first(picked, tree, tmpdir, args.launcher, res, meta, ["warm", "empty"])
+    res.close()
+
+
+def summarize_new(args):
+    """Run summary: routing-off vs the base tree's dispatch, hook overhead, route counts."""
+    tier = _tier(args)
+    new_rows = schema.read_csv(os.path.join(args.out_dir, f"new-{tier}.csv"))
+    summary = {"tier": tier, "cases": len({r["case_id"] for r in new_rows})}
+    routed = [r for r in new_rows if r.get("new_kernel_id") not in ("", "aiter")]
+    summary["served_by_kernel"] = len({r["case_id"] for r in routed})
+    summary["route_changed_in_capture"] = [
+        r["case_id"] for r in new_rows if r.get("route_changed") == "1"
+    ]
+    if args.dispatch_results:
+        path = args.dispatch_results
+        if os.path.isdir(path):
+            path = os.path.join(path, f"{tier}.csv")
+        disp = {
+            (r["case_id"], r["mode"]): r
+            for r in schema.read_csv(path)
+            if r["status"] == "ok"
+        }
+        off_bad = []
+        for r in new_rows:
+            d = disp.get((r["case_id"], r["mode"]))
+            if d and r.get("off_us"):
+                ratio = float(r["off_us"]) / float(d["median_us"])
+                if abs(ratio - 1) > 0.05:
+                    off_bad.append((r["case_id"], r["mode"], round(ratio, 3)))
+        summary["off_vs_dispatch_over_5pct"] = off_bad
+    ov = {}
+    for label, pick in (
+        (
+            "routed",
+            [r for r in routed if r.get("new_host_us") and r.get("off_host_us")],
+        ),
+        (
+            "not_routed",
+            [
+                r
+                for r in new_rows
+                if r.get("new_kernel_id") == "aiter"
+                and r.get("new_host_us")
+                and r.get("off_host_us")
+            ],
+        ),
+    ):
+        if pick:
+            r = pick[0]
+            ov[label] = {
+                "case_id": r["case_id"],
+                "on_host_us": float(r["new_host_us"]),
+                "off_host_us": float(r["off_host_us"]),
+                "overhead_us": float(r["new_host_us"]) - float(r["off_host_us"]),
+            }
+    summary["hook_overhead"] = ov
+    with open(os.path.join(args.out_dir, f"summary-{tier}.json"), "w") as f:
+        json.dump(summary, f, indent=1)
+    print("new-mode summary:", json.dumps(summary), flush=True)
+
+
+def _run_pass(args, kind):
     node = args.node or socket.gethostname()
     tmpdir = args.tmpdir or os.path.join(tempfile.gettempdir(), "moe-bench-tmp")
     os.makedirs(tmpdir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
     tree = os.path.abspath(
-        args.new_aiter if args.kind == "new" and args.new_aiter else args.aiter
+        args.new_aiter if kind in ("new", "off") and args.new_aiter else args.aiter
     )
-    if args.new_entry:
-        os.environ["MOE_BENCH_NEW_ENTRY"] = args.new_entry
-    if getattr(args, "new_routes", None):
-        os.environ["MOE_BENCH_NEW_ROUTES"] = args.new_routes
-    tier = args.tier_name or tier_name(args.cases)
+    tier = _tier(args)
     cases = runner.select_cases(args.cases.split(","), args.filter)
     if getattr(args, "ids", None):
         cases = [c for c in cases if c.id in args.ids]
     modes_req = [m for m in args.modes.split(",") if m and m != "first"]
-    dispatch_status = {}
+    dispatch_status, dispatch_us = {}, {}
     if args.dispatch_results:
         path = args.dispatch_results
         if os.path.isdir(path):
             path = os.path.join(path, f"{tier}.csv")
-        for r in schema.read_csv(path):
-            prev = dispatch_status.get(r["case_id"])
-            if prev is None or r["status"] == "ok":
-                dispatch_status[r["case_id"]] = r["status"]
-    kind = args.kind
+        dispatch_status, dispatch_us = dispatch_lookup(path)
     main_failures = read_main_failures(args, args.cases)
-    prefix = "new" if kind == "new" else "bar"
+    prefix = kind if kind in ("new", "off") else "bar"
     bar = Table(
         os.path.join(args.out_dir, f"{prefix}-{tier}.csv"), BAR_COLS, args.resume
     )
     cand = Table(
-        os.path.join(args.out_dir, f"candidates-{tier}.csv"),
+        os.path.join(
+            args.out_dir,
+            f"candidates-{tier}.csv" if kind != "off" else f"candidates-off-{tier}.csv",
+        ),
         CAND_COLS,
         args.resume,
         key=("case_id", "cand_id", "mode", "phase"),
@@ -352,6 +512,7 @@ def cmd_bar(args):
     ]
     for j in jobs:
         j.main_failures = main_failures
+        j.dispatch_us = dispatch_us
     print(
         f"{prefix}: {sum(len(cs) for _, cs in groups)} cases in {len(jobs)} groups, modes {modes_req}",
         flush=True,

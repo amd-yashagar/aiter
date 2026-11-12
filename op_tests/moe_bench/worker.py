@@ -372,6 +372,16 @@ def run_aux_case(case, modes_req, fh):
         )
 
 
+def _last_route_id():
+    try:
+        from aiter import moe
+
+        v = moe.last_route()
+        return str(v[0] if isinstance(v, (tuple, list)) else v)
+    except Exception:  # noqa: BLE001  (tree without aiter.moe)
+        return ""
+
+
 def run_first_case(case, fh, variant):
     """First call in a fresh process: JIT module load and FlyDSL compile included.
 
@@ -412,6 +422,7 @@ def run_first_case(case, fh, variant):
                 first_call_s=first,
                 second_call_s=second,
                 median_us=first * 1e6,
+                new_kernel_id=_last_route_id(),
                 **routes.route_from_record(rec.last()),
             ),
         )

@@ -66,6 +66,7 @@ RESULT_COLS = (
         "sentinel_ok",
         "empty_rows_ok",
         "fp",
+        "new_kernel_id",
         "first_call_s",
         "second_call_s",
         "weight_build_seconds",

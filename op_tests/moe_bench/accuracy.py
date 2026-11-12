@@ -24,7 +24,6 @@ need validation of aiter's MX quant ops on gfx950 and raise NotImplementedError.
 """
 
 import contextlib
-import os
 import types
 
 import torch
@@ -40,12 +39,12 @@ FP64_CHUNK_BYTES = 3 << 30
 METRICS = ("rel_l2", "max_norm", "cos", "allclose")
 REFS = ("path", "exact")
 GATE_METRICS = ("rel_l2", "max_norm")
-# aiter's checkAllclose default is 0.05 (test_moe_2stage.test_fmoe). With the outlier
-# activations the existing fp8 per-token path sits at 4.7-5.2% mismatch against ref_path,
-# so 0.05 would reject the existing path itself; 0.10 is the default until the coordinator
-# sets the tolerance (MOE_BENCH_ALLCLOSE_TOL overrides).
-ALLCLOSE_TOL_ERR_RATIO = float(os.environ.get("MOE_BENCH_ALLCLOSE_TOL", "0.10"))
+# aiter's strict rule (op_tests/test_moe_2stage.py:667-675, test_fmoe with
+# strict_accuracy): NaN fails; a nonzero checkAllclose mismatch fraction (rtol=atol=1e-2)
+# fails only together with logits_diff above 0.01; asm FLAT MXFP4 rows use
+# logits_diff < 2e-3 instead. The mismatch fraction itself is reported, not gated.
 LOGITS_DIFF_LIMIT = 0.01
+FLAT_MXFP4_LOGITS_LIMIT = 2e-3
 
 
 def _seed(*parts):
@@ -306,6 +305,7 @@ def evaluate(
     seeds=SEEDS,
     sentinel=True,
     repeats=REPEATS,
+    flat_mxfp4=False,
 ):
     """Run ``call`` on each seed's inputs and score it against both references.
 
@@ -328,7 +328,8 @@ def evaluate(
                 if prev is not None and not torch.equal(prev, out):
                     nondeterministic = True
                 prev = out.clone() if repeats > 1 else None
-                bad = int(torch.isnan(out).sum()) + int(torch.isinf(out).sum())
+                valid = out[:n_valid]  # rows past num_local_tokens are unspecified
+                bad = int(torch.isnan(valid).sum()) + int(torch.isinf(valid).sum())
                 nan_inf += bad
                 y = out[:n_valid][rows[rows < n_valid]]
                 m = {"nan_inf": bad, "seed": seed, "rep": rep}
@@ -361,7 +362,7 @@ def evaluate(
         "nondeterministic": nondeterministic if repeats > 1 else None,
     }
     res.update(aggregate(per_seed))
-    res["pass"] = rule(res)
+    res["pass"] = rule(res, flat_mxfp4)
     return res
 
 
@@ -375,22 +376,21 @@ def aggregate(per_seed):
     return {"mean": mean, "std": std}
 
 
-def rule(res):
-    """aiter's test rule vs ref_path, plus no NaN/Inf and the sentinel check.
+def rule(res, flat_mxfp4=False):
+    """aiter's strict test rule vs ref_path, plus NaN/Inf and the sentinel check.
 
-    Rule (op_tests/test_moe_2stage.py::test_fmoe): checkAllclose rtol=atol=1e-2 with a 5%
-    mismatch ratio, and fail when any element mismatches while the logits diff is above
-    0.01. None when ref_path is unavailable.
+    op_tests/test_moe_2stage.py:667-675 (test_fmoe, strict_accuracy): fail on NaN, or when
+    the checkAllclose mismatch fraction is nonzero and logits_diff > 0.01; asm FLAT MXFP4
+    rows additionally need logits_diff < 2e-3. None when ref_path is unavailable.
     """
     if res["nan_inf"] or res["sentinel_ok"] is False:
         return False
     if "path_allclose" not in res["mean"]:
         return None
     for m in res["per_seed"]:
-        frac = m["path_allclose"]
-        if frac > ALLCLOSE_TOL_ERR_RATIO:
+        if m["path_allclose"] > 0 and m["path_logits_diff"] > LOGITS_DIFF_LIMIT:
             return False
-        if frac > 0 and m["path_logits_diff"] > LOGITS_DIFF_LIMIT:
+        if flat_mxfp4 and m["path_logits_diff"] >= FLAT_MXFP4_LOGITS_LIMIT:
             return False
     return True
 
@@ -427,6 +427,7 @@ def gate_columns(who):
     """Mean/std of the gated metrics against both references for dispatch, bar or new."""
     cols = [f"{who}_acc_pass", f"{who}_nondeterministic"]
     for ref in REFS:
+        cols.append(f"{who}_{ref}_allclose_mean")
         for k in GATE_METRICS:
             cols += [f"{who}_{ref}_{k}_mean", f"{who}_{ref}_{k}_std"]
     return cols
