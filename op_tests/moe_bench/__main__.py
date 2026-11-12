@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""MoE regression gate: ``python -m op_tests.moe_bench <command>``.
+
+Commands: cases, routes, coverage, run, affected, compare, merge, gpus.
+The harness measures any aiter tree given as ``--aiter <path>``.
+"""
+
+import argparse
+import os
+import sys
+
+DEFAULT_TIERS = os.environ.get("MOE_BENCH_TIERS", "")
+
+
+def add_launcher(p):
+    p.add_argument(
+        "--launcher",
+        choices=("claim", "gpuq", "none"),
+        default=os.environ.get("MOE_BENCH_LAUNCHER", "claim"),
+        help="claim: claim file + HIP_VISIBLE_DEVICES on an idle GPU (meta, dell300x); "
+        "gpuq: GPUQ_USER=yashagar gpuq --num-gpus=1 per worker (smci355); "
+        "none: inherit the environment",
+    )
+    p.add_argument("--tmpdir", default=None, help="private TMPDIR for workers")
+    p.add_argument(
+        "--wait", type=int, default=0, help="seconds to wait for an idle GPU"
+    )
+
+
+def cmd_cases(a):
+    from . import schema
+
+    paths = schema.tier_paths(a.tiers_dir)
+    problems, total = [], {}
+    for name, p in paths.items():
+        cases = schema.load_tier(p)
+        total[name] = len(cases)
+        problems += schema.validate(cases, name)
+    for name, n in total.items():
+        print(f"{name}: {n} rows")
+    for pr in problems[:100]:
+        print("PROBLEM", pr)
+    if a.aiter:
+        from .catalogue import regen
+
+        rows = regen.build_tier3(regen.build_matrix(os.path.abspath(a.aiter)))
+        new_sigs = {
+            schema.case_signature(schema.Case(r, schema.parse_extra(r["extra"]))): r
+            for r in rows
+        }
+        old = schema.load_tier(paths["tier3"]) if "tier3" in paths else []
+        old_sigs = {schema.case_signature(c) for c in old}
+        added = [r for s, r in new_sigs.items() if s not in old_sigs]
+        gone = len(old_sigs - set(new_sigs))
+        print(
+            f"tier3 from {a.aiter}: {len(rows)} cases; {len(added)} not in the shared file, "
+            f"{gone} of the shared file's rows absent from this tree (never dropped)"
+        )
+        if a.out:
+            schema.write_tier(a.out, rows)
+            print("wrote", a.out)
+        if a.update and added and "tier3" in paths:
+            n = len(old)
+            for r in added:
+                r["case_id"] = f"tier3-{n:05d}"
+                r["reason"] = f"new in tree {os.path.basename(a.aiter.rstrip('/'))}"
+                r["added_by"] = a.added_by
+                n += 1
+            with open(paths["tier3"], "a", newline="") as f:
+                import csv
+
+                w = csv.DictWriter(f, fieldnames=schema.COLS)
+                for r in added:
+                    w.writerow({k: r.get(k, "") for k in schema.COLS})
+            print(f"appended {len(added)} rows to {paths['tier3']}")
+    return 1 if problems else 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="moe_bench", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser(
+        "cases", help="validate tier files; regenerate tier 3 from a tree"
+    )
+    p.add_argument("--tiers-dir", default=DEFAULT_TIERS)
+    p.add_argument("--aiter", help="tree to regenerate tier 3 from")
+    p.add_argument("--out", help="write the regenerated tier 3 here")
+    p.add_argument(
+        "--update",
+        action="store_true",
+        help="append new tier-3 rows to the shared file",
+    )
+    p.add_argument("--added-by", default="moe-bench-harness")
+    p.set_defaults(fn=cmd_cases)
+
+    p = sub.add_parser("routes", help="dispatch decision per case, no timing")
+    p.add_argument("--aiter", required=True)
+    p.add_argument(
+        "--cases", required=True, help="tier CSV (comma separated for several)"
+    )
+    p.add_argument("--out", required=True)
+    p.add_argument("--filter")
+    add_launcher(p)
+    p.set_defaults(fn="routes")
+
+    p = sub.add_parser("routes-worker", help=argparse.SUPPRESS)
+    p.add_argument("--cases", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--filter")
+    p.set_defaults(fn="routes-worker")
+
+    p = sub.add_parser("coverage", help="every live route key at least once in tier 1")
+    p.add_argument("--tier1", required=True)
+    p.add_argument("--tiers-dir", default=DEFAULT_TIERS)
+    p.add_argument("--routes-tier1", required=True)
+    p.add_argument(
+        "--routes-other", required=True, help="tier2-x=routes.csv,tier3=routes.csv"
+    )
+    p.add_argument("--arch", default="gfx942")
+    p.add_argument("--added-by", default="meta moe-bench-harness")
+    p.add_argument("--append", action="store_true")
+    p.set_defaults(fn="coverage")
+
+    p = sub.add_parser("run", help="correctness and timing")
+    p.add_argument("--aiter", required=True)
+    p.add_argument("--cases", required=True)
+    p.add_argument("--filter")
+    p.add_argument("--modes", default="warm,cold")
+    p.add_argument("--out", required=True)
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--shard", help="i/n")
+    p.add_argument(
+        "--jobs", type=int, default=1, help="concurrent workers, one GPU each"
+    )
+    p.add_argument("--node")
+    p.add_argument("--case-timeout", type=int, default=1200)
+    p.add_argument("--setup-timeout", type=int, default=3600)
+    p.add_argument("--baseline-tree", help="drift check: re-time anchors on this tree")
+    p.add_argument("--baseline-results", help="drift check: stored baseline CSV")
+    p.add_argument("--drift-anchors", type=int, default=10)
+    add_launcher(p)
+    p.set_defaults(fn="run")
+
+    p = sub.add_parser("affected", help="cases whose route or route sources changed")
+    p.add_argument("--base", required=True)
+    p.add_argument("--new", required=True)
+    p.add_argument("--cases", required=True)
+    p.add_argument("--base-routes")
+    p.add_argument("--new-routes")
+    p.add_argument("--out")
+    add_launcher(p)
+    p.set_defaults(fn="affected")
+
+    p = sub.add_parser(
+        "compare", help="speedups, regressions, correctness; exit 1 on any"
+    )
+    p.add_argument("base")
+    p.add_argument("new")
+    p.add_argument("--out")
+    p.add_argument("--drift", help="drift.json written by run")
+    p.add_argument("--ab", action="store_true")
+    p.add_argument("--ab-base-tree")
+    p.add_argument("--ab-new-tree")
+    p.add_argument("--cases")
+    p.add_argument("--rounds", type=int, default=3)
+    add_launcher(p)
+    p.set_defaults(fn="compare")
+
+    p = sub.add_parser("merge", help="merge repeats into medians with per-case spread")
+    p.add_argument("runs", nargs="+")
+    p.add_argument("--out", required=True)
+    p.set_defaults(fn="merge")
+
+    p = sub.add_parser("gpus", help="idle check and claim state")
+    p.set_defaults(fn="gpus")
+
+    a = ap.parse_args(argv)
+    if a.cmd == "cases":
+        return a.fn(a)
+    if a.fn == "routes":
+        from . import routes_cmd
+
+        return routes_cmd.cmd_routes(a)
+    if a.fn == "routes-worker":
+        from . import routes_cmd
+
+        return routes_cmd.routes_worker(a)
+    if a.fn == "coverage":
+        from . import routes_cmd
+
+        return routes_cmd.cmd_coverage(a)
+    if a.fn == "run":
+        from . import runner
+
+        return runner.cmd_run(a)
+    if a.fn == "affected":
+        from . import affected
+
+        return affected.cmd_affected_main(a)
+    if a.fn == "compare":
+        from . import compare
+
+        return compare.cmd_compare(a)
+    if a.fn == "merge":
+        from . import compare
+
+        return compare.cmd_merge(a)
+    if a.fn == "gpus":
+        from . import gpu_claim
+
+        return gpu_claim.main(["--list"])
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
