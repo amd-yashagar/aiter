@@ -2745,6 +2745,17 @@ def _needs_swiglu_bias_support(dtype, quant_type):
     return dtype in [dtypes.bf16, dtypes.fp16] and quant_type == QuantType.per_1x32
 
 
+def _mxfp4_stage_supports_bias(activation, q_dtype_a):
+    """Whether the FlyDSL and Opus MXFP4 stages apply the expert bias.
+
+    Swiglu has always enabled it. Silu is validated for fp8 activations (a8w4);
+    without this the bias passed with Silu was silently dropped.
+    """
+    return activation == ActivationType.Swiglu or (
+        activation == ActivationType.Silu and q_dtype_a == dtypes.fp8
+    )
+
+
 def _normalize_mxfp4_activation_params(
     activation,
     beta: float | None,
@@ -5071,7 +5082,7 @@ def get_2stage_cfgs(
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
     if is_opus1 or is_flydsl1 or is_flydsl2:
         enable_bias = (
-            activation == ActivationType.Swiglu
+            _mxfp4_stage_supports_bias(activation, q_dtype_a)
             and _needs_swiglu_bias_support(dtype, q_type)
             and q_dtype_w == dtypes.fp4x2
         )
@@ -5424,10 +5435,9 @@ def get_2stage_cfgs(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
             f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
         )
-        enable_bias = (
-            activation == ActivationType.Swiglu
-            and _needs_swiglu_bias_support(dtype, q_type)
-        )
+        enable_bias = _mxfp4_stage_supports_bias(
+            activation, q_dtype_a
+        ) and _needs_swiglu_bias_support(dtype, q_type)
         return MOEMetadata(
             functools.partial(
                 _flydsl_stage1_wrapper,
