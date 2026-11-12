@@ -118,18 +118,30 @@ class _Fp8BlockGfx950(MoeKernel):
         from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage1 import (
             compile_stage1,
         )
+        from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage1_8wave import (
+            compile_stage1_8wave,
+        )
         from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage2 import (
             compile_stage2,
         )
 
-        s1 = compile_stage1(
-            model_dim=spec.model_dim,
-            inter_dim=spec.inter_dim,
-            experts=spec.experts,
-            tile_m=cfg["tile_m"],
-            act=_ACTS[spec.act],
-            doweight_stage1=spec.doweight_stage1,
-        )
+        if cfg.get("stage1") == "8wave":
+            s1 = compile_stage1_8wave(
+                model_dim=spec.model_dim,
+                inter_dim=spec.inter_dim,
+                experts=spec.experts,
+                tile_m=cfg["tile_m"],
+                act=_ACTS[spec.act],
+            )
+        else:
+            s1 = compile_stage1(
+                model_dim=spec.model_dim,
+                inter_dim=spec.inter_dim,
+                experts=spec.experts,
+                tile_m=cfg["tile_m"],
+                act=_ACTS[spec.act],
+                doweight_stage1=spec.doweight_stage1,
+            )
         s2 = compile_stage2(
             model_dim=spec.model_dim,
             inter_dim=spec.inter_dim,
