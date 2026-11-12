@@ -42,6 +42,11 @@ def inner_argv(argv, args, i, n):
         a = _swap(a, "--out", f"{args.out}.batch{i}")
     else:
         a = _swap(a, "--out-dir", os.path.join(args.out_dir, f".batch{i}"))
+    base = args.tmpdir or os.path.join(
+        os.environ.get("TMPDIR", "/tmp"), "moe-bench-tmp"
+    )
+    a = _swap(a, "--tmpdir", os.path.join(base, f"batch{i}"))
+    a = _swap(a, "--jobs", "1")
     a = [x for x in a if x not in ("--resume", "--inner")]
     return a + ["--resume", "--inner"]
 
