@@ -399,7 +399,10 @@ class FusedCfgSource(Source):
         for c in pairs:
             by_bm.setdefault(c.group, []).append(c)
         ranked = []
-        for lst in by_bm.values():
+        self.last_stage = (
+            {}
+        )  # group -> (stage-1 times, stage-2 times, {(k1, k2): cand})
+        for group, lst in by_bm.items():
             s1_names = sorted({c.meta["s1"] for c in lst})
             s2_names = sorted({c.meta["s2"] for c in lst})
             find = {(c.meta["s1"], c.meta["s2"]): c for c in lst}
@@ -436,6 +439,7 @@ class FusedCfgSource(Source):
             if not t2:
                 continue
             ref = t2.get(base[1], base[2])
+            self.last_stage[group] = (t1, t2, find)
             for (k1, k2), c in find.items():
                 if k1 in t1 and k2 in t2:
                     ranked.append((t1[k1] + t2[k2] - ref, c))

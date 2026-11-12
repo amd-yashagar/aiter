@@ -708,7 +708,24 @@ def run_bar_group(cases, spec, fh):
 
 
 FINALISTS_TOP = 8
+CROSS_TOP = 4  # top stage-1 x top stage-2 kernels per block_m group, always finalists
 FINALISTS_BAND = 0.05  # also anything within 5% of the best screened time
+
+
+def cross_products(src, top=CROSS_TOP):
+    """Pairs of the ``top`` fastest stage-1 and ``top`` fastest stage-2 kernels of each
+    block_m group, from the stage times ``src.rank`` just measured."""
+    out, seen = [], set()
+    for t1, t2, find in (getattr(src, "last_stage", None) or {}).values():
+        k1s = sorted(t1, key=t1.get)[:top]
+        k2s = sorted(t2, key=t2.get)[:top]
+        for k1 in k1s:
+            for k2 in k2s:
+                c = find.get((k1, k2))
+                if c is not None and c.id not in seen:
+                    seen.add(c.id)
+                    out.append(c)
+    return out
 
 
 def two_phase(meas, cands, bad, modes, results, src=None):
@@ -739,10 +756,18 @@ def two_phase(meas, cands, bad, modes, results, src=None):
     n = max(
         FINALISTS_TOP, sum(1 for us, _ in screened if us <= best * (1 + FINALISTS_BAND))
     )
+    # the guard: the cross product of the top stage-1 and stage-2 kernels of every block_m
+    # group is measured in full too, so a pair whose stages are each fast but whose
+    # predicted sum was off is never missed (the bar is never slower than aiter's best
+    # real pair for want of timing it)
+    for cand in cross_products(src):
+        if cand.id not in results and cand.id not in bad:
+            results[cand.id] = meas.measure(cand, quick=False, modes=modes)
     done = 0
     while done < len(screened):
         for _, cand in screened[done:n]:
-            results[cand.id] = meas.measure(cand, quick=False, modes=modes)
+            if cand.id not in results:
+                results[cand.id] = meas.measure(cand, quick=False, modes=modes)
         done = n
         if any(results[c.id].get("ok") for _, c in screened[:done]):
             return

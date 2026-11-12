@@ -119,3 +119,34 @@ def test_a_source_that_ranks_replaces_timing_every_candidate():
     assert src.asked == 1
     assert not [1 for _c, q, chk in m.calls if q and not chk], "no per-candidate timing"
     assert set(results) == {c.id for _, c in ranked[:8]}
+
+
+def test_the_top_stage_kernels_cross_product_is_always_measured_in_full():
+    """Marginal ranking predicts a pair from its stages; the guard times every pair of the
+    4 fastest stage-1 and 4 fastest stage-2 kernels of a group too."""
+    s1 = [f"a{i}" for i in range(8)]
+    s2 = [f"b{j}" for j in range(8)]
+    find = {(a, b): types.SimpleNamespace(id=f"{a}|{b}") for a in s1 for b in s2}
+    t1 = {a: 100.0 + i for i, a in enumerate(s1)}
+    t2 = {b: 200.0 + j for j, b in enumerate(s2)}
+
+    class Src:
+        def __init__(self):
+            self.last_stage = {"pair-bm32": (t1, t2, find)}
+
+        def rank(self, ctx, cands, runner):
+            # a mispredicted ranking: the true best pair sits at the very bottom
+            order = sorted(find.values(), key=lambda c: c.id, reverse=True)
+            return [(300.0 + i, c) for i, c in enumerate(order)]
+
+    cross = bar_worker.cross_products(Src())
+    assert len(cross) == 16
+    assert {c.id for c in cross} == {f"a{i}|b{j}" for i in range(4) for j in range(4)}
+    m = FakeMeasurer({c.id: 100.0 for c in find.values()})
+    results = {}
+    bar_worker.two_phase(m, list(find.values()), (), ("warm",), results, Src())
+    assert all(c.id in results for c in cross)
+    # top 8 of the (wrong) ranking plus the 16 of the guard, no pair measured twice
+    full = [c for c, q, chk in m.calls if not q and chk]
+    assert len(full) == len(set(full))
+    assert set(results) >= {c.id for c in cross}
