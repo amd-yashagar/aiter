@@ -7003,10 +7003,15 @@ def fused_topk(
     # row max (a logit 88 or more above the rest overflows to NaN weights and
     # duplicated ids), so it gets the row-max-shifted fp32 logits.
     # AITER_TOPK_SOFTMAX_HIP=1 uses the HIP kernel instead, and so does the shifted
-    # path for E <= 256 and M >= 2048, where the HIP kernel is the faster correct one.
+    # path for E <= 256 at M >= 4096 (M >= 2048 below top-8), where the HIP kernel is
+    # as fast or faster (MI300X and MI355X timings).
     if (
         not _USE_TOPK_SOFTMAX_HIP
-        and not (_USE_TOPK_SOFTMAX_SHIFT and expert <= 256 and M >= 2048)
+        and not (
+            _USE_TOPK_SOFTMAX_SHIFT
+            and expert <= 256
+            and M >= (4096 if topk >= 8 else 2048)
+        )
         and num_valid_rows is None
         and get_gfx() in ["gfx942", "gfx950"]
         and (expert, topk)
