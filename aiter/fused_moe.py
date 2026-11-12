@@ -1557,6 +1557,7 @@ def _moe_try_route(*args):
     if _MOE_ROUTING is None:
         _MOE_ROUTING = _MOE_ROUTER.active()
         if not _MOE_ROUTING:
+            _MOE_ROUTER.record_inactive()
             return None
     return _MOE_ROUTER.try_route(*args)
 
@@ -1761,6 +1762,8 @@ def _fused_moe_impl(
         )
         if routed is not None:
             return routed
+    else:
+        _MOE_ROUTER.record_inactive()
 
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4

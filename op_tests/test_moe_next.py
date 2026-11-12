@@ -156,9 +156,22 @@ def test_router(probe):
         n = probe.calls
         assert not _is_probe(fused_moe(hidden[:4], w1, w2, tw[:4], ti[:4]))
         assert probe.calls == n, "a failed kernel stays off for that weight set"
+    with env(AITER_MOE_ROUTES=table):
+        assert _is_probe(fused_moe(hidden[:4], w1, w2, tw[:4], ti[:4]))
+        assert moe.last_route()[0] == "test.probe"
     with env(AITER_MOE_ROUTES=table, AITER_MOE_DISABLE="1"):
-        assert not _is_probe(fused_moe(hidden[:4], w1, w2, tw[:4], ti[:4]))
+        for _ in range(2):  # the call that finds routing off, then the cached path
+            assert not _is_probe(fused_moe(hidden[:4], w1, w2, tw[:4], ti[:4]))
+            assert moe.last_route()[0] == "aiter", "inactive call records aiter"
+            assert "inactive" in moe.last_route()[3]
         assert aiter.fused_moe._MOE_ROUTING is False, "kill switch"
+    if not routes.table_for(router.gpu_name()).rows:  # this GPU has no rows
+        with env(AITER_MOE_ROUTES=table):
+            fused_moe(hidden[:4], w1, w2, tw[:4], ti[:4])
+        with env(AITER_MOE_ROUTES=None):
+            fused_moe(hidden[:4], w1, w2, tw[:4], ti[:4])
+            assert moe.last_route()[0] == "aiter", "no route rows records aiter"
+            assert "inactive" in moe.last_route()[3]
     with env(AITER_MOE_ROUTES="nope"):
         fused_moe(hidden[:4], w1, w2, tw[:4], ti[:4])
         assert moe.last_route()[0] == "aiter" and "unknown" in moe.last_route()[3]

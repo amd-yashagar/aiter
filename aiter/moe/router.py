@@ -80,6 +80,20 @@ def last_route() -> LastRoute:
     return getattr(_LAST, "route", LastRoute("aiter", "", "", "no call yet", None))
 
 
+_INACTIVE = LastRoute(
+    "aiter",
+    "",
+    "",
+    "routing inactive (AITER_MOE_DISABLE=1, or no route rows and no AITER_MOE_ROUTES)",
+    None,
+)
+
+
+def record_inactive() -> None:
+    """A fused_moe call the hook did not route at all: today's path."""
+    _LAST.route = _INACTIVE
+
+
 def _record(kernel, family, gpu, reason, key):
     num = None
     if kernel != "aiter":
