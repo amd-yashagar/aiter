@@ -1,1 +1,3 @@
 family,model_dim,inter_dim,experts,topk,act,doweight_stage1,m_min,m_max,kernel,config,verified,note
+fp8-block,7168,256,257,9,silu,0,8192,10240,gfx950_fp8_block.prefill,p128w8,smci355 tier2-fp8-block-00281 + M sweep 2026-11-12,DSV3 E257 prefill: 0.92-0.99x the fmoe 64x256 1-stage bar warm and cold
+fp8-block,7168,256,257,9,silu,0,13312,16384,gfx950_fp8_block.prefill,p128w8,smci355 tier2-fp8-block-00282 + M sweep 2026-11-12,DSV3 E257 prefill: 0.96-0.98x the bar warm and cold (11264 loses and 12288 ties: aiter)
