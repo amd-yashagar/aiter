@@ -5,13 +5,49 @@
     "gateup_ch": 2,
     "gateup_pw": 2,
     "gateup_pa": 2,
-    "down_nbd": 2,
+    "down_nbd": 4,
     "down_waves": 4
   },
-  "pw1": {"gateup_pw": 1, "gateup_pa": 1},
-  "pw3": {"gateup_pw": 3},
-  "ch1pw4": {"gateup_ch": 1, "gateup_pw": 4},
-  "m32": {"tile_m": 32},
-  "m32pw3": {"tile_m": 32, "gateup_pw": 3},
-  "m32ch1pw4": {"tile_m": 32, "gateup_ch": 1, "gateup_pw": 4}
+  "pw1": {
+    "gateup_pw": 1,
+    "gateup_pa": 1
+  },
+  "pw3": {
+    "gateup_pw": 3
+  },
+  "ch1pw4": {
+    "gateup_ch": 1,
+    "gateup_pw": 4
+  },
+  "m32": {
+    "tile_m": 32
+  },
+  "m32pw3": {
+    "tile_m": 32,
+    "gateup_pw": 3
+  },
+  "m32ch1pw4": {
+    "tile_m": 32,
+    "gateup_ch": 1,
+    "gateup_pw": 4
+  },
+  "wc0": {
+    "w_cache": 0
+  },
+  "m32wc0": {
+    "tile_m": 32,
+    "w_cache": 0
+  },
+  "m32nbd2": {
+    "tile_m": 32,
+    "down_nbd": 2
+  },
+  "m32nbd8": {
+    "tile_m": 32,
+    "down_nbd": 8
+  },
+  "m32pwd4": {
+    "tile_m": 32,
+    "down_pw": 4
+  }
 }

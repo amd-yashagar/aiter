@@ -51,8 +51,10 @@ class _Tile:
     ch: int
     pw: int
     pa: int
+    w_cache: int
     nbd: int
     waves: int
+    pwd: int
 
 
 def _tile(config, gpu, model_dim, inter_dim):
@@ -64,17 +66,19 @@ def _tile(config, gpu, model_dim, inter_dim):
         ch //= 2
     while gw > 1 and inter_dim % (16 * gw):
         gw //= 2
-    nbd, waves = int(cfg.get("down_nbd", 2)), int(cfg.get("down_waves", 4))
+    nbd, waves = int(cfg.get("down_nbd", 4)), int(cfg.get("down_waves", 4))
     while waves > 1 and model_dim % (16 * nbd * waves):
         waves //= 2
     while nbd > 1 and model_dim % (16 * nbd * waves):
         nbd //= 2
     pw, pa = int(cfg.get("gateup_pw", 2)), int(cfg.get("gateup_pa", 2))
-    return _Tile(int(cfg.get("tile_m", 64)), gw, ch, pw, pa, nbd, waves)
+    w_cache = int(cfg.get("w_cache", 2))
+    pwd = int(cfg.get("down_pw", 2))
+    return _Tile(int(cfg.get("tile_m", 64)), gw, ch, pw, pa, w_cache, nbd, waves, pwd)
 
 
 @functools.cache
-def _gateup(N, K, s_max, waves, ch, pw, pa, act, swiglu_limit):
+def _gateup(N, K, s_max, waves, ch, pw, pa, w_cache, act, swiglu_limit):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token_mid.gateup import (
         compile_gateup,
     )
@@ -87,19 +91,28 @@ def _gateup(N, K, s_max, waves, ch, pw, pa, act, swiglu_limit):
         CH=ch,
         PW=pw,
         PA=pa,
+        W_CACHE=w_cache,
         activation=act,
         swiglu_limit=swiglu_limit,
     )
 
 
 @functools.cache
-def _down(N, K, topk, s_max, nbd, waves, rows):
+def _down(N, K, topk, s_max, nbd, waves, pwd, rows, w_cache):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token_mid.down import (
         compile_down,
     )
 
     return compile_down(
-        N=N, K=K, TOPK=topk, S_MAX=s_max, NBD=nbd, WAVES=waves, ROWS=rows
+        N=N,
+        K=K,
+        TOPK=topk,
+        S_MAX=s_max,
+        NBD=nbd,
+        WAVES=waves,
+        PWD=pwd,
+        ROWS=rows,
+        W_CACHE=w_cache,
     )
 
 
@@ -187,11 +200,13 @@ class Gfx942Fp8TokenMid(MoeKernel):
         act, limit = _ACTS[spec.act], _swiglu_limit(spec)
         s_max = t.tile_m // 16
         with compile_only():
-            gu = _gateup(2 * I, D, s_max, t.gu_waves, t.ch, t.pw, t.pa, act, limit)
+            gu = _gateup(
+                2 * I, D, s_max, t.gu_waves, t.ch, t.pw, t.pa, t.w_cache, act, limit
+            )
             types = (fx.BFloat16, fx.Uint8, fx.BFloat16) + (fx.Int32,) * 3
             types += (fx.Float32,)
             gu(*[flyc.from_c_void_p(x, 0) for x in types], m, 1, fx.Stream(None))
-            dn = _down(D, I, topk, s_max, t.nbd, t.waves, self.rows)
+            dn = _down(D, I, topk, s_max, t.nbd, t.waves, t.pwd, self.rows, t.w_cache)
             types = (fx.BFloat16, fx.Uint8, fx.BFloat16, fx.Int32, fx.Float32)
             types += (fx.Int32, fx.Int32, fx.Float32)
             dn(*[flyc.from_c_void_p(x, 0) for x in types], m, 1, fx.Stream(None))
@@ -228,7 +243,9 @@ class Gfx942Fp8TokenMid(MoeKernel):
         inter = torch.empty((tm.rows, I), dtype=torch.bfloat16, device=dev)
         act, limit = _ACTS[spec.act], _swiglu_limit(spec)
         _launch(
-            _gateup(2 * I, D, s_max, t.gu_waves, t.ch, t.pw, t.pa, act, limit),
+            _gateup(
+                2 * I, D, s_max, t.gu_waves, t.ch, t.pw, t.pa, t.w_cache, act, limit
+            ),
             x,
             call.w1,
             inter,
@@ -243,7 +260,7 @@ class Gfx942Fp8TokenMid(MoeKernel):
         if self.rows:
             dst = torch.empty((M * topk, D), dtype=torch.bfloat16, device=dev)
         _launch(
-            _down(D, I, topk, s_max, t.nbd, t.waves, self.rows),
+            _down(D, I, topk, s_max, t.nbd, t.waves, t.pwd, self.rows, t.w_cache),
             inter,
             call.w2,
             dst,
