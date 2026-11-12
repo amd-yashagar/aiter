@@ -12,7 +12,6 @@ as e8m0_shuffle / shuffle_scale_a16w4; gate/up separated or 16-row interleaved
 """
 
 import os
-from typing import ClassVar
 
 import torch
 
@@ -58,7 +57,7 @@ def parse_config(config):
     out = {}
     for tok in (config or "").split("_"):
         key = tok.rstrip("0123456789")
-        if key in ("bm", "tn", "la", "nb", "ra") and tok[len(key) :]:
+        if key in ("bm", "tn", "la", "nb", "ra", "nt", "ar") and tok[len(key) :]:
             out[key] = int(tok[len(key) :])
     return out
 
@@ -180,6 +179,8 @@ class _MxGfx950(MoeKernel):
             tile_n=tn,
             ahead=la,
             read_ahead=cfg.get("ra", 1),
+            nt=bool(cfg.get("nt", 1)),
+            a_resident=bool(cfg.get("ar", 1)),
         )
         s2 = compile_stage2(
             model_dim=spec.model_dim,
@@ -192,6 +193,7 @@ class _MxGfx950(MoeKernel):
             reduce=reduce,
             topk=topk,
             blocks=nb,
+            nt=bool(cfg.get("nt", 1)),
         )
         r = compile_reduce(model_dim=spec.model_dim, topk=topk) if reduce else None
         return bm, a, q, s1, s2, r
@@ -327,25 +329,49 @@ class _MxGfx950(MoeKernel):
         return out
 
 
-@register_kernel
-class MxGfx950Decode(_MxGfx950):
-    id = "gfx950_mx.decode"
-    epilogue = "atomic"
-    numerics: ClassVar[dict] = {
-        "act_quant": "per_1x32_mx_roundup",
-        "inter": "fp32_direct",
-        "combine": "bf16_atomic",
-    }
-    prefill = False
+_ACT_TERM = {"fp4": "mx_fp4", "fp8": "mx_fp8"}
+_FAMILIES = {
+    # family: (activation dtype, weight dtype)
+    "a4w4": (dtypes.fp4x2, dtypes.fp4x2),
+    "a8w4": (dtypes.fp8, dtypes.fp4x2),
+    "mxfp8": (dtypes.fp8, dtypes.fp8),
+}
 
 
-@register_kernel
-class MxGfx950Prefill(_MxGfx950):
-    id = "gfx950_mx.prefill"
-    epilogue = "reduce"
-    numerics: ClassVar[dict] = {
-        "act_quant": "per_1x32_mx_roundup",
-        "inter": "fp32_direct",
-        "combine": "bf16_rows_fp32_reduce",
-    }
-    prefill = True
+def _make(fam, prefill):
+    a_dt, w_dt = _FAMILIES[fam]
+    name = f"Mx{fam.capitalize()}Gfx950{'Prefill' if prefill else 'Decode'}"
+
+    def supports(self, spec, m, topk, call=None):
+        if spec.w_dtype != w_dt:
+            return f"weights are {spec.w_dtype}, not {fam}"
+        if call is not None:
+            a = activation_dtype(
+                spec, call.weights, call.w1, m, call.hidden_states.dtype, False
+            )
+            if a != a_dt:
+                return f"activation dtype {a} is not {fam}"
+        return _MxGfx950.supports(self, spec, m, topk, call)
+
+    cls = type(
+        name,
+        (_MxGfx950,),
+        {
+            "id": f"gfx950_mx_{fam}.{'prefill' if prefill else 'decode'}",
+            "family": fam,
+            "epilogue": "reduce" if prefill else "atomic",
+            "prefill": prefill,
+            "numerics": {
+                "act_quant": _ACT_TERM[_DT[a_dt]],
+                "inter": "fp32_direct",
+                "combine": "bf16_rows_fp32_sum" if prefill else "bf16_atomic",
+            },
+            "supports": supports,
+        },
+    )
+    return register_kernel(cls)
+
+
+for _fam in _FAMILIES:
+    for _prefill in (False, True):
+        _make(_fam, _prefill)
