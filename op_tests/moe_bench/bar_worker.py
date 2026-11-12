@@ -224,6 +224,15 @@ class Measurer:
             except NotImplementedError:
                 raise
             except Exception as e:  # noqa: BLE001
+                if _is_gpu_fault(_err(e)):
+                    emit(
+                        self.fh,
+                        {
+                            "event": "log",
+                            "msg": f"gpu fault building the reference: {_err(e)}",
+                        },
+                    )
+                    os._exit(70)
                 res["outcome"] = "noref"
                 self._emit(
                     base,
