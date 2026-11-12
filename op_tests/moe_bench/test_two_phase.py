@@ -96,3 +96,26 @@ def test_forced_config_file_is_per_worker(tmp_path, monkeypatch):
     assert other != mine and "kernelName1" in text
     assert text.splitlines()[1].count("k") >= 1
     os.environ.pop("AITER_CONFIG_FMOE", None)
+
+
+class RankingSource:
+    """A source that predicts pair times from their stages (FusedCfgSource.rank)."""
+
+    def __init__(self, ranked):
+        self.ranked, self.asked = ranked, 0
+
+    def rank(self, ctx, cands, runner):
+        self.asked += 1
+        return self.ranked
+
+
+def test_a_source_that_ranks_replaces_timing_every_candidate():
+    cands = _cands(300)  # a product of stages: far too many to time one by one
+    ranked = [(100.0 + i, c) for i, c in enumerate(cands[:20])]
+    m = FakeMeasurer({c.id: us for us, c in ranked})
+    src = RankingSource(ranked)
+    results = {}
+    bar_worker.two_phase(m, cands, (), ("warm",), results, src)
+    assert src.asked == 1
+    assert not [1 for _c, q, chk in m.calls if q and not chk], "no per-candidate timing"
+    assert set(results) == {c.id for _, c in ranked[:8]}

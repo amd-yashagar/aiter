@@ -679,7 +679,7 @@ def run_bar_group(cases, spec, fh):
                 {"event": "log", "msg": f"{c.id} {src.name}: {len(cands)} candidates"},
             )
             if mode_kind == "bar" and spec.get("screen") == "two-phase":
-                two_phase(meas, cands, bad.get(c.id, ()), modes, results)
+                two_phase(meas, cands, bad.get(c.id, ()), modes, results, src)
                 continue
             if mode_kind == "bar":
                 keep = src.screen(ctx, cands, _Screener(meas, bad.get(c.id, ())))
@@ -711,24 +711,28 @@ FINALISTS_TOP = 8
 FINALISTS_BAND = 0.05  # also anything within 5% of the best screened time
 
 
-def two_phase(meas, cands, bad, modes, results):
+def two_phase(meas, cands, bad, modes, results, src=None):
     """Two-phase bar screening of one source's candidates.
 
-    Phase 1 times every candidate briefly and warm, without the accuracy check. Phase 2
-    runs the full measurement (warm and cold timing, accuracy) for the finalists: the
-    fastest ``FINALISTS_TOP`` plus anything within ``FINALISTS_BAND`` of the best screened
-    time. If every finalist fails, the set widens by the next ``FINALISTS_TOP`` screened
-    candidates until one passes or none is left. Results go into ``results``.
+    Phase 1 ranks the candidates by a short warm timing without the accuracy check: every
+    candidate is timed, or, where the source can predict a pair's time from its stages
+    (``src.rank``), the stages are. Phase 2 runs the full measurement (warm and cold
+    timing, accuracy) for the finalists: the fastest ``FINALISTS_TOP`` plus anything within
+    ``FINALISTS_BAND`` of the best screened time. If every finalist fails, the set widens by
+    the next ``FINALISTS_TOP`` ranked candidates until one passes or none is left. Results
+    go into ``results``.
     """
     bad = set(bad)
-    screened = []
-    for cand in cands:
-        if cand.id in bad:
-            continue
-        r = meas.measure(cand, quick=True, modes=("warm",), check=False)
-        if r["ok"]:
-            screened.append((r["us"], cand))
-    screened.sort(key=lambda t: t[0])
+    cands = [c for c in cands if c.id not in bad]
+    if src is not None and hasattr(src, "rank"):
+        screened = src.rank(None, cands, _Screener(meas, bad))
+    else:
+        screened = []
+        for cand in cands:
+            r = meas.measure(cand, quick=True, modes=("warm",), check=False)
+            if r["ok"]:
+                screened.append((r["us"], cand))
+        screened.sort(key=lambda t: t[0])
     if not screened:
         return
     best = screened[0][0]
@@ -750,10 +754,10 @@ class _Screener:
         self.meas = meas
         self.bad = set(bad)
 
-    def measure(self, cand, quick=True):
+    def measure(self, cand, quick=True, check=True):
         if cand.id in self.bad:
             return {"ok": False, "us": None}
-        return self.meas.measure(cand, quick=quick, modes=("warm",))
+        return self.meas.measure(cand, quick=quick, modes=("warm",), check=check)
 
 
 def _gate(who, acc, numerics=""):

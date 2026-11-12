@@ -384,6 +384,68 @@ class FusedCfgSource(Source):
             out.append(ForcedConfig(f"fused_moe|graph|{cs}", k1, row, "whole-graph"))
         return out
 
+    def rank(self, ctx, cands, runner):
+        """Timing-only ranking for two-phase bar screening: [(predicted us, candidate)],
+        fastest first, over every candidate.
+
+        A pair's time is predicted from the marginal effect of each stage (stage 1 with a
+        fixed stage 2, then stage 2 with the best stage 1): n1 + n2 short timings per
+        block_m group instead of the n1 x n2 product (55k pairs for one a4w4 case). Singles
+        (1-stage, whole-graph) are timed directly. No accuracy check here: finalists get it.
+        """
+        pairs = [c for c in cands if c.group.startswith("pair-")]
+        singles = [c for c in cands if not c.group.startswith("pair-")]
+        by_bm = {}
+        for c in pairs:
+            by_bm.setdefault(c.group, []).append(c)
+        ranked = []
+        for lst in by_bm.values():
+            s1_names = sorted({c.meta["s1"] for c in lst})
+            s2_names = sorted({c.meta["s2"] for c in lst})
+            find = {(c.meta["s1"], c.meta["s2"]): c for c in lst}
+            base = None
+            for k2 in s2_names:
+                c = find.get((s1_names[0], k2))
+                if c is None:
+                    continue
+                res = runner.measure(c, quick=True, check=False)
+                if res["ok"]:
+                    base = (s1_names[0], k2, res["us"])
+                    break
+            if base is None:
+                continue
+            t1 = {}
+            for k1 in s1_names:
+                c = find.get((k1, base[1]))
+                if c is None:
+                    continue
+                res = runner.measure(c, quick=True, check=False)
+                if res["ok"]:
+                    t1[k1] = res["us"]
+            if not t1:
+                continue
+            best1 = min(t1, key=t1.get)
+            t2 = {}
+            for k2 in s2_names:
+                c = find.get((best1, k2))
+                if c is None:
+                    continue
+                res = runner.measure(c, quick=True, check=False)
+                if res["ok"]:
+                    t2[k2] = res["us"]
+            if not t2:
+                continue
+            ref = t2.get(base[1], base[2])
+            for (k1, k2), c in find.items():
+                if k1 in t1 and k2 in t2:
+                    ranked.append((t1[k1] + t2[k2] - ref, c))
+        for c in singles:
+            res = runner.measure(c, quick=True, check=False)
+            if res["ok"]:
+                ranked.append((res["us"], c))
+        ranked.sort(key=lambda t: t[0])
+        return ranked
+
     def screen(self, ctx, cands, runner):
         """Marginal-effect screening of pairs; singles are timed directly."""
         pairs = [c for c in cands if c.group.startswith("pair-")]

@@ -89,3 +89,28 @@ def test_plan_only_writes_the_batches(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0 and "batch 000" in out and "batch 001" in out
     assert (tmp_path / "o" / "pipeline" / "batch-000.csv").exists()
+
+
+def test_covering_pairs_compile_every_stage_kernel_once_not_the_product():
+    import types
+
+    from op_tests.moe_bench import flydsl_prebuild as fp
+
+    def pair(g, a, b):
+        return types.SimpleNamespace(
+            id=f"{g}|{a}|{b}", group=g, kernels="flydsl_x", meta={"s1": a, "s2": b}
+        )
+
+    cands = [pair("pair-bm32", f"a{i}", f"b{j}") for i in range(6) for j in range(11)]
+    cands += [pair("pair-bm64", f"a{i}", f"b{j}") for i in range(3) for j in range(4)]
+    single = types.SimpleNamespace(
+        id="g", group="whole-graph", kernels="impl__flydsl", meta={}
+    )
+    keep = fp.covering_pairs(cands + [single])
+    bm32 = [c for c in keep if c.group == "pair-bm32"]
+    bm64 = [c for c in keep if c.group == "pair-bm64"]
+    assert single in keep
+    assert len(bm32) == 11 and len(bm64) == 4  # max(n1, n2), not 66 and 12
+    for lst, n1, n2 in ((bm32, 6, 11), (bm64, 3, 4)):
+        assert len({c.meta["s1"] for c in lst}) == n1
+        assert len({c.meta["s2"] for c in lst}) == n2

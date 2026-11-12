@@ -63,12 +63,47 @@ def make_ctx(S, case, tmpdir, gfx, cu):
 
 
 def enumerate_flydsl(S, case, tmpdir, gfx, cu):
-    """The FlyDSL candidates the bar would try for ``case`` (no GPU needed)."""
+    """The FlyDSL candidates to compile for ``case`` (no GPU needed): the bar's FlyDSL
+    singles plus a covering set of its stage pairs (``covering_pairs``)."""
     from .candidates.fused_cfg import FusedCfgSource
 
     ctx = make_ctx(S, case, tmpdir, gfx, cu)
     cands = FusedCfgSource().enumerate(ctx)
-    return ctx, [c for c in cands if is_flydsl(c)]
+    return ctx, covering_pairs([c for c in cands if is_flydsl(c)])
+
+
+def covering_pairs(cands):
+    """Candidates to compile so every stage kernel is compiled at least once.
+
+    Pair candidates are the product of stage-1 and stage-2 kernels per block_m group (55k
+    for one a4w4 case), but a stage's artifact does not depend on its partner: its key is
+    that stage's own lowered code and config. So a smallest cover of the stage-1 and stage-2
+    kernels (about max(n1, n2) pairs per group) fills the cache for every pair and every
+    pair the bar's marginal screening will time. Singles (1-stage, whole-graph) are all kept.
+    """
+    pairs = [c for c in cands if c.group.startswith("pair-")]
+    keep = [c for c in cands if not c.group.startswith("pair-")]
+    by_group = {}
+    for c in pairs:
+        by_group.setdefault(c.group, []).append(c)
+    for lst in by_group.values():
+        by_s1 = {}
+        for c in lst:
+            by_s1.setdefault(c.meta["s1"], []).append(c)
+        need1 = set(by_s1)
+        need2 = {c.meta["s2"] for c in lst}
+        while need1 or need2:
+            best, gain = None, -1
+            for c in lst:
+                g = (c.meta["s1"] in need1) + (c.meta["s2"] in need2)
+                if g > gain:
+                    best, gain = c, g
+                    if g == 2:
+                        break
+            keep.append(best)
+            need1.discard(best.meta["s1"])
+            need2.discard(best.meta["s2"])
+    return keep
 
 
 def _patch_generators():
