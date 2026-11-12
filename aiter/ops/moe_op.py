@@ -142,6 +142,19 @@ def topk_softmax_asm(
 ) -> None: ...
 
 
+@compile_ops(
+    "module_moe_topksoftmax_asm", fc_name="topk_softmax_asm_shifted", ffi_type="ctypes"
+)
+def topk_softmax_asm_shifted(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    shifted: Tensor,
+    need_renorm: bool,
+) -> None: ...
+
+
 @compile_ops("module_moe_topk_ck")
 def topk_sigmoid(
     topk_weights: Tensor, topk_indices: Tensor, gating_output: Tensor
