@@ -252,6 +252,7 @@ EDGE_CASES = [
     (64, 256, 8, 128, "onehot", False, None),
     (40, 64, 6, 32, "dup", False, None),
     (3000, 256, 8, 32, "dup", True, None),
+    (2000, 128, 6, 16, "dup", False, None),
     (500, 256, 8, 64, "pad", False, None),
     (100, 256, 8, 32, "random", False, 50),
     (127, 40, 6, 16, "all_empty", False, None),

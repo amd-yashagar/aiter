@@ -20,7 +20,8 @@ ballots over the expert id bits; ranks across waves and rounds follow route
 order, which is token-major, so expert segments come out in token order.
 
 Two launch shapes:
-  oneshot   one launch; workgroup 0 sorts, the rest zero-fill the output.
+  oneshot   one launch, up to STAGE routes; workgroup 0 sorts, the rest
+            zero-fill the output.
   count +   per-chunk expert counts (and the zero-fill), then every chunk
   scatter   reads all counts, takes its prefix and scatters its routes.
 """
@@ -65,28 +66,47 @@ def _lds_st(ptr, v, i):
     fx.ptr_store(v, ptr + fx.Int64(i))
 
 
-def _load_route(ids_it, w_it, i, end, with_weight):
-    """(raw expert id, in range, weight) of route slot ``i``; loads only."""
+def _load_route(ids_it, w_it, i, end, with_weight, topk=1, halo_end=None):
+    """(raw expert id, in range, weight, halo) of route slot ``i``; loads only.
+    ``halo`` is the id of slot ``i + WAVE`` (-1 past ``halo_end``, the total
+    route count, default ``end``), which the repeated-expert check reads for a
+    token whose slots run into the next wave or chunk."""
+    c0 = fx.Int32(0)
     inb = i < end
-    j = inb.select(i, fx.Int32(0))
-    e = _ld(ids_it, j)
-    w = _ld(w_it, j) if with_weight else None
-    return e, inb, w
+    e = _ld(ids_it, inb.select(i, c0))
+    w = _ld(w_it, inb.select(i, c0)) if with_weight else None
+    halo = None
+    if topk > 1:
+        hi = i + fx.Int32(WAVE)
+        hin = hi < (end if halo_end is None else halo_end)
+        halo = hin.select(_ld(ids_it, hin.select(hi, c0)), fx.Int32(-1))
+    return e, inb, w, halo
 
 
-def _check(e, inb, mask_lds, num_experts, has_mask, ids_it=None, i=None, topk=1):
+def _lane_value(v, src):
+    return fx.Int32(rocdl.ds_bpermute(T.i32, _raw(src * fx.Int32(4)), _raw(v)))
+
+
+def _check(e, inb, mask_lds, num_experts, has_mask, halo=None, i=None, topk=1):
     """(expert or 0, valid): in range, a real expert, local under EP, and not
     repeated in a later slot of the same token (aiter's sorts keep only the
-    last slot of a repeated expert)."""
+    last slot of a repeated expert). Later slots of the token are lanes
+    ``lane + j`` of this wave, or of ``halo`` past the wave's end, read with
+    ds_bpermute; every lane must take part."""
     valid = inb & (e >= fx.Int32(0)) & (e < fx.Int32(num_experts))
     es = valid.select(e, fx.Int32(0))
     if has_mask:
         valid = valid & (_lds(mask_lds, es) != fx.Int32(0))
     if topk > 1:
+        lane = i % fx.Int32(WAVE)
         slot = i - i // fx.Int32(topk) * fx.Int32(topk)
         for j in range_constexpr(1, topk):
+            src = lane + fx.Int32(j)
+            inside = src < fx.Int32(WAVE)
+            mine = _lane_value(e, inside.select(src, fx.Int32(0)))
+            ahead = _lane_value(halo, inside.select(fx.Int32(0), src - fx.Int32(WAVE)))
+            other = inside.select(mine, ahead)
             later = slot + fx.Int32(j) < fx.Int32(topk)
-            other = _ld(ids_it, (valid & later).select(i + fx.Int32(j), fx.Int32(OOB)))
             valid = valid & ~(later & (other == e))
     return valid.select(e, fx.Int32(0)), valid
 
@@ -144,14 +164,18 @@ def _zero_fill(z_it, first, stride, n_v4):
 
 
 @flyc.jit
-def _histogram(hist, mask_lds, tid, ids_it, begin, end, num_experts, topk, has_mask):
+def _histogram(
+    hist, mask_lds, tid, ids_it, begin, end, n_total, num_experts, topk, has_mask
+):
     """hist[e] += routes of expert e in [begin, end); loads are issued a stage
     (STAGE_ROUNDS rounds) at a time."""
     stages = (end - begin + fx.Int32(STAGE - 1)) // fx.Int32(STAGE)
     for st in range(fx.Int32(0), stages, fx.Int32(1)):
         i0 = begin + fx.Int32(st) * fx.Int32(STAGE) + tid
         raw = [
-            _load_route(ids_it, None, i0 + fx.Int32(k * BLOCK), end, False)
+            _load_route(
+                ids_it, None, i0 + fx.Int32(k * BLOCK), end, False, topk, n_total
+            )
             for k in range_constexpr(STAGE_ROUNDS)
         ]
         routes = [
@@ -161,7 +185,7 @@ def _histogram(hist, mask_lds, tid, ids_it, begin, end, num_experts, topk, has_m
                 mask_lds,
                 num_experts,
                 has_mask,
-                ids_it,
+                raw[k][3],
                 i0 + fx.Int32(k * BLOCK),
                 topk,
             )
@@ -359,6 +383,7 @@ def _rank_and_scatter(
     sw_it,
     begin,
     end,
+    n_total,
     num_experts,
     topk,
     has_mask,
@@ -373,7 +398,9 @@ def _rank_and_scatter(
     for st in range(fx.Int32(0), stages, fx.Int32(1)):
         base = begin + fx.Int32(st) * fx.Int32(STAGE)
         raw = [
-            _load_route(ids_it, w_it, base + fx.Int32(k * BLOCK) + tid, end, True)
+            _load_route(
+                ids_it, w_it, base + fx.Int32(k * BLOCK) + tid, end, True, topk, n_total
+            )
             for k in range_constexpr(STAGE_ROUNDS)
         ]
         routes = [
@@ -383,7 +410,7 @@ def _rank_and_scatter(
                 mask_lds,
                 num_experts,
                 has_mask,
-                ids_it,
+                raw[k][3],
                 base + fx.Int32(k * BLOCK) + tid,
                 topk,
             )
@@ -437,14 +464,16 @@ def _oneshot_body(
     key_bits,
     ept,
     e_cap,
+    rounds,
 ):
-    """The whole sort in one workgroup, for at most STAGE routes: every route's
-    id and weight is loaded once, up front, beside the mask."""
+    """The whole sort in one workgroup, for at most ``rounds`` * BLOCK routes
+    (``rounds`` <= STAGE_ROUNDS, from the static token count): every route's id
+    and weight is loaded once, up front, beside the mask."""
     n = tokens * fx.Int32(topk)
     wave = tid // fx.Int32(WAVE)
     raw = [
-        _load_route(ids_it, w_it, fx.Int32(k * BLOCK) + tid, n, True)
-        for k in range_constexpr(STAGE_ROUNDS)
+        _load_route(ids_it, w_it, fx.Int32(k * BLOCK) + tid, n, True, topk)
+        for k in range_constexpr(rounds)
     ]
     if has_mask:
         _load_mask(mask_lds, mask_it, tid, num_experts, e_cap)
@@ -458,13 +487,13 @@ def _oneshot_body(
             mask_lds,
             num_experts,
             has_mask,
-            ids_it,
+            raw[k][3],
             fx.Int32(k * BLOCK) + tid,
             topk,
         )
-        for k in range_constexpr(STAGE_ROUNDS)
+        for k in range_constexpr(rounds)
     ]
-    for k in range_constexpr(STAGE_ROUNDS):
+    for k in range_constexpr(rounds):
         if routes[k][1]:
             fx.atomic_add(
                 hist + fx.Int64(routes[k][0]), fx.Int32(1), syncscope="workgroup"
@@ -494,7 +523,7 @@ def _oneshot_body(
         e = fx.Int32(k) + tid
         _lds_st(run, _lds(start, e), e)
     gpu.barrier()
-    for k in range_constexpr(STAGE_ROUNDS):
+    for k in range_constexpr(rounds):
         if fx.Int32(k * BLOCK) < n:
             _rank_round(
                 run,
@@ -547,90 +576,10 @@ def _store_counts(hist, c_it, tid, bid, num_experts, e_cap):
             _st(c_it, _lds(hist, e), bid * fx.Int32(num_experts) + e)
 
 
-@flyc.jit
-def _oneshot_big(
-    hist,
-    run,
-    local,
-    start,
-    tbl,
-    scan,
-    mask_lds,
-    tid,
-    ids_it,
-    w_it,
-    mask_it,
-    sids_it,
-    sw_it,
-    seid_it,
-    nv_it,
-    live_it,
-    nlive_it,
-    tokens,
-    num_experts,
-    topk,
-    tile_m,
-    has_mask,
-    key_bits,
-    ept,
-    e_cap,
-):
-    """The whole sort in one workgroup for more than STAGE routes: the routes
-    stream through in stages, once for the histogram and once to scatter."""
-    n = tokens * fx.Int32(topk)
-    if has_mask:
-        _load_mask(mask_lds, mask_it, tid, num_experts, e_cap)
-    _clear(hist, e_cap, tid)
-    _clear(tbl, 2 * WAVES * e_cap, tid)
-    gpu.barrier()
-    _histogram(hist, mask_lds, tid, ids_it, fx.Int32(0), n, num_experts, topk, has_mask)
-    total = _expert_scan(
-        hist, start, local, scan, tid, mask_lds, num_experts, tile_m, ept, has_mask
-    )
-    _write_meta(nv_it, nlive_it, tid, tokens, total, tile_m)
-    _write_tile_list(
-        hist,
-        start,
-        local,
-        seid_it,
-        live_it,
-        total,
-        tid,
-        fx.Int32(BLOCK),
-        num_experts,
-        tile_m,
-        key_bits,
-    )
-    _write_padding(
-        hist, start, sids_it, sw_it, tid, tokens, num_experts, topk, tile_m, ept
-    )
-    for k in range_constexpr(0, e_cap, BLOCK):
-        e = fx.Int32(k) + tid
-        _lds_st(run, _lds(start, e), e)
-    gpu.barrier()
-    _rank_and_scatter(
-        run,
-        tbl,
-        mask_lds,
-        tid,
-        ids_it,
-        w_it,
-        sids_it,
-        sw_it,
-        fx.Int32(0),
-        n,
-        num_experts,
-        topk,
-        has_mask,
-        key_bits,
-        e_cap,
-    )
-
-
 @functools.lru_cache(maxsize=128)
-def build(num_experts, topk, tile_m, has_mask, has_local, big=False):
+def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
     """Compile-time specialisation; returns (oneshot, count, scatter) launchers.
-    ``big`` makes the one-shot stream more than STAGE routes."""
+    ``rounds`` bounds the one-shot's 256-route rounds (from M * topk)."""
     E = num_experts
     key_bits = max(1, (E - 1).bit_length())
     ept = -(-E // BLOCK)  # experts per thread in the expert scan
@@ -684,8 +633,7 @@ def build(num_experts, topk, tile_m, has_mask, has_local, big=False):
                 _zero_rows(tokens, m_cap) * row_v4,
             )
         if bid == c0:
-            body = _oneshot_big if big else _oneshot_body
-            body(
+            _oneshot_body(
                 hist,
                 run,
                 local,
@@ -711,6 +659,7 @@ def build(num_experts, topk, tile_m, has_mask, has_local, big=False):
                 key_bits,
                 ept,
                 e_cap,
+                rounds,
             )
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
@@ -743,7 +692,9 @@ def build(num_experts, topk, tile_m, has_mask, has_local, big=False):
                 _load_mask(lds.mask.ptr, _it(mask), tid, E, e_cap)
             _clear(hist, e_cap, tid)
             gpu.barrier()
-            _histogram(hist, lds.mask.ptr, tid, _it(ids), begin, end, E, topk, has_mask)
+            _histogram(
+                hist, lds.mask.ptr, tid, _it(ids), begin, end, n, E, topk, has_mask
+            )
             _store_counts(hist, _it(counts), tid, bid, E, e_cap)
         _zero_fill(
             _it(zbuf),
@@ -843,6 +794,7 @@ def build(num_experts, topk, tile_m, has_mask, has_local, big=False):
             _it(sorted_w),
             begin,
             end,
+            n,
             E,
             topk,
             has_mask,

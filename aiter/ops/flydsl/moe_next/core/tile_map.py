@@ -12,9 +12,8 @@ import torch
 from aiter.jit.utils.chip_info import get_cu_num
 
 TILE_M = (16, 32, 64, 128)
-# Up to STAGE_ROUTES route slots (M * topk) one workgroup sorts from registers;
-# up to ONESHOT_MAX_ROUTES it streams them; above, the sort is count + scatter.
-STAGE_ROUTES = 2048
+# Up to this many route slots (M * topk) one workgroup sorts them all from
+# registers; above, the sort is count + scatter.
 ONESHOT_MAX_ROUTES = 2048
 CHUNK_MIN_ROUTES = 1024
 MAX_CHUNKS = 128
@@ -151,7 +150,7 @@ def route_to_tiles(
         tile_m,
         expert_mask is not None,
         num_local_tokens is not None,
-        STAGE_ROUTES < n_routes <= ONESHOT_MAX_ROUTES,
+        rounds=min(8, max(1, -(-n_routes // 256))),
     )
     stream = torch.cuda.current_stream(dev)
     if n_routes <= ONESHOT_MAX_ROUTES:
