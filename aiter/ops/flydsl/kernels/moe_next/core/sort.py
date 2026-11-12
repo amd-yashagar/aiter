@@ -751,9 +751,15 @@ def _oneshot_body(
             )
 
 
+def count_batch(e_cap):
+    """Chunks per batch of the count sum: about COUNT_BATCH loads a thread
+    whatever E (96 live values at E = 513 spilled: the sum took 10x longer)."""
+    return max(8, COUNT_BATCH // (e_cap // BLOCK))
+
+
 def _count_batch(c_it, tid, g0, n_chunks, num_experts, e_cap):
-    """Loads of one COUNT_BATCH of chunk counts from chunk ``g0``: per expert
-    slot of this thread, [(chunk, count)]."""
+    """Loads of one count_batch(e_cap) of chunk counts from chunk ``g0``: per
+    expert slot of this thread, [(chunk, count)]."""
     c0, cE = fx.Int32(0), fx.Int32(num_experts)
     out = []
     for k in range_constexpr(0, e_cap, BLOCK):
@@ -761,7 +767,7 @@ def _count_batch(c_it, tid, g0, n_chunks, num_experts, e_cap):
         live = e < cE
         es = live.select(e, c0)
         vals = []
-        for q in range_constexpr(COUNT_BATCH):
+        for q in range_constexpr(count_batch(e_cap)):
             g = g0 + fx.Int32(q)
             ok = live & (g < n_chunks)
             vals.append((g, ok.select(_ld(c_it, ok.select(g * cE + es, c0)), c0)))
@@ -784,12 +790,17 @@ def _add_batch(hist, run, tid, bid, batch, e_cap):
 @flyc.jit
 def _sum_counts(hist, run, c_it, tid, bid, n_chunks, num_experts, e_cap, first):
     """hist[e] = counts over all chunks, run[e] = counts over chunks before bid.
-    ``first`` holds the first COUNT_BATCH chunks' loads, issued early by the
-    caller (their latency overlaps the route loads); later batches load here."""
-    _add_batch(hist, run, tid, bid, first, e_cap)
-    batches = (n_chunks + fx.Int32(COUNT_BATCH - 1)) // fx.Int32(COUNT_BATCH)
-    for bt in range(fx.Int32(1), batches, fx.Int32(1)):
-        g0 = fx.Int32(bt) * fx.Int32(COUNT_BATCH)
+    ``first`` holds the first batch of chunk counts' loads, issued early by the
+    caller (their latency overlaps the route loads), or None; later batches
+    load here."""
+    b0 = 0
+    if first is not None:
+        _add_batch(hist, run, tid, bid, first, e_cap)
+        b0 = 1
+    cb = count_batch(e_cap)
+    batches = (n_chunks + fx.Int32(cb - 1)) // fx.Int32(cb)
+    for bt in range(fx.Int32(b0), batches, fx.Int32(1)):
+        g0 = fx.Int32(bt) * fx.Int32(cb)
         batch = _count_batch(c_it, tid, g0, n_chunks, num_experts, e_cap)
         _add_batch(hist, run, tid, bid, batch, e_cap)
     gpu.barrier()
