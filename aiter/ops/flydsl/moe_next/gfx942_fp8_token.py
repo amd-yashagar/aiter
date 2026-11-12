@@ -358,7 +358,9 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
 
 
 @functools.cache
-def _decode_gateup(N, K, topk, per_tensor, act, swiglu_limit, waves=4):
+def _decode_gateup(
+    N, K, topk, per_tensor, act, swiglu_limit, waves=4, global_e=None, nlt=False
+):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token.decode import (
         compile_decode_gateup,
     )
@@ -371,6 +373,9 @@ def _decode_gateup(N, K, topk, per_tensor, act, swiglu_limit, waves=4):
         PER_TENSOR=per_tensor,
         swiglu_limit=swiglu_limit,
         WAVES=waves,
+        GLOBAL_E=global_e,
+        HAS_MASK=global_e is not None,
+        HAS_NLT=nlt,
     )
 
 
@@ -418,8 +423,6 @@ class Gfx942Fp8TokenDecode(Gfx942Fp8TokenPrefill):
                 return "contiguous fp32 weight scales only"
             if call.w1_scale.dtype != torch.float32:
                 return "fp32 weight scales only"
-            if call.expert_mask is not None or call.num_local_tokens is not None:
-                return "EP and num_local_tokens not implemented in decode yet"
             if call.a1_scale is not None or call.a2_scale is not None:
                 return "prequantized activations"
             if call.output is not None and not call.output.is_contiguous():
@@ -428,6 +431,8 @@ class Gfx942Fp8TokenDecode(Gfx942Fp8TokenPrefill):
                 return f"unsupported {sorted(call.extra)}"
             if not call.hidden_states.is_contiguous():
                 return "contiguous hidden_states only"
+            if spec.quant == QuantType.per_Tensor and call.num_local_tokens is not None:
+                return "per-tensor with num_local_tokens"
         return None
 
     def warmup(self, weights, m, topk, config):
@@ -439,10 +444,19 @@ class Gfx942Fp8TokenDecode(Gfx942Fp8TokenPrefill):
         per_tensor = spec.quant == QuantType.per_Tensor
         act, limit = _ACTS[spec.act], _swiglu_limit(spec)
         with compile_only():
+            ep = spec.global_experts if spec.global_experts != spec.experts else None
             gu = _decode_gateup(
-                2 * I, D, topk, per_tensor, act, limit, self._waves_cfg(weights, config)
+                2 * I,
+                D,
+                topk,
+                per_tensor,
+                act,
+                limit,
+                self._waves_cfg(weights, config),
+                ep,
             )
             types = (fx.BFloat16, fx.Uint8, fx.BFloat16, fx.Int32, fx.Float32)
+            types += (fx.Int32,) * 3
             gu(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
             dn = _decode_down(D, I, topk, per_tensor)
             types = (fx.BFloat16, fx.Uint8, fx.BFloat16, fx.Int32, fx.Float32)
@@ -467,16 +481,32 @@ class Gfx942Fp8TokenDecode(Gfx942Fp8TokenPrefill):
         ids = call.topk_ids.to(torch.int32).contiguous()
         tw = call.topk_weight.to(torch.float32).contiguous()
         inter = torch.empty((M * topk, I), dtype=torch.bfloat16, device=x.device)
+        local_ids = torch.empty((M * topk,), dtype=torch.int32, device=x.device)
+        mask, nlt = call.expert_mask, call.num_local_tokens
+        global_e = call.global_experts if mask is not None else None
         out = call.output
         if out is None:
             out = torch.empty((M, D), dtype=torch.bfloat16, device=x.device)
         _launch(
-            _decode_gateup(2 * I, D, topk, per_tensor, act, limit, self._waves(call)),
+            _decode_gateup(
+                2 * I,
+                D,
+                topk,
+                per_tensor,
+                act,
+                limit,
+                self._waves(call),
+                global_e,
+                nlt is not None,
+            ),
             x,
             call.w1,
             inter,
             ids,
             call.w1_scale,
+            local_ids,
+            mask.to(torch.int32) if mask is not None else local_ids,
+            nlt if nlt is not None else local_ids,
             M,
             spec.experts,
         )
@@ -485,7 +515,7 @@ class Gfx942Fp8TokenDecode(Gfx942Fp8TokenPrefill):
             inter,
             call.w2,
             out,
-            ids,
+            local_ids,
             tw,
             call.w2_scale,
             M,
