@@ -48,5 +48,14 @@
     "tile_m": 32,
     "down_nbd": 2,
     "down_coalesce": false
+  },
+  "m64gw8": {
+    "tile_m": 64,
+    "down_nbd": 2,
+    "gateup_waves": 8
+  },
+  "m64nbd2": {
+    "tile_m": 64,
+    "down_nbd": 2
   }
 }
