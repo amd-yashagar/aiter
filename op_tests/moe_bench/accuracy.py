@@ -524,7 +524,8 @@ def numerics_from_route(S, route):
       output rounded to bf16 and then quantized (bf16_then_<quant>)
     * ASM 1-stage: act none for the a16/xbf16 kernels, else quantized; fp32_direct
     * FlyDSL whole-graph (impl__flydsl_gfx942): act none, bf16 intermediate unquantized
-    * MXMOE: act quantized, fp32_direct
+    * MXMOE and, for MX, flydsl_moe1: act quantized, intermediate rounding and scale
+      rule matched against the output (see below)
 
     MX scale rule: the quant call the route makes (``mx_rule_of_route``); a 1-stage ASM
     kernel quantizes in-kernel (``in_kernel``), and so does the MXMOE g1 epilogue for the
@@ -563,7 +564,11 @@ def numerics_from_route(S, route):
         a16 = bool(route.get("flat")) or "a16" in k1 or "xbf16" in k1
         act = "none" if a16 else q(in_kernel=True)
         inter, iq = "fp32_direct", q(in_kernel=True)
-    elif mxmoe:
+    elif mxmoe or (mx and k1.startswith("flydsl_moe1")):
+        # MXMOE g1 quantizes the intermediate from fp32; flydsl_moe1 rounds it to bf16
+        # first at some configs (a4w4 M=8) and quantizes from fp32 at others (M=64,
+        # M=4096), measured on MI355X: the config picks it, not the kernel family, so the
+        # rule and the rounding are matched against the output (in_kernel_variants)
         act, inter, iq = q(), "fp32_direct", q(in_kernel=True)
     else:
         act = q()

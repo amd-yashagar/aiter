@@ -617,3 +617,36 @@ def test_match_rule_picks_the_closer_reference_and_applies_the_strict_rule():
     accuracy.match_rule(res, ("round_up", "even"))
     assert accuracy.rule(res) is False
     assert accuracy.match_rule({"mean": {}, "per_seed": []}, ("even",)) is None
+
+
+def test_mx_flydsl_moe1_is_matched_not_assumed_bf16_then():
+    """flydsl_moe1 quantizes from fp32 at a4w4 M=64/4096 and rounds to bf16 first at
+    M=8 (MI355X): the route cannot say which, so the output picks it."""
+    import aiter.fused_moe as fm
+
+    S = _mx()
+    fn = lambda *a, **k: None
+    fn.__module__ = "aiter.ops.quant"
+    fm.fused_dynamic_mxfp4_quant_moe_sort, real = (
+        fn,
+        fm.fused_dynamic_mxfp4_quant_moe_sort,
+    )
+    try:
+        n = accuracy.numerics_from_route(
+            S,
+            {
+                "stages": "2-stage",
+                "backend1": "flydsl",
+                "backend2": "flydsl",
+                "kernel1": "flydsl_moe1_afp4_wfp4_bf16_t64x256x256",
+                "kernel2": "flydsl_moe2_afp4_wfp4_bf16_t64x256x256_reduce",
+            },
+        )
+    finally:
+        fm.fused_dynamic_mxfp4_quant_moe_sort = real
+    assert accuracy.has_in_kernel(n)
+    assert n["act_quant"] == "mx_fp4_round_up"  # through the quant call
+    v = accuracy.in_kernel_variants(S, n)
+    assert v["round_up"]["inter"] == "fp32_direct"
+    assert v["round_up+bf16"]["inter"] == "bf16_then_mx_fp4_round_up"
+    assert n["combine"] == "bf16_rows_fp32_sum"
