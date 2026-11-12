@@ -465,8 +465,16 @@ def _slice_experts(t, e, e0, e1):
     return t[e0 * r : e1 * r]
 
 
-def reference(S, ref_w, bias, hidden, topk_w, topk_ids, expert_mask, n_valid=None):
-    """Torch reference on the unshuffled quantized weights, same flow as test_fmoe."""
+def reference(
+    S, ref_w, bias, hidden, topk_w, topk_ids, expert_mask, n_valid=None, hp=False
+):
+    """Torch reference on the unshuffled quantized weights, same flow as test_fmoe.
+
+    ``hp`` is the high-precision variant for error measurement: the same quantized
+    weights and activation quantization, fp32 accumulation, but the stage-1 output
+    stays fp32 (no bf16 rounding of the intermediate) and the result is returned in
+    fp32.
+    """
     import aiter
     from aiter import dtypes
     from aiter.fused_moe import torch_moe_stage1, torch_moe_stage2
@@ -543,7 +551,8 @@ def reference(S, ref_w, bias, hidden, topk_w, topk_ids, expert_mask, n_valid=Non
             )
             out1[t0:t1] = torch.where(sel[..., None], part, out1[t0:t1])
             del part
-    out1 = out1.to(S.dtype)
+    if not hp:
+        out1 = out1.to(S.dtype)
 
     if qT == aiter.QuantType.per_1x128:
         a2q, a2s = aiter.pertoken_quant(out1.view(M, -1, 128), quant_dtype=AQ)
@@ -600,7 +609,7 @@ def reference(S, ref_w, bias, hidden, topk_w, topk_ids, expert_mask, n_valid=Non
             res[t0:t1] += part
             del part
     del w_el
-    return res.to(S.dtype)
+    return res if hp else res.to(S.dtype)
 
 
 def fused_kwargs(S, aiter_w, bias, expert_mask):
@@ -713,3 +722,40 @@ def free_vram_bytes():
 
 def span(x):
     return math.ceil(x)
+
+
+ERR_FLOOR = 1e-2  # relative errors use max(|ref|, ERR_FLOOR * max|ref|) as denominator
+
+
+def error_metrics(out, ref, rows_per_chunk=None):
+    """Error of ``out`` against the high-precision reference, accumulated in fp64.
+
+    max_abs, max_rel (denominator floored at 1% of max|ref|), mean_rel
+    (sum|d| / sum|ref|), rms_rel (|d|_2 / |ref|_2) and err_cos (1 - cosine).
+    """
+    n = out.shape[0]
+    cols = max(1, out.shape[-1])
+    step = rows_per_chunk or max(1, (1 << 24) // cols)
+    ref_absmax = float(ref.abs().max()) if ref.numel() else 0.0
+    floor = max(ERR_FLOOR * ref_absmax, 1e-30)
+    max_abs = max_rel = sum_d = sum_r = sq_d = sq_r = dot = sq_o = 0.0
+    for i in range(0, n, step):
+        o = out[i : i + step].double()
+        r = ref[i : i + step].double()
+        d = (o - r).abs()
+        max_abs = max(max_abs, float(d.max()))
+        max_rel = max(max_rel, float((d / r.abs().clamp_min(floor)).max()))
+        sum_d += float(d.sum())
+        sum_r += float(r.abs().sum())
+        sq_d += float(d.pow(2).sum())
+        sq_r += float(r.pow(2).sum())
+        sq_o += float(o.pow(2).sum())
+        dot += float((o * r).sum())
+    tiny = 1e-300
+    return {
+        "err_max_abs": max_abs,
+        "err_max_rel": max_rel,
+        "err_mean_rel": sum_d / max(sum_r, tiny),
+        "err_rms_rel": (sq_d**0.5) / max(sq_r**0.5, tiny),
+        "err_cos": 1.0 - dot / max((sq_o**0.5) * (sq_r**0.5), tiny),
+    }

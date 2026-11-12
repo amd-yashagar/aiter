@@ -234,6 +234,25 @@ def gpu_key(name):
     return roofline.sku_of(name) or (name or "unknown").replace(" ", "_")
 
 
+ACC_GATE = [f"{ref}_{k}" for ref in ("path", "exact") for k in ("rel_l2", "max_norm")]
+
+
+def acc_ok(bar, new):
+    """Accuracy rule of the plan: for rel_l2 and max_norm against both references,
+    mean(new) <= mean(bar) + 2 * std(bar) + 1% of mean(bar). Also needs the new kernel to
+    pass aiter's rule. None when the numbers are missing."""
+    if str(new.get("new_acc_pass", "")) != "True":
+        return None if new.get("new_acc_pass", "") == "" else False
+    ok = True
+    for name in ACC_GATE:
+        bm, bs = _f(bar.get(f"bar_{name}_mean")), _f(bar.get(f"bar_{name}_std"))
+        nm = _f(new.get(f"new_{name}_mean"))
+        if bm is None or bs is None or nm is None:
+            return None
+        ok = ok and nm <= bm + 2 * bs + 0.01 * bm
+    return ok
+
+
 def bar_view(rows, bar_rows, new_rows, weights):
     """Per case and mode: dispatch, bar, roofline, new, gap and roofline efficiency.
 
@@ -251,6 +270,7 @@ def bar_view(rows, bar_rows, new_rows, weights):
         roof = _f(b.get("roofline_us"))
         new_us = _f(n.get("median_us")) if n and n.get("status") == "ok" else None
         band_v = band(d)[0] if d else 0.02
+        err_ok = acc_ok(b, n or {}) if (new_us and bar_us) else None
         gap = new_us / bar_us - 1 if (new_us and bar_us) else None
         if new_us and not bar_us and b.get("status") == "no-bar":
             gap = -1.0  # no existing backend computes it: any correct kernel wins
@@ -277,9 +297,22 @@ def bar_view(rows, bar_rows, new_rows, weights):
                 "roofline_eff": roof / new_us if (roof and new_us) else "",
                 "band": band_v,
                 "new_kernel_id": (n.get("new_kernel_id") or "") if n else "",
+                **{
+                    f"{who}_{name}_{st}": (b if who != "new" else (n or {})).get(
+                        f"{who}_{name}_{st}", ""
+                    )
+                    for who in ("dispatch", "bar", "new")
+                    for name in ACC_GATE
+                    for st in ("mean", "std")
+                },
+                "bar_acc_pass": b.get("bar_acc_pass", ""),
+                "new_acc_pass": (n or {}).get("new_acc_pass", ""),
+                "acc_ok": "" if err_ok is None else err_ok,
                 "won_mode": bool(
                     gap is not None
                     and gap < -band_v
+                    and err_ok is not False
+                    and (err_ok is True or not bar_us or b.get("status") == "no-bar")
                     and not (n and n.get("new_kernel_id") == "aiter")
                 ),
                 "weight": model_weight(b["model"], weights),
@@ -299,8 +332,17 @@ def case_won(rows):
 def write_queue(view, queue_dir):
     """Rebuild queue/<gpu>.csv: every case not yet won, ranked by gap x model weight."""
     won = case_won(view)
+    acc_fail = {
+        r["sig"]
+        for r in view
+        if r["acc_ok"] is False or str(r["new_acc_pass"]) == "False"
+    }
     by_gpu = collections.defaultdict(dict)
+    acc_by_gpu = collections.defaultdict(dict)
     for r in view:
+        if r["sig"] in acc_fail:
+            acc_by_gpu[gpu_key(r["gpu"])].setdefault(r["sig"], r)
+            continue
         if won.get(r["sig"]):
             continue
         cur = by_gpu[gpu_key(r["gpu"])].get(r["sig"])
@@ -349,7 +391,35 @@ def write_queue(view, queue_dir):
             w.writeheader()
             for i, r in enumerate(ordered, 1):
                 w.writerow(dict(r, rank=i, gpu=gpu))
-    return {g: len(c) for g, c in by_gpu.items()}
+    acc_cols = [
+        "gpu",
+        "case_id",
+        "family",
+        "model",
+        "token",
+        "mode",
+        "weight",
+        "new_id",
+        "new_acc_pass",
+        "acc_ok",
+        *[
+            f"{w}_{n}_{st}"
+            for w in ("bar", "new")
+            for n in ACC_GATE
+            for st in ("mean", "std")
+        ],
+    ]
+    for gpu, cases in acc_by_gpu.items():
+        ordered = sorted(cases.values(), key=lambda r: -r["weight"])
+        with open(os.path.join(queue_dir, f"{gpu}-accuracy.csv"), "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=acc_cols, extrasaction="ignore")
+            w.writeheader()
+            for r in ordered:
+                w.writerow(dict(r, gpu=gpu))
+    return {
+        "speed": {g: len(c) for g, c in by_gpu.items()},
+        "accuracy": {g: len(c) for g, c in acc_by_gpu.items()},
+    }
 
 
 def cmd_compare(args):

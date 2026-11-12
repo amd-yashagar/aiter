@@ -15,7 +15,7 @@ import socket
 import tempfile
 import time
 
-from . import runner, schema
+from . import accuracy, runner, schema
 
 BAR_COLS = (
     [
@@ -67,6 +67,9 @@ BAR_COLS = (
         "bar_roofline_eff",
         "dispatch_roofline_eff",
         "new_roofline_eff",
+        *accuracy.gate_columns("dispatch"),
+        *accuracy.gate_columns("bar"),
+        *accuracy.gate_columns("new"),
     ]
     + ["node", "gpu", "gfx", "cu_num", "rocm", "torch", "flydsl"]
     + ["aiter_sha", "aiter_dirty", "harness_sha", "env", "date"]
@@ -98,6 +101,7 @@ CAND_COLS = [
     "kernel1",
     "kernel2",
     "new_kernel_id",
+    *accuracy.seed_columns(),
     "node",
     "gpu",
     "aiter_sha",

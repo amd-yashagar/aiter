@@ -80,14 +80,15 @@ PREPARE_KWARGS = (
 )
 
 
-def split_kwargs(kwargs):
+def split_kwargs(kwargs, mod=None):
     """fused_moe kwargs -> (model-constant prepare kwargs, per-call kwargs).
 
-    The split follows docs/aiter-moe-api.md (core-api-contract.md until it is
-    published): weight-level and model-constant arguments go to prepare.
+    The split is the API module's own ``PREPARE_KWARGS`` (docs/aiter-moe-api.md section 2;
+    ``aiter.moe.PREPARE_KWARGS``), with the list above as the fallback for toys.
     """
-    prep = {k: v for k, v in kwargs.items() if k in PREPARE_KWARGS}
-    call = {k: v for k, v in kwargs.items() if k not in PREPARE_KWARGS}
+    names = set(getattr(mod, "PREPARE_KWARGS", None) or PREPARE_KWARGS)
+    prep = {k: v for k, v in kwargs.items() if k in names}
+    call = {k: v for k, v in kwargs.items() if k not in names}
     return prep, call
 
 
@@ -150,17 +151,23 @@ class NewCandidate(Candidate):
                 )
             return
         if "new" not in ctx.group_cache:
-            prep, _ = split_kwargs(ctx.kwargs)
-            kw = dict(prep, dtype=S.dtype)
+            prep, _ = split_kwargs(ctx.kwargs, self.mod)
+            kw = dict(prep, dtype=S.dtype, topk=S.topk)
             if S.is_ep:
                 kw["num_global_experts"] = S.E
             routes = os.environ.get("MOE_BENCH_NEW_ROUTES")
             if routes:
                 kw["routes"] = routes
+                # measuring a named kernel: a decline must raise, not fall back
+                os.environ.setdefault("AITER_MOE_STRICT", "1")
             ctx.group_cache["new"] = self.mod.prepare(ctx.aw["w1"], ctx.aw["w2"], **kw)
         explain = getattr(self.mod, "explain", None)
         if explain is not None:
-            self.kernel_id = str(explain(ctx.group_cache["new"], S.M).get("route", ""))
+            try:
+                info = explain(ctx.group_cache["new"], S.M, topk=S.topk)
+            except TypeError:
+                info = explain(ctx.group_cache["new"], S.M)
+            self.kernel_id = str(info.get("route", ""))
             self.kernels = self.kernel_id
 
     def call(self, ctx):
@@ -188,7 +195,7 @@ class NewCandidate(Candidate):
                 )
 
             return run
-        _, call_kw = split_kwargs(kw)
+        _, call_kw = split_kwargs(kw, self.mod)
 
         def run():
             return self.mod.forward(

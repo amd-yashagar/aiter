@@ -64,8 +64,9 @@ class DispatchCandidate:
 class Measurer:
     """Correctness plus timing of one candidate over the shared timed region."""
 
-    def __init__(self, ctx, ref, ref_err, pool, fh, case_id):
-        self.ctx, self.ref, self.ref_err, self.pool = ctx, ref, ref_err, pool
+    def __init__(self, ctx, acc_refs, acc_err, rows, pool, fh, case_id):
+        self.ctx, self.acc_refs, self.acc_err = ctx, acc_refs, acc_err
+        self.rows, self.pool = rows, pool
         self.fh, self.case_id = fh, case_id
         self.records = []  # confirmed results for the bar
 
@@ -73,7 +74,7 @@ class Measurer:
         """Returns {"ok", "us", ...}; emits one ``cand`` event per mode."""
         import torch
 
-        from . import routes, workload
+        from . import accuracy, routes
         from .timing import Timer
 
         ctx = self.ctx
@@ -98,7 +99,7 @@ class Measurer:
             cand.prepare(ctx)
             call = cand.call(ctx)
             with routes.RouteRecorder() as rec:
-                out = call()
+                call()
                 torch.cuda.synchronize()
             route = routes.route_from_record(rec.last()) if rec.records else {}
             if getattr(cand, "id", "") == "dispatch":
@@ -108,16 +109,35 @@ class Measurer:
             if reason:
                 self._emit(base, modes, status="router-discarded", detail=reason)
                 return res
-            n = ctx.n_valid
-            if self.ref is None:
+            if self.acc_refs is None:
                 self._emit(
-                    base, modes, status="no-reference", detail=self.ref_err or ""
+                    base, modes, status="no-reference", detail=self.acc_err or ""
                 )
                 return res
-            corr = workload.check_correctness(out[:n], self.ref, None)
-            res["corr"] = corr
-            if not corr["ref_pass"]:
-                self._emit(base, modes, status="fail", detail="correctness", **corr)
+            acc = accuracy.evaluate(
+                ctx.S,
+                ctx,
+                call,
+                self.acc_refs,
+                self.rows,
+                ctx.n_valid,
+                seeds=accuracy.SEEDS[:1] if quick else accuracy.SEEDS,
+                sentinel=not quick,
+                repeats=1 if quick else accuracy.REPEATS,
+            )
+            res["acc"] = acc
+            cols = accuracy.flat_columns(acc)
+            if acc["pass"] is None:
+                self._emit(
+                    base,
+                    modes,
+                    status="no-ref-path",
+                    detail="ref_path unavailable for this path",
+                    **cols,
+                )
+                return res
+            if not acc["pass"]:
+                self._emit(base, modes, status="fail", detail="accuracy rule", **cols)
                 return res
             timer = Timer(call, ctx.hidden_static, self.pool)
             timer.prepare_graph()
@@ -131,7 +151,7 @@ class Measurer:
                     status="ok",
                     timing_mode=timer.mode,
                     **st,
-                    **corr,
+                    **cols,
                     new_kernel_id=getattr(cand, "kernel_id", ""),
                     kernel1=route.get("kernel1", ""),
                     kernel2=route.get("kernel2", ""),
@@ -188,7 +208,7 @@ def _roof_case(case, S):
 def run_bar_group(cases, spec, fh):
     import torch
 
-    from . import candidates, routes, workload
+    from . import accuracy, candidates, routes, workload
 
     modes_req = spec["modes"]
     mode_kind = spec.get("kind", "bar")
@@ -256,17 +276,21 @@ def run_bar_group(cases, spec, fh):
     for c in live:
         S = specs[c.id]
         emit(fh, {"event": "case_start", "case_id": c.id, "phase": "reference"})
-        tw, ti = workload.make_routing(S, c.token)
         mask = workload.make_expert_mask(S) if S.is_ep else None
-        hidden = workload.make_inputs(S, c.token)
         _, n_valid = _num_local(S, c.token)
+        rows = accuracy.sample_rows(c.id, n_valid)
         try:
-            refs[c.id] = (
-                workload.reference(S, rw, bias, hidden, tw, ti, mask, n_valid),
-                None,
-            )
+            by_seed = {}
+            for seed in accuracy.SEEDS:
+                hs, tw, ti = accuracy.acc_inputs(S, c.token, seed)
+                by_seed[seed] = accuracy.references(S, rw, bias, hs, tw, ti, mask, rows)
+                del hs
+            if not all("path" in r for r in by_seed.values()):
+                refs[c.id] = (None, "ref_path not available for this path", rows)
+            else:
+                refs[c.id] = (by_seed, None, rows)
         except Exception as e:  # noqa: BLE001
-            refs[c.id] = (None, f"reference error: {_err(e)}")
+            refs[c.id] = (None, f"reference error: {_err(e)}", rows)
         torch.cuda.empty_cache()
     ref_weights = rw if mode_kind == "new" else None
     rw = None
@@ -305,8 +329,8 @@ def run_bar_group(cases, spec, fh):
         per = hidden.numel() * hidden.element_size()
         k = int(max(1, min(4, (2 << 30) // max(per, 1))))
         pool = [workload.make_inputs(S, M) if j else hidden.clone() for j in range(k)]
-        ref, ref_err = refs[c.id]
-        meas = Measurer(ctx, ref, ref_err, pool, fh, c.id)
+        acc_refs, acc_err, rows = refs[c.id]
+        meas = Measurer(ctx, acc_refs, acc_err, rows, pool, fh, c.id)
         results = {}
         skipped = []
         emit(fh, {"event": "case_start", "case_id": c.id, "phase": "run"})
@@ -401,6 +425,22 @@ class _Screener:
         return self.meas.measure(cand, quick=quick, modes=("warm",))
 
 
+def _gate(who, acc):
+    """Gated accuracy columns (mean/std vs both references) of one candidate."""
+    from . import accuracy
+
+    if not acc:
+        return {}
+    out = {f"{who}_acc_pass": acc["pass"]}
+    for ref in accuracy.REFS:
+        for k in accuracy.GATE_METRICS:
+            name = f"{ref}_{k}"
+            if name in acc["mean"]:
+                out[f"{who}_{name}_mean"] = acc["mean"][name]
+                out[f"{who}_{name}_std"] = acc["std"][name]
+    return out
+
+
 def _emit_summary(fh, c, S, mode, results, ident, skipped, kind, main_failure=None):
     from . import roofline
 
@@ -426,6 +466,7 @@ def _emit_summary(fh, c, S, mode, results, ident, skipped, kind, main_failure=No
             row["dispatch_us"] = disp["by_mode"][mode]["median_us"]
         for k in ("route_key", "kernel1", "kernel2", "route_family"):
             row["dispatch_" + k] = disp.get("route", {}).get(k, "")
+        row.update(_gate("dispatch", disp.get("acc")))
     if kind == "new":
         if ok:
             r = next(iter(ok.values()))
@@ -435,6 +476,7 @@ def _emit_summary(fh, c, S, mode, results, ident, skipped, kind, main_failure=No
                 new_kernel_id=getattr(r["cand"], "kernel_id", ""),
                 status="ok",
             )
+            row.update(_gate("new", r.get("acc")))
         else:
             row.update(status="no-correct-candidate")
     elif ok:
@@ -449,6 +491,7 @@ def _emit_summary(fh, c, S, mode, results, ident, skipped, kind, main_failure=No
             bar_kernels=d["kernels"],
             bar_timing_mode=best.get("timing_mode", ""),
         )
+        row.update(_gate("bar", best.get("acc")))
     else:
         # a case no existing backend computes correctly has no bar
         row["status"] = "no-bar"
