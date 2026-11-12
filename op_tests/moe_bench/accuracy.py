@@ -228,9 +228,24 @@ def _local_ids(ti, mask):
     return local[ti.long()].to(torch.int32)
 
 
-ACT_QUANT = ("none", "per_token_fp8", "per_1x128_fp8", "mx_fp4", "mx_fp8")
+QUANTS = (
+    "none",
+    "per_token_fp8",
+    "per_tensor_fp8",
+    "per_1x128_fp8",
+    "mx_fp4_round_up",
+    "mx_fp4_even",
+    "mx_fp8_round_up",
+    "mx_fp8_even",
+)
+# Harness-only values, accepted from the route of an existing aiter path and never from a
+# kernel's declaration: a 1-stage ASM kernel (and the MXMOE g1 epilogue) quantizes in-kernel
+# with its own rule, so ref_path does not exist for it (ref_exact scores it).
+IN_KERNEL = ("mx_fp4_in_kernel", "mx_fp8_in_kernel")
+BARE_MX = ("mx_fp4", "mx_fp8")  # accepted for one release, with a warning
 INTER = ("bf16", "fp32_direct")  # or bf16_then_<quant>
 COMBINE = ("bf16_atomic", "fp32_atomic", "bf16_rows_fp32_sum", "fp32_reduce")
+EXACT_ONLY_LIMIT = 0.5  # rel_l2 vs ref_exact above which a path with no ref_path fails
 
 
 class NumericsError(ValueError):
@@ -238,7 +253,8 @@ class NumericsError(ValueError):
 
 
 def quant_name(S):
-    """Core's name for the activation quant the case's quant type implies (None: none)."""
+    """The quant family the case implies: per_token_fp8, per_tensor_fp8, per_1x128_fp8,
+    mx_fp4 or mx_fp8 (None: bf16 activations). MX families still need a scale rule."""
     import aiter
 
     q = S.qtype
@@ -258,70 +274,164 @@ def quant_name(S):
     return None
 
 
+def split_quant(q):
+    """'mx_fp4_even' -> ('mx_fp4', 'even'); any other value -> (value, None)."""
+    for fam in ("mx_fp4", "mx_fp8"):
+        if q.startswith(fam + "_"):
+            return fam, q[len(fam) + 1 :]
+    return q, None
+
+
+def _check_quant(S, field, q, derived):
+    """Validate one quant value of a declaration; returns it with bare MX resolved."""
+    import warnings
+
+    if q in BARE_MX:
+        warnings.warn(
+            f"numerics {field}={q!r} names no MX scale rule; assuming {q}_round_up "
+            f"(aiter's default). Declare {q}_round_up or {q}_even; bare values will "
+            "raise NumericsError in the next release",
+            stacklevel=3,
+        )
+        q = q + "_round_up"
+    if q not in QUANTS and not (derived and q in IN_KERNEL):
+        raise NumericsError(f"unknown {field} {q!r}; core knows {QUANTS}")
+    fam = split_quant(q)[0]
+    qn = quant_name(S)
+    if q != "none" and fam != qn:
+        raise NumericsError(
+            f"{field} {q!r} does not fit this case (quant type implies {qn!r})"
+        )
+    return q
+
+
+def out_dtype_name(S):
+    return "fp16" if S.dtype == torch.float16 else "bf16"
+
+
 def normalize_numerics(S, declared, derived=False):
     """Validate a declared numerics dict against core's vocabulary and the case.
 
-    Core's keys: ``act_quant`` (none, per_token_fp8, per_1x128_fp8, mx_fp4, mx_fp8),
+    Keys: ``act_quant`` and ``inter_quant`` (none, per_token_fp8, per_tensor_fp8,
+    per_1x128_fp8, mx_fp4_round_up, mx_fp4_even, mx_fp8_round_up, mx_fp8_even),
     ``inter`` (bf16, fp32_direct, bf16_then_<quant>) and ``combine`` (bf16_atomic,
-    fp32_reduce). Anything else raises NumericsError: a guess would score the kernel
-    against the wrong reference. ``per_tensor_fp8`` is accepted for per-tensor cases
-    (aiter paths round there; core has no name for it yet). ``combine`` (bf16_atomic, fp32_atomic,
-    bf16_rows_fp32_sum, fp32_reduce) is recorded as declared and validated, not modeled:
-    the references sum in fp64.
+    fp32_atomic, bf16_rows_fp32_sum, fp32_reduce; "bf16" means the output dtype, which
+    is recorded as ``out_dtype``). Anything else raises NumericsError: a guess would
+    score the kernel against the wrong reference. ``combine`` is recorded as declared
+    and validated, not modeled: the references sum in fp64. The intermediate's quant is
+    the suffix of ``bf16_then_<quant>``, else ``inter_quant``, else ``act_quant``
+    (the family's name when ``act_quant`` is none and the family is not MX).
     """
     if not isinstance(declared, dict):
         raise NumericsError(f"numerics must be a dict, got {declared!r}")
-    allowed_keys = {"act_quant", "inter", "combine", "source"}
+    allowed_keys = {
+        "act_quant",
+        "inter",
+        "inter_quant",
+        "combine",
+        "source",
+        "out_dtype",
+    }
     extra = set(declared) - allowed_keys
     if extra:
         raise NumericsError(
             f"unknown numerics key(s) {sorted(extra)}; core's keys are "
-            "act_quant, inter, combine"
+            "act_quant, inter, inter_quant, combine"
         )
     missing = [k for k in ("act_quant", "inter", "combine") if k not in declared]
     if missing:
         raise NumericsError(f"numerics missing {missing}: {declared!r}")
+    act = _check_quant(S, "act_quant", declared["act_quant"], derived)
+    inter, comb = declared["inter"], declared["combine"]
     qn = quant_name(S)
-    quants = set(ACT_QUANT) | ({qn} if qn else set())
-    act, inter, comb = declared["act_quant"], declared["inter"], declared["combine"]
-    if act not in quants:
-        raise NumericsError(f"unknown act_quant {act!r}; core knows {ACT_QUANT}")
-    if act not in ("none", qn):
+    if inter == "bf16":
+        iq = "none"
+    elif inter == "fp32_direct" or (
+        isinstance(inter, str) and inter.startswith("bf16_then_")
+    ):
+        if inter == "fp32_direct":
+            if "inter_quant" in declared:
+                iq = _check_quant(S, "inter_quant", declared["inter_quant"], derived)
+            elif act != "none":
+                iq = act
+            elif qn and not qn.startswith("mx_"):
+                iq = qn
+            elif qn:
+                raise NumericsError(
+                    "an MX intermediate needs its scale rule: declare inter_quant "
+                    "(mx_fp4_round_up, mx_fp4_even, ...)"
+                )
+            else:
+                iq = "none"
+        else:
+            iq = _check_quant(S, "inter", inter[len("bf16_then_") :], derived)
+            if iq == "none":
+                raise NumericsError(f"inter {inter!r} names no quant")
+            inter = f"bf16_then_{iq}"
+    else:
         raise NumericsError(
-            f"act_quant {act!r} does not fit this case (quant type implies {qn!r})"
+            f"unknown inter {inter!r}; core knows {INTER} and bf16_then_<quant>"
         )
-    if inter not in INTER:
-        if not (isinstance(inter, str) and inter.startswith("bf16_then_")):
-            raise NumericsError(
-                f"unknown inter {inter!r}; core knows {INTER} and bf16_then_<quant>"
-            )
-        q = inter[len("bf16_then_") :]
-        if q not in quants or q == "none" or q != qn:
-            raise NumericsError(
-                f"inter {inter!r} does not fit this case (quant type implies {qn!r})"
-            )
-    if comb not in COMBINE and not (derived and comb == "n/a"):
+    base = comb.removesuffix(" (inferred)") if isinstance(comb, str) else comb
+    if base not in COMBINE and not (derived and comb == "n/a"):
         raise NumericsError(f"unknown combine {comb!r}; core knows {COMBINE}")
-    return {"act_quant": act, "inter": inter, "combine": comb}
+    if " (inferred)" in str(comb) and not derived:
+        raise NumericsError(f"combine {comb!r} is a harness label, not a declaration")
+    return {
+        "act_quant": act,
+        "inter": inter,
+        "inter_quant": iq,
+        "combine": comb,
+        "out_dtype": out_dtype_name(S),
+    }
+
+
+NUMERICS_FIELDS = ("act_quant", "inter", "inter_quant", "combine", "out_dtype")
 
 
 def numerics_key(n):
-    return f"act_quant={n['act_quant']};inter={n['inter']};combine={n['combine']}"
+    return ";".join(f"{k}={n[k]}" for k in NUMERICS_FIELDS)
+
+
+def key_fields(key):
+    return dict(p.split("=", 1) for p in (key or "").split(";") if "=" in p)
 
 
 def same_rounding(key_a, key_b):
-    """Equal act_quant and inter (``combine`` is not modeled by the references)."""
+    """Equal act_quant, inter and inter_quant (``combine`` is not modeled)."""
     if not key_a or not key_b:
         return False
-    return key_a.split(";")[:2] == key_b.split(";")[:2]
+    a, b = key_fields(key_a), key_fields(key_b)
+    return all(a.get(k) == b.get(k) for k in ("act_quant", "inter", "inter_quant"))
 
 
 def combine_of_route(route):
-    """FlyDSL stage 2 names its epilogue (``_reduce``: per-route bf16 rows summed in
-    fp32, ``_atomic``); aiter's CK, ck_tile and ASM stage 2 accumulate with bf16 atomics.
-    "n/a" where the route says nothing (1-stage ASM, whole-graph)."""
+    """Epilogue of the aiter path that served a call.
+
+    FlyDSL stage 2 names it (``_reduce``: per-route bf16 rows summed in fp32,
+    ``_atomic``). aiter's CK, ck_tile and ASM 2-stage stage 2 and 1-stage ASM
+    accumulate with bf16 atomics into the zero-filled output buffer: labelled
+    "(inferred)". The gfx942 whole-graph path ends its prefill with ``sorted_sum``
+    (bf16 rows, fp32 sum) and writes its batch-1 and decode paths with pairwise bf16
+    atomics. "bf16" reads as the output dtype (see ``out_dtype``).
+    """
     route = route or {}
+    k1 = route.get("kernel1", "") or ""
     k2 = route.get("kernel2", "") or ""
+    if route.get("stages") == "whole-graph":
+        try:
+            from aiter.ops.flydsl.fused_moe_gfx942 import Config
+
+            cs = k1.split("__", 2)[2]
+            return (
+                "bf16_rows_fp32_sum"
+                if Config.from_string(cs).use_prefill
+                else "bf16_atomic"
+            )
+        except Exception:  # noqa: BLE001
+            return "n/a"
+    if route.get("stages") == "1-stage":
+        return "bf16_atomic (inferred)"
     if route.get("stages") != "2-stage":
         return "n/a"
     if k2.startswith("flydsl_moe2"):
@@ -331,8 +441,34 @@ def combine_of_route(route):
             return "bf16_atomic"
         return "n/a"
     if route.get("backend2") in ("ck", "ck_tile", "asm"):
-        return "bf16_atomic"
+        return "bf16_atomic (inferred)"
     return "n/a"
+
+
+def mx_rule_of_route(fam):
+    """The scale rule of the quant call fused_moe makes for an MX 2-stage path.
+
+    Read from the function the tree under test imports: the HIP quant (``aiter.ops.quant``)
+    is ``round_up`` (kDefaultMxScaleRoundMode), the Triton fused sort quant
+    (``aiter.ops.triton``) is ``even``. Anything else raises: a guess scores the path
+    against the wrong reference.
+    """
+    import aiter.fused_moe as fm
+
+    fn = getattr(
+        fm,
+        (
+            "fused_dynamic_mxfp4_quant_moe_sort"
+            if fam == "mx_fp4"
+            else "fused_dynamic_mxfp8_quant_moe_sort"
+        ),
+    )
+    mod = getattr(fn, "__module__", "") or ""
+    if mod.startswith("aiter.ops.triton"):
+        return "even"
+    if mod.startswith("aiter.ops.quant"):
+        return "round_up"
+    raise NumericsError(f"cannot tell the MX scale rule of {mod}.{fn.__name__}")
 
 
 def numerics_from_route(S, route):
@@ -343,22 +479,49 @@ def numerics_from_route(S, route):
     * ASM 1-stage: act none for the a16/xbf16 kernels, else quantized; fp32_direct
     * FlyDSL whole-graph (impl__flydsl_gfx942): act none, bf16 intermediate unquantized
     * MXMOE: act quantized, fp32_direct
+
+    MX scale rule: the quant call the route makes (``mx_rule_of_route``); a 1-stage ASM
+    kernel quantizes in-kernel (``in_kernel``), and so does the MXMOE g1 epilogue for the
+    intermediate: ref_path is n/a there and ref_exact scores it.
     """
     route = route or {}
-    qn = quant_name(S) or "none"
-    then = f"bf16_then_{qn}" if qn != "none" else "bf16"
+    qn = quant_name(S)
     full = route.get("full_impl", "") or ""
     k1 = route.get("kernel1", "") or ""
+    one_stage = (
+        route.get("stages") == "1-stage" or str(route.get("backend1", "")) == "asm"
+    )
+    mxmoe = k1.startswith("flydsl_mxmoe")
+    mx = qn in ("mx_fp4", "mx_fp8")
+
+    def q(rule_fam=None, in_kernel=False):
+        if qn is None:
+            return "none"
+        if not mx:
+            return qn
+        if in_kernel:
+            return f"{qn}_in_kernel"
+        return f"{qn}_{mx_rule_of_route(qn)}"
+
     if "flydsl_gfx942" in full:
-        act, inter = "none", "bf16"
-    elif route.get("stages") == "1-stage" or str(route.get("backend1", "")) == "asm":
+        act, inter, iq = "none", "bf16", "none"
+    elif one_stage and "flydsl_gfx942" not in full:
         a16 = bool(route.get("flat")) or "a16" in k1 or "xbf16" in k1
-        act, inter = ("none" if a16 else qn), "fp32_direct"
-    elif k1.startswith("flydsl_mxmoe"):
-        act, inter = qn, "fp32_direct"
+        act = "none" if a16 else q(in_kernel=True)
+        inter, iq = "fp32_direct", q(in_kernel=True)
+    elif mxmoe:
+        act, inter, iq = q(), "fp32_direct", q(in_kernel=True)
     else:
-        act, inter = qn, then
-    return {"act_quant": act, "inter": inter, "combine": combine_of_route(route)}
+        act = q()
+        iq = q()
+        inter = f"bf16_then_{iq}" if iq != "none" else "bf16"
+    return {
+        "act_quant": act,
+        "inter": inter,
+        "inter_quant": iq,
+        "combine": combine_of_route(route),
+        "out_dtype": out_dtype_name(S),
+    }
 
 
 def numerics_of(S, cand, route, ctx=None):
@@ -415,15 +578,21 @@ def path_ref(S, ref_w, bias, hidden, tw, ti, mask, rows, numerics=None):
     import aiter
 
     n = numerics_from_route(S, {}) if numerics is None else numerics
-    n = normalize_numerics(S, n, derived=n.get("combine") == "n/a")
+    n = normalize_numerics(
+        S, n, derived=n.get("combine") == "n/a" or "(inferred)" in str(n.get("combine"))
+    )
     act_none = n["act_quant"] == "none"
     inter = n["inter"]
-    if n["act_quant"].startswith("mx_") or inter.endswith(("mx_fp4", "mx_fp8")):
+    iq = n["inter_quant"]
+    if n["act_quant"].endswith("_in_kernel") or iq.endswith("_in_kernel"):
         raise NotImplementedError(
-            "ref_path for MX activation quant (a4w4/a8w4/mxfp8) is not implemented"
+            "ref_path is n/a: the path quantizes MX activations in-kernel with its own "
+            "rule (ref_exact scores it)"
         )
+    act_fam, act_rule = split_quant(n["act_quant"])
+    inter_fam, inter_rule = split_quant(iq)
     qn = quant_name(S)
-    quant_inter = qn is not None and inter != "bf16"
+    quant_inter = qn is not None and inter != "bf16" and iq != "none"
     E = S.E_local
     ids = _local_ids(ti, mask)
     h_rows, tw_rows, ids_rows = hidden[rows], tw[rows], ids[rows]
@@ -431,6 +600,8 @@ def path_ref(S, ref_w, bias, hidden, tw, ti, mask, rows, numerics=None):
     with fp64_math():
         if act_none:
             a1q, a1s = h_rows, _ones_scale(S, r, S.D)
+        elif act_rule:
+            a1q, a1s = _mx_deq(h_rows, act_fam, act_rule), None
         else:
             a1q_all, a1s_all = _path_quant(S, hidden)
             if a1s_all is None:
@@ -445,6 +616,9 @@ def path_ref(S, ref_w, bias, hidden, tw, ti, mask, rows, numerics=None):
         if not quant_inter or S.qtype in (aiter.QuantType.No,):
             a2q = flat.reshape(r, S.topk, S.I)
             a2s = _ones_scale3(S, r)
+        elif inter_rule:
+            a2q = _mx_deq(flat, inter_fam, inter_rule).reshape(r, S.topk, S.I)
+            a2s = None
         elif S.qtype == aiter.QuantType.per_Tensor:
             # the intermediate scale is a function of the whole batch
             a1q_f, a1s_f = (
@@ -465,6 +639,14 @@ def path_ref(S, ref_w, bias, hidden, tw, ti, mask, rows, numerics=None):
             a2s = None if a2s_f is None else a2s_f.reshape(r, S.topk, -1)
             a2q = a2q.reshape(r, S.topk, S.I)
         return _stage2(S, ref_w, bias, a2q, a2s, tw_rows, ids_rows, E)
+
+
+def _mx_deq(x, fam, rule):
+    """Dequantized MX values of ``x`` per aiter's scale rule; a GEMM that consumes them
+    with unit scales sees exactly what the quantized operand carries."""
+    from . import mx_ref
+
+    return mx_ref.mx_quant_ref(x, "fp4" if fam == "mx_fp4" else "fp8", rule)["deq"]
 
 
 def _inter_values(S, out1, inter):
@@ -606,7 +788,10 @@ def rule(res, flat_mxfp4=False):
     if res["nan_inf"] or res["sentinel_ok"] is False:
         return False
     if "path_allclose" not in res["mean"]:
-        return None
+        # ref_path is n/a (an in-kernel MX quant): the garbage guard on ref_exact only;
+        # the verdict against the bar stays on ref_exact in compare
+        e = res["mean"].get("exact_rel_l2")
+        return None if e is None else e <= EXACT_ONLY_LIMIT
     for m in res["per_seed"]:
         if m["path_allclose"] > 0 and m["path_logits_diff"] > LOGITS_DIFF_LIMIT:
             return False

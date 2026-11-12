@@ -27,12 +27,16 @@ class OldLastRoute(NamedTuple):
     reason: str
 
 
-def _S(qtype="per_1x128", aq="fp8"):
+def _S(qtype="per_1x128", aq="fp8", dtype="bfloat16"):
+    import torch
+
     import aiter
     from aiter import dtypes
 
     return types.SimpleNamespace(
-        qtype=getattr(aiter.QuantType, qtype), aq=getattr(dtypes, aq)
+        qtype=getattr(aiter.QuantType, qtype),
+        aq=getattr(dtypes, aq),
+        dtype=getattr(torch, dtype),
     )
 
 
@@ -46,7 +50,8 @@ def test_core_vocabulary_is_accepted_and_recorded():
     S = _S()
     n = accuracy.normalize_numerics(S, _decl())
     assert accuracy.numerics_key(n) == (
-        "act_quant=per_1x128_fp8;inter=fp32_direct;combine=fp32_reduce"
+        "act_quant=per_1x128_fp8;inter=fp32_direct;inter_quant=per_1x128_fp8;"
+        "combine=fp32_reduce;out_dtype=bf16"
     )
     n = accuracy.normalize_numerics(
         S, _decl(inter="bf16_then_per_1x128_fp8", combine="bf16_atomic")
@@ -66,8 +71,8 @@ def test_every_core_combine_is_accepted_and_recorded(combine):
     n = accuracy.normalize_numerics(S, _decl(combine=combine))
     assert n["combine"] == combine
     cand = types.SimpleNamespace(declared_numerics=_decl(combine=combine))
-    assert accuracy.numerics_key(accuracy.numerics_of(S, cand, {})).endswith(
-        f"combine={combine}"
+    assert f"combine={combine};" in accuracy.numerics_key(
+        accuracy.numerics_of(S, cand, {})
     )
     # combine does not change the rounding points the references are built at
     other = accuracy.normalize_numerics(S, _decl(combine="bf16_atomic"))
@@ -219,7 +224,7 @@ def test_combine_rounding_rank_is_informational_in_compare():
 
 def test_aiter_route_combine_from_stage2_name():
     r = {"stages": "2-stage", "backend2": "ck", "kernel2": "moe_ck2stages_x"}
-    assert accuracy.combine_of_route(r) == "bf16_atomic"
+    assert accuracy.combine_of_route(r) == "bf16_atomic (inferred)"
     f = {
         "stages": "2-stage",
         "backend2": "flydsl",
@@ -228,10 +233,10 @@ def test_aiter_route_combine_from_stage2_name():
     assert accuracy.combine_of_route(f) == "bf16_rows_fp32_sum"
     f["kernel2"] = "flydsl_moe2_afp8_t32x128_atomic"
     assert accuracy.combine_of_route(f) == "bf16_atomic"
-    assert accuracy.combine_of_route({"stages": "1-stage"}) == "n/a"
+    assert accuracy.combine_of_route({"stages": "1-stage"}) == "bf16_atomic (inferred)"
     assert accuracy.combine_of_route({"stages": "whole-graph"}) == "n/a"
     n = accuracy.numerics_from_route(_S(), r)
-    assert n["combine"] == "bf16_atomic"
+    assert n["combine"] == "bf16_atomic (inferred)"
     accuracy.normalize_numerics(_S(), n, derived=True)
 
 
@@ -271,3 +276,169 @@ def test_no_reference_is_its_own_state_and_fails_a_routed_row(tmp_path):
         assert row["status"] == "no-reference"
         assert row.get("gate_fail", "") == want_fail
     assert csv and tmp_path
+
+
+def test_whole_graph_combine_follows_its_epilogue():
+    pytest.importorskip("aiter.ops.flydsl.fused_moe_gfx942")
+    from aiter.ops.flydsl.fused_moe_gfx942 import Config, get_tune_space
+
+    seen = {}
+    for cs in get_tune_space():
+        c = Config.from_string(cs)
+        route = {
+            "stages": "whole-graph",
+            "kernel1": f"impl__flydsl_gfx942__{cs}",
+        }
+        seen.setdefault(bool(c.use_prefill), accuracy.combine_of_route(route))
+    assert seen.get(True) == "bf16_rows_fp32_sum"  # prefill ends with sorted_sum
+    assert seen.get(False) == "bf16_atomic"  # batch1 / decode: pairwise bf16 atomics
+
+
+def test_out_dtype_is_recorded_for_fp16_cases():
+    n = accuracy.normalize_numerics(_S(dtype="float16"), _decl())
+    assert n["out_dtype"] == "fp16"
+    assert "out_dtype=fp16" in accuracy.numerics_key(n)
+
+
+def test_inferred_combine_label_is_not_a_declaration():
+    S = _S()
+    with pytest.raises(accuracy.NumericsError):
+        accuracy.normalize_numerics(S, _decl(combine="bf16_atomic (inferred)"))
+    ok = accuracy.normalize_numerics(
+        S, _decl(combine="bf16_atomic (inferred)"), derived=True
+    )
+    assert ok["combine"] == "bf16_atomic (inferred)"
+
+
+def _mx(qtype="per_1x32", aq="fp4x2"):
+    return _S(qtype, aq)
+
+
+def test_mx_rules_are_in_the_vocabulary():
+    S = _mx()
+    for rule in ("round_up", "even"):
+        n = accuracy.normalize_numerics(
+            S,
+            {
+                "act_quant": f"mx_fp4_{rule}",
+                "inter": "fp32_direct",
+                "inter_quant": f"mx_fp4_{rule}",
+                "combine": "bf16_atomic",
+            },
+        )
+        assert (
+            n["act_quant"] == f"mx_fp4_{rule}" and n["inter_quant"] == f"mx_fp4_{rule}"
+        )
+    # a rule that does not fit the format, an unknown rule, the harness-only value
+    for bad in ("mx_fp8_even", "mx_fp4_floor", "mx_fp4_in_kernel"):
+        with pytest.raises(accuracy.NumericsError):
+            accuracy.normalize_numerics(
+                S,
+                {"act_quant": bad, "inter": "bf16", "combine": "bf16_atomic"},
+            )
+    # an MX intermediate quantized from fp32 with act_quant none needs its rule
+    with pytest.raises(accuracy.NumericsError, match="inter_quant"):
+        accuracy.normalize_numerics(
+            S, {"act_quant": "none", "inter": "fp32_direct", "combine": "bf16_atomic"}
+        )
+    # inter_quant defaults to act_quant (core's registry sets it the same way)
+    n = accuracy.normalize_numerics(
+        S,
+        {"act_quant": "mx_fp4_even", "inter": "fp32_direct", "combine": "bf16_atomic"},
+    )
+    assert n["inter_quant"] == "mx_fp4_even"
+
+
+def test_bare_mx_is_accepted_once_with_a_warning_that_names_the_qualifier():
+    S = _mx()
+    with pytest.warns(UserWarning, match="mx_fp4_round_up or mx_fp4_even"):
+        n = accuracy.normalize_numerics(
+            S, {"act_quant": "mx_fp4", "inter": "bf16", "combine": "bf16_atomic"}
+        )
+    assert n["act_quant"] == "mx_fp4_round_up"
+
+
+def test_mx_rule_of_route_is_read_from_the_quant_call(monkeypatch):
+    import aiter.fused_moe as fm
+
+    def fake(module):
+        f = lambda *a, **k: None
+        f.__module__ = module
+        return f
+
+    monkeypatch.setattr(
+        fm, "fused_dynamic_mxfp4_quant_moe_sort", fake("aiter.ops.quant")
+    )
+    assert accuracy.mx_rule_of_route("mx_fp4") == "round_up"
+    monkeypatch.setattr(
+        fm,
+        "fused_dynamic_mxfp4_quant_moe_sort",
+        fake("aiter.ops.triton.quant.fused_mxfp4_quant"),
+    )
+    assert accuracy.mx_rule_of_route("mx_fp4") == "even"
+    monkeypatch.setattr(
+        fm, "fused_dynamic_mxfp8_quant_moe_sort", fake("somewhere.else")
+    )
+    with pytest.raises(accuracy.NumericsError):
+        accuracy.mx_rule_of_route("mx_fp8")
+
+
+def test_mx_route_numerics_follow_the_call_and_in_kernel_for_asm_one_stage(monkeypatch):
+    import aiter.fused_moe as fm
+
+    def fake(module):
+        f = lambda *a, **k: None
+        f.__module__ = module
+        return f
+
+    S = _mx()
+    monkeypatch.setattr(
+        fm, "fused_dynamic_mxfp4_quant_moe_sort", fake("aiter.ops.triton.x")
+    )
+    two = accuracy.numerics_from_route(
+        S, {"stages": "2-stage", "backend1": "ck", "backend2": "ck", "kernel1": "k"}
+    )
+    assert two["act_quant"] == "mx_fp4_even" and two["inter_quant"] == "mx_fp4_even"
+    assert two["inter"] == "bf16_then_mx_fp4_even"
+    one = accuracy.numerics_from_route(
+        S, {"stages": "1-stage", "backend1": "asm", "kernel1": "fmoe_x"}
+    )
+    assert one["act_quant"] == "mx_fp4_in_kernel" and one["inter"] == "fp32_direct"
+    assert one["combine"] == "bf16_atomic (inferred)"
+    # the harness-only value is accepted from a route, never from a declaration
+    accuracy.normalize_numerics(S, one, derived=True)
+    # a in-kernel path has no ref_path; the references say so
+    with pytest.raises(NotImplementedError, match="n/a"):
+        accuracy.path_ref(S, None, None, None, None, None, None, None, one)
+
+
+def test_compare_reports_mx_rule_and_rounding_separately():
+    from op_tests.moe_bench import compare
+
+    def key(act, inter="bf16_then_mx_fp4_even", iq=None, combine="bf16_atomic"):
+        iq = iq or act
+        return (
+            f"act_quant={act};inter={inter};inter_quant={iq};combine={combine};"
+            "out_dtype=bf16"
+        )
+
+    bar = key("mx_fp4_even")
+    new = key("mx_fp4_round_up", inter="bf16_then_mx_fp4_round_up")
+    assert compare.rule_differs(bar, new) == "different rule (MX scale)"
+    assert compare.rounds_more(bar, new) == ""  # not "rounds more"
+    assert not compare._same_rounding(bar, new)
+    assert compare.rule_differs(bar, bar) == ""
+    # a bar against an in-kernel path is a different rule too
+    inkernel = key("mx_fp4_in_kernel", inter="fp32_direct", iq="mx_fp4_in_kernel")
+    assert compare.rule_differs(bar, inkernel) == "different rule (MX scale)"
+    # bars from before inter_quant existed still compare on what they have
+    old = "act_quant=mx_fp4_even;inter=bf16_then_mx_fp4_even;combine=bf16_atomic"
+    assert compare._same_rounding(old, bar)
+    # "(inferred)" does not change the combine rank
+    assert (
+        compare.rounds_more(
+            key("none", inter="bf16", combine="fp32_reduce"),
+            key("none", inter="bf16", combine="bf16_atomic (inferred)"),
+        )
+        == "combine"
+    )

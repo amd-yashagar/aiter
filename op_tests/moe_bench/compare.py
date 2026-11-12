@@ -271,8 +271,8 @@ def rounds_more(bar_key, new_key):
     bi, ni = inter_rank(b.get("inter", "")), inter_rank(n.get("inter", ""))
     if bi is not None and ni is not None and ni > bi:
         out.append("inter")
-    bc = COMBINE_ROUNDING.get(b.get("combine", ""))
-    nc = COMBINE_ROUNDING.get(n.get("combine", ""))
+    bc = COMBINE_ROUNDING.get(b.get("combine", "").removesuffix(" (inferred)"))
+    nc = COMBINE_ROUNDING.get(n.get("combine", "").removesuffix(" (inferred)"))
     if bc is not None and nc is not None and nc > bc:
         out.append("combine")
     return ",".join(out)
@@ -282,8 +282,33 @@ ACC_GATE = [f"{ref}_{k}" for ref in ("path", "exact") for k in ("rel_l2", "max_n
 
 
 def _same_rounding(a, b):
-    """Equal act_quant and inter; ``combine`` is not modeled by the references."""
-    return bool(a) and bool(b) and a.split(";")[:2] == b.split(";")[:2]
+    """Equal act_quant, inter and inter_quant; ``combine`` is not modeled by the
+    references. Bars from before ``inter_quant`` existed compare on what they have."""
+    if not a or not b:
+        return False
+    fa, fb = _numerics_fields(a), _numerics_fields(b)
+    keys = [k for k in ("act_quant", "inter", "inter_quant") if k in fa and k in fb]
+    return bool(keys) and all(fa[k] == fb[k] for k in keys)
+
+
+def _mx_rule(q):
+    for fam in ("mx_fp4_", "mx_fp8_"):
+        if (q or "").startswith(fam):
+            return fam[:-1], q[len(fam) :]
+    return None, None
+
+
+def rule_differs(bar_key, new_key):
+    """ "different rule (MX scale)" when both quantize MX with the same format but another
+    scale rule (round_up, even, in_kernel). Informational: not "rounds more"; the verdict
+    stays on ref_exact against the bar."""
+    b, n = _numerics_fields(bar_key), _numerics_fields(new_key)
+    for k in ("act_quant", "inter_quant"):
+        bf, br = _mx_rule(b.get(k))
+        nf, nr = _mx_rule(n.get(k))
+        if bf and bf == nf and br != nr:
+            return "different rule (MX scale)"
+    return ""
 
 
 def acc_ok(bar, new):
@@ -369,6 +394,9 @@ def bar_view(rows, bar_rows, new_rows, weights):
                 "bar_numerics": b.get("bar_numerics", ""),
                 "new_numerics": (n or {}).get("new_numerics", ""),
                 "rounds_more": rounds_more(
+                    b.get("bar_numerics", ""), (n or {}).get("new_numerics", "")
+                ),
+                "mx_rule": rule_differs(
                     b.get("bar_numerics", ""), (n or {}).get("new_numerics", "")
                 ),
                 "dispatch_exact_rel_l2_mean": b.get("dispatch_exact_rel_l2_mean", ""),

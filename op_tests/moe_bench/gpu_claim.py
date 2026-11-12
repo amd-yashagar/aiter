@@ -150,16 +150,38 @@ def read_claims():
     return claims
 
 
+def attlas_flow_running():
+    """A live attlas flow (``flow.py``) on this node: its GPUs are claimed for the flow
+    even where the claim file records only a launcher pid."""
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", "flow.py"], capture_output=True, text=True, check=False
+        ).stdout
+    except OSError:
+        return False
+    return any(p.strip().isdigit() and int(p) != os.getpid() for p in out.split())
+
+
+FLOW_GPUS = (0, 3)  # the gfx942 prefill flow's GPUs: never started on while it runs
+
+
 def idle_gpus():
     state = gpu_state()
     claims = read_claims()
+    flow = attlas_flow_running()
     out = []
     for i, s in sorted(state.items()):
         busy = (
             s["util"] > MAX_UTIL_PCT
             or s["vram_gb"] > MAX_VRAM_GB
             or (s["procs"] and s["vram_gb"] > 0.6)
-            or (i in claims and claims[i]["alive"])
+            # another worker's claim holds the GPU even when its pid looks dead: the
+            # recorded pid can be a launcher while the job lives on
+            or (
+                i in claims
+                and (claims[i]["alive"] or claims[i].get("worker") != WORKER)
+            )
+            or (flow and i in FLOW_GPUS)
         )
         if not busy:
             out.append(i)
