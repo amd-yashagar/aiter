@@ -49,3 +49,31 @@ def test_aiter_strict_rule():
     # asm FLAT MXFP4 rows: logits_diff < 2e-3
     assert accuracy.rule(res(0.5, 1e-3), flat_mxfp4=True) is True
     assert accuracy.rule(res(0.5, 3e-3), flat_mxfp4=True) is False
+
+
+def test_a16w4_false_layout_equals_std16():
+    """MX worker finding (MXB-1 notes): for 1-byte and packed-fp4 weights
+    shuffle_weight((16,16)) and shuffle_weight_a16w4(w, 16, False) give the same byte
+    order, and e8m0_shuffle equals shuffle_scale_a16w4(False)."""
+    import torch
+
+    from aiter.ops.shuffle import (
+        shuffle_scale_a16w4,
+        shuffle_weight,
+        shuffle_weight_a16w4,
+    )
+    from aiter.utility import fp4_utils
+
+    g = torch.Generator().manual_seed(0)
+    e, n, k = 4, 256, 512
+    for dt, kk in ((torch.uint8, k // 2), (torch.int8, k)):
+        w = torch.randint(0, 255, (e, n, kk), generator=g, dtype=torch.int64).to(dt)
+        a = shuffle_weight(w.clone(), (16, 16))
+        b = shuffle_weight_a16w4(w.clone(), 16, False)
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), dt
+    s = torch.randint(100, 140, (e * n, k // 32), generator=g, dtype=torch.int64)
+    s = s.to(torch.uint8)
+    assert torch.equal(
+        fp4_utils.e8m0_shuffle(s.clone()).view(torch.uint8),
+        shuffle_scale_a16w4(s.clone(), e, False).view(torch.uint8),
+    )
