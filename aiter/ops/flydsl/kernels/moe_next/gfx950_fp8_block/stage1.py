@@ -51,7 +51,10 @@ def _build_stage1(*, model_dim, inter_dim, experts, tile_m, act, doweight_stage1
     assert BM in (16, 32, 64, 128), f"tile_m={BM}"
     assert act in ("silu", "gelu")
 
-    a_lds_size = BM * TILE_K
+    # The A gather copies 256 // (TILE_K / 16) = 32 rows per pass: a tile_m 16 buffer
+    # must still hold 32 rows, or the copy runs into the other ping-pong buffer.
+    _gather_rows = 256 // (TILE_K // 16)
+    a_lds_size = max(BM, _gather_rows) * TILE_K
 
     @fx.struct
     class GemmBuffers:
@@ -331,7 +334,8 @@ def _build_stage1(*, model_dim, inter_dim, experts, tile_m, act, doweight_stage1
                 fx.max(amax_view[r], amax_view[fx.Int32(128) + r]),
                 fx.max(amax_view[fx.Int32(256) + r], amax_view[fx.Int32(384) + r]),
             )
-            scale = amax / fx.Float32(fxh.FP8_MAX)
+            # As the reference (torch divides by a Python scalar via its fp32 reciprocal).
+            scale = amax * fx.Float32(fxh.FP8_MAX_RCP)
             scale = (scale == fx.Float32(0.0)).select(fx.Float32(1.0), scale)
             row = row0 + r
             if (wave == fx.Int32(0)) & (grp == fx.Int32(0)):

@@ -43,7 +43,7 @@ def _build_stage2(*, model_dim, inter_dim, experts, tile_m, tile_n, doweight_sta
         BN in (64, 128, 256) and N % BN == 0
     ), f"tile_n={BN} must divide model_dim={N}"
     assert BM in (16, 32, 64, 128), f"tile_m={BM}"
-    a_lds_bytes = BM * TILE_K
+    a_lds_bytes = max(BM, 256 // (TILE_K // 16)) * TILE_K  # the A copy covers 32 rows
     cshuf_bytes = BM * BN * out_bytes
     region_bytes = max(2 * a_lds_bytes, cshuf_bytes)
 
