@@ -211,3 +211,70 @@ def test_children_follow_the_aiter_tree_whatever_the_cwd(monkeypatch, tmp_path):
     prebuild.prebuild_probe(log=lambda *_: None, tree=str(tree))
     assert seen and seen[0]["cwd"] == str(tree)
     assert seen[0]["env"]["AITER_JIT_DIR"] == str(jit)
+
+
+def test_a_candidate_that_would_compile_is_skipped_logged_and_recorded(
+    monkeypatch, tmp_path
+):
+    from op_tests.moe_bench import bar_worker
+
+    monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    status, detail, outcome = bar_worker.not_prebuilt_row("module_moe_x")
+    assert (status, outcome) == ("not-prebuilt", "notprebuilt")
+    assert detail == "not prebuilt: module_moe_x"
+    assert (
+        "module_moe_x" in prebuild.read_missing_record()
+    )  # the next prebuild builds it
+    # a module that failed to build on the CPU carries its recorded error
+    (tmp_path / "prebuild_failed.json").write_text(
+        '{"module_moe_y": "compile error z"}'
+    )
+    status, detail, outcome = bar_worker.not_prebuilt_row("module_moe_y")
+    assert status == "build_failed" and "compile error z" in detail
+    assert "module_moe_y" not in prebuild.read_missing_record()
+
+
+def test_the_build_guard_names_the_module_even_after_a_wrapper_reraised_it():
+    e = prebuild.NotPrebuilt("module_moe_ck2stages_abi2_f8")
+    assert prebuild.not_prebuilt_module(e) == "module_moe_ck2stages_abi2_f8"
+    wrapped = RuntimeError(
+        str(e)
+    )  # a torch custom-op wrapper re-raises as RuntimeError
+    assert prebuild.not_prebuilt_module(wrapped) == "module_moe_ck2stages_abi2_f8"
+    assert prebuild.not_prebuilt_module(RuntimeError("something else")) is None
+
+
+def test_flydsl_run_only_alone_turns_builds_into_errors(monkeypatch):
+    from aiter.jit import core
+
+    real = core.build_module
+    monkeypatch.delenv(prebuild.NO_BUILD_ENV, raising=False)
+    monkeypatch.setenv("FLYDSL_RUNTIME_RUN_ONLY", "1")
+    try:
+        prebuild.forbid_builds()
+        with pytest.raises(prebuild.NotPrebuilt):
+            core.build_module(
+                "module_x", [], [], [], "", [], None, False, True, False, False
+            )
+    finally:
+        core.build_module = real
+
+
+def test_the_plan_includes_the_default_route_and_candidate_modules(monkeypatch):
+    """A forced row aiter declines falls back to its default route; those modules are
+    planned too, as are the CK modules the enumeration's own candidates name."""
+    mods = prebuild.modules_from_names(
+        PTPC_S(), "moe_ck2stages_gemm1_256x32x64x128_1x4_v1", "moe_ck2stages_gemm2_x"
+    )
+    assert any("per_token" in m for m in mods)
+    ct = prebuild.modules_from_names(PTPC_S(), "cktile_a8w4_bm32", "cktile_a8w4_bm32")
+    assert set(ct) == {"module_moe_cktile2stages"}
+    assert prebuild.modules_from_names(PTPC_S(), "flydsl_moe1_x", "flydsl_moe2_y") == {}
+    sk = prebuild.modules_from_names(PTPC_S(), "moe_ck2stages_gemm1_Splitk_x", "")
+    assert any(m.endswith("_splitk") for m in sk)
+
+
+def PTPC_S():
+    from op_tests.moe_bench import workload
+
+    return workload.resolve(PTPC)

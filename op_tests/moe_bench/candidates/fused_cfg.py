@@ -223,6 +223,12 @@ class FusedCfgSource(Source):
 
     def enumerate(self, ctx):
         a = ctx.dispatch_args
+        if a is None:
+            raise RuntimeError(
+                "the dispatch call recorded no get_2stage_cfgs arguments: a router hook "
+                "served it (routes must be disabled for aiter-side measurements, "
+                "AITER_MOE_DISABLE=1)"
+            )
         info = (
             ctx.dispatch_meta["gfx"],
             ctx.dispatch_meta["cu_num"],

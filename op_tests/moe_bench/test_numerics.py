@@ -650,3 +650,26 @@ def test_mx_flydsl_moe1_is_matched_not_assumed_bf16_then():
     assert v["round_up"]["inter"] == "fp32_direct"
     assert v["round_up+bf16"]["inter"] == "bf16_then_mx_fp4_round_up"
     assert n["combine"] == "bf16_rows_fp32_sum"
+
+
+def test_a_numerics_key_core_added_stops_the_run_with_one_clear_message(tmp_path):
+    import json
+
+    from op_tests.moe_bench import runner
+
+    with pytest.raises(accuracy.UnknownNumericsKey) as exc:
+        accuracy.normalize_numerics(_S(), _decl(brand_new_key="x"))
+    msg = str(exc.value)
+    assert "doesn't know numerics key 'brand_new_key'" in msg
+    assert "from core" in msg and "update the harness" in msg
+    assert isinstance(exc.value, accuracy.NumericsError)  # still a numerics error
+
+    # the worker reports it as an event; the job stops the whole run with that message
+    out = tmp_path / "events.jsonl"
+    out.write_text(json.dumps({"event": "harness_stale", "msg": msg}) + "\n")
+    job = runner.GroupJob.__new__(runner.GroupJob)
+    job.outfile, job.pos, job.proc = str(out), 0, None
+    with pytest.raises(SystemExit) as stop:
+        job._drain()
+    assert "update the harness" in str(stop.value)
+    assert isinstance(stop.value, runner.HarnessStale)

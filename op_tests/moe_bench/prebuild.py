@@ -60,6 +60,143 @@ def _ck(S, stage, splitk=False, runtime_limit=False):
     return {"md_name": md, "blob_gen_cmd": cmd, "kind": "ck2stages"}
 
 
+def modules_from_names(S, k1, k2):
+    """Modules a route's kernel names load: a CK 2-stage name loads that stage's
+    ``module_moe_ck2stages_*`` (dtypes, activation and quant type from the case, split-k
+    from the name), a CK-Tile name loads ``module_moe_cktile2stages``."""
+    mods = {}
+    for stage, k in ((1, k1 or ""), (2, k2 or "")):
+        if k.startswith("moe_ck2stages"):
+            spec = _ck(S, stage, splitk=stage == 1 and "splitk" in k.lower())
+            mods[spec["md_name"]] = spec
+        elif "cktile" in k.lower():
+            mods["module_moe_cktile2stages"] = {
+                "md_name": "module_moe_cktile2stages",
+                "kind": "cktile",
+            }
+    return mods
+
+
+def fallback_modules(S, case):
+    """Modules of aiter's own default route for the case.
+
+    A forced candidate row that aiter does not accept makes ``fused_moe`` fall back to its
+    default heuristics, and that route's modules would be JIT-built inside the lease (the
+    candidate is discarded only afterwards). The default route is the one an empty tuned
+    table gives: resolved on meta tensors, no launch."""
+    import tempfile
+
+    from . import routes
+    from .candidates import fused_cfg
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "empty_fmoe.csv")
+        with open(path, "w") as f:
+            f.write(",".join(fused_cfg.CSV_COLS) + "\n")
+        old = os.environ.get("AITER_CONFIG_FMOE")
+        os.environ["AITER_CONFIG_FMOE"] = path
+        fused_cfg.reset_router()
+        try:
+            route = routes.dry_route(case, S)
+        finally:
+            if old is None:
+                os.environ.pop("AITER_CONFIG_FMOE", None)
+            else:
+                os.environ["AITER_CONFIG_FMOE"] = old
+            fused_cfg.reset_router()
+    return modules_from_names(S, route.get("kernel1", ""), route.get("kernel2", ""))
+
+
+def candidate_modules(S, cands):
+    """Modules of an enumeration's CK / CK-Tile candidates (by their kernel names)."""
+    mods = {}
+    for c in cands:
+        meta = getattr(c, "meta", None) or {}
+        if "s1" in meta:
+            mods.update(modules_from_names(S, meta["s1"], meta["s2"]))
+        else:
+            mods.update(modules_from_names(S, c.kernels or "", ""))
+    return mods
+
+
+def routed_modules(S, case, cands, ctx):
+    """Modules aiter loads for each kind of enumerated candidate, after its own decision.
+
+    The kernel names of a candidate say which module it means to load, not which one aiter
+    loads when it declines the forced row and falls back to its default route. So one
+    representative per (block group, stage-1 family, stage-2 family) is forced and resolved
+    on meta tensors (``routes.dry_route``: the route aiter ends up with, nothing launched),
+    and the modules of that route are collected. Returns (modules, representatives, routes
+    seen as (candidate, kernel1, kernel2))."""
+    import re
+
+    from . import routes
+    from .candidates import fused_cfg
+
+    reps, seen = [], set()
+    for c in cands:
+        m = getattr(c, "meta", None) or {}
+        key = (
+            c.group,
+            re.split(r"[_ ]", m.get("s1") or c.kernels or "")[0],
+            re.split(r"[_ ]", m.get("s2") or "")[0],
+        )
+        if key not in seen and getattr(c, "row", None):
+            seen.add(key)
+            reps.append(c)
+    mods, resolved = {}, []
+    # aiter's own dispatch (the bar's "dispatch" candidate): shipped tuned rows included
+    fused_cfg.reset_router()
+    r = routes.dry_route(case, S)
+    resolved.append(("dispatch", r.get("kernel1", ""), r.get("kernel2", "")))
+    mods.update(modules_from_names(S, r.get("kernel1", ""), r.get("kernel2", "")))
+    try:
+        for c in reps:
+            c.prepare(ctx)
+            r = routes.dry_route(case, S)
+            resolved.append((c.id, r.get("kernel1", ""), r.get("kernel2", "")))
+            mods.update(
+                modules_from_names(S, r.get("kernel1", ""), r.get("kernel2", ""))
+            )
+    finally:
+        os.environ.pop("AITER_CONFIG_FMOE", None)
+        fused_cfg.reset_router()
+    return mods, len(reps), resolved
+
+
+def routed_modules_in_child(case):
+    """``routed_modules`` for one case, run as a GPU-less child that stands in for the
+    target arch (``AITER_AOT_REPLAY``): the arch aiter's runtime dispatch sees follows
+    ``GPU_ARCHS`` only there, and this process may be another arch's host."""
+    import aiter
+
+    from . import runner
+
+    tree = os.path.dirname(os.path.dirname(os.path.abspath(aiter.__file__)))
+    shim, pkg = None, "op_tests.moe_bench"
+    if runner.needs_shim(tree):
+        shim = runner.make_shim(os.environ.get("TMPDIR") or "/tmp")
+        pkg = "moe_bench_shim"
+    r = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            f"{pkg}.prebuild",
+            "--routed-modules",
+            json.dumps(case.row),
+        ],
+        env=_child_env(1, tree, shim, flydsl=True),
+        cwd=tree,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for line in r.stdout.splitlines():
+        if line.startswith("ROUTED "):
+            return json.loads(line[len("ROUTED ") :])
+    raise RuntimeError(f"routed-modules child failed: {(r.stderr or r.stdout)[-400:]}")
+
+
 def _tuner_info(S):
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
@@ -130,6 +267,27 @@ def modules_for_case(S):
     return mods
 
 
+def missing_record_path():
+    return os.path.join(jit_dir(), "prebuild_missing.json")
+
+
+def read_missing_record():
+    """{md_name: spec} modules a leased run asked for and did not find (``not prebuilt``);
+    the next prebuild builds them."""
+    try:
+        with open(missing_record_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def record_missing(md_name, spec=None):
+    rec = read_missing_record()
+    rec.setdefault(md_name, spec or {"md_name": md_name, "kind": "unknown"})
+    with open(missing_record_path(), "w") as f:
+        json.dump(rec, f, indent=1)
+
+
 def plan(cases):
     """Deduplicated {md_name: spec} over every runnable fused case, with the case ids that
     need each module."""
@@ -143,9 +301,29 @@ def plan(cases):
             S = workload.resolve(c)
         except Exception:  # noqa: BLE001, S112  (invalid rows are reported by run)
             continue
-        for md, spec in modules_for_case(S).items():
+        mods = dict(modules_for_case(S))
+        try:
+            mods.update(fallback_modules(S, c))
+            cands = _enumerate_all(S, c)[1]
+            mods.update(candidate_modules(S, cands))
+            mods.update(routed_modules_in_child(c))
+        except Exception:  # noqa: BLE001, S110  (the bar reports enumeration errors)
+            pass
+        for md, spec in mods.items():
             need.setdefault(md, dict(spec, cases=[]))["cases"].append(c.id)
+    for md, spec in read_missing_record().items():
+        need.setdefault(md, dict(spec, cases=[]))["cases"].append("lease-recorded")
     return need
+
+
+def _enumerate_all(S, case):
+    """Every candidate the bar sweep would try for the case (no GPU)."""
+    from .candidates.fused_cfg import FusedCfgSource
+    from .flydsl_prebuild import make_ctx
+
+    arch, cu = gpu_identity()
+    ctx = make_ctx(S, case, os.environ.get("TMPDIR") or "/tmp", arch, int(cu))
+    return ctx, FusedCfgSource().enumerate(ctx)
 
 
 def failed_path():
@@ -179,17 +357,40 @@ def require_prebuilt(cases):
         )
 
 
+class NotPrebuilt(RuntimeError):
+    """A leased run reached a JIT module that was not built beforehand."""
+
+    def __init__(self, md_name):
+        super().__init__(
+            f"build forbidden in a leased run ({NO_BUILD_ENV}=1): {md_name} is not "
+            "prebuilt; run `run --mode prebuild` first"
+        )
+        self.md_name = md_name
+
+
+def not_prebuilt_module(exc):
+    """The module a NotPrebuilt names, also after a custom-op wrapper re-raised it."""
+    import re
+
+    if isinstance(exc, NotPrebuilt):
+        return exc.md_name
+    m = re.search(r"\): (\S+) is not prebuilt", str(exc))
+    return m.group(1) if m and "build forbidden in a leased run" in str(exc) else None
+
+
 def forbid_builds():
-    """In a worker: turn any JIT build into an error (``MOE_BENCH_NO_BUILD=1``)."""
-    if os.environ.get(NO_BUILD_ENV) != "1":
+    """In a worker: turn any JIT build into an error. Active under ``MOE_BENCH_NO_BUILD=1``
+    and whenever FlyDSL is in run-only mode (``FLYDSL_RUNTIME_RUN_ONLY=1``): a lease is
+    run-only for every compiler, not just FlyDSL."""
+    if (
+        os.environ.get(NO_BUILD_ENV) != "1"
+        and os.environ.get("FLYDSL_RUNTIME_RUN_ONLY") != "1"
+    ):
         return
     from aiter.jit import core
 
     def refuse(md_name, *a, **k):
-        raise RuntimeError(
-            f"build forbidden in a leased run ({NO_BUILD_ENV}=1): {md_name} is not "
-            "prebuilt; run `run --mode prebuild` first"
-        )
+        raise NotPrebuilt(md_name)
 
     core.build_module = refuse
 
@@ -631,7 +832,17 @@ def prebuild_probe(log=print, tree=None, tmpdir=None):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", help="JSON module spec: build it in this process")
+    ap.add_argument("--routed-modules", help="JSON case row: print its routed modules")
     a = ap.parse_args(argv)
+    if a.routed_modules:
+        from . import schema, workload
+
+        case = schema.Case(json.loads(a.routed_modules), {})
+        S = workload.resolve(case)
+        ctx, cands = _enumerate_all(S, case)
+        mods, _, _ = routed_modules(S, case, cands, ctx)
+        print("ROUTED " + json.dumps(mods))
+        return 0
     if a.build:
         spec = json.loads(a.build)
         return 0 if build_one(spec) else 1

@@ -185,6 +185,11 @@ def probe_meta(tree, node, launcher, tmpdir):
     return info
 
 
+class HarnessStale(SystemExit):
+    """A worker found core declaring something this harness does not know: the whole run
+    stops with the message, once."""
+
+
 def check_harness(expected, imported):
     """Refuse to run when workers would import another tree's harness."""
     if not imported or os.path.realpath(expected) != os.path.realpath(imported):
@@ -400,6 +405,10 @@ class GroupJob:
             kind = ev.get("event")
             if kind == "worker_start":
                 check_harness(HERE, ev.get("harness", ""))
+            elif kind == "harness_stale":
+                if self.proc is not None:
+                    self.proc.kill()
+                raise HarnessStale(f"moe_bench: {ev.get('msg', 'stale harness')}")
             elif kind == "case_start":
                 self.inflight = ev["case_id"]
                 self.phase = ev.get("phase", "")
@@ -516,6 +525,16 @@ class GroupJob:
 
 def run_jobs(jobs, concurrency):
     active = []
+    try:
+        _run_jobs(jobs, concurrency, active)
+    except BaseException:
+        for j in active:
+            if getattr(j, "proc", None) is not None:
+                j.proc.kill()
+        raise
+
+
+def _run_jobs(jobs, concurrency, active):
     queue = list(jobs)
     while queue or active:
         while queue and len(active) < concurrency:

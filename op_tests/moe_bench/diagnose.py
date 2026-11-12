@@ -20,6 +20,23 @@ import sys
 import torch
 
 
+def _tree_sha():
+    import subprocess
+
+    import aiter
+
+    root = __import__("os").path.dirname(__import__("os").path.dirname(aiter.__file__))
+    try:
+        return subprocess.run(
+            ["git", "-C", root, "rev-parse", "--short=12", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 def interleave_position(S):
     """Interleaved row of each separated row of w1: tiles of 16 gate rows then 16 up."""
     i = S.I
@@ -74,7 +91,10 @@ def diagnose(case, rows=16, seed=0, log=print):
        off or read in interleaved order, bf16 activations, an unquantized intermediate.
     """
     from . import accuracy, routes, workload
+    from .bar_worker import assert_no_route, disable_routes
 
+    # the dispatch side is aiter's own path: the router hook off, asserted per call
+    has_hook = disable_routes()
     S = workload.resolve(case)
     M = min(case.token, rows)
     aw, rw, bias = workload.build_group(S)
@@ -86,6 +106,7 @@ def diagnose(case, rows=16, seed=0, log=print):
     with routes.RouteRecorder() as rec:
         out = fm.fused_moe(hs.clone(), aw["w1"], aw["w2"], tw, ti, **kw).clone()
     torch.cuda.synchronize()
+    assert_no_route()
     route = routes.route_from_record(rec.last()) if rec.records else {}
     ridx = torch.arange(M, device="cuda")
     fam = accuracy.quant_name(S)
@@ -108,7 +129,8 @@ def diagnose(case, rows=16, seed=0, log=print):
 
     log(
         f"{case.id} {S.act.name} {fam} bias={S.bias} gate_mode={S.gate_mode} M={M} "
-        f"route={route.get('kernel1', '')[:40]}"
+        f"route={route.get('kernel1', '')[:40]} routes_disabled=1"
+        f"{' (aiter.moe hook present)' if has_hook else ''} aiter={_tree_sha()}"
     )
     exact = accuracy.exact_ref(S, rw, bias, hs, tw, ti, mask, ridx)
     results["ref_exact"] = _score(out[:M], exact) + ("exact",)

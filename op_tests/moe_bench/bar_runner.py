@@ -88,7 +88,7 @@ BAR_COLS = (
         *accuracy.gate_columns("new"),
     ]
     + ["node", "gpu", "gfx", "cu_num", "rocm", "torch", "flydsl"]
-    + ["aiter_sha", "aiter_dirty", "harness_sha", "env", "date"]
+    + ["aiter_sha", "aiter_dirty", "harness_sha", "env", "date", "routes_disabled"]
 )
 CAND_COLS = [
     "case_id",
@@ -126,6 +126,7 @@ CAND_COLS = [
     "gpu",
     "aiter_sha",
     "date",
+    "routes_disabled",
 ]
 
 
@@ -167,7 +168,7 @@ def _row(case, ev, meta, cols):
             r[k] = json.dumps(v) if isinstance(v, (dict, list)) else v
     for k in ("node", "gfx", "cu_num", "rocm", "torch", "flydsl", "aiter_sha", "date"):
         r.setdefault(k, meta.get(k, ""))
-    for k in ("aiter_dirty", "harness_sha", "env"):
+    for k in ("aiter_dirty", "harness_sha", "env", "routes_disabled"):
         r[k] = meta.get(k, "")
     r["gpu"] = ev.get("gpu") or meta.get("gpu", "")
     return r
@@ -594,6 +595,9 @@ def _run_pass(args, kind):
         key=("case_id", "cand_id", "mode", "phase"),
     )
     meta = runner.probe_meta(tree, node, args.launcher, tmpdir)
+    # bar mode measures aiter's own paths with the router hook off (AITER_MOE_DISABLE=1),
+    # which the workers set and assert; the tree's sha is in aiter_sha
+    meta["routes_disabled"] = 1 if kind == "bar" else 0
     if kind in ("bar", "new"):
         shimmed = runner.needs_shim(tree)
         pf = preflight.ensure(

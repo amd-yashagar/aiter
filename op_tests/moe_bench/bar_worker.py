@@ -68,6 +68,56 @@ def _is_gpu_fault(msg):
     )
 
 
+def disable_routes():
+    """AITER_MOE_DISABLE=1 for this process: bar mode measures aiter's own paths. On a tree
+    with live route rows the dispatched call would otherwise be our routed kernel (and the
+    route recorder sees no get_2stage_cfgs call at all). Returns whether the tree has
+    ``aiter.moe`` (and so a hook that had to be told)."""
+    os.environ["AITER_MOE_DISABLE"] = "1"
+    try:
+        from aiter import moe
+    except Exception:  # noqa: BLE001  (a tree without aiter.moe has no hook)
+        return False
+    if hasattr(moe, "refresh"):
+        moe.refresh()
+    return True
+
+
+def assert_no_route():
+    """After an aiter-side call: ``aiter.moe.last_route()`` must report no route taken."""
+    try:
+        from aiter import moe
+
+        last = moe.last_route()
+    except Exception:  # noqa: BLE001
+        return
+    kid, reason = _parse_route(last)
+    if kid not in ("", "aiter"):
+        raise RuntimeError(
+            f"aiter.moe served an aiter-side measurement with {kid!r} ({reason}); "
+            "routes are not disabled (AITER_MOE_DISABLE)"
+        )
+
+
+def not_prebuilt_row(md_name):
+    """(status, detail, outcome) of a candidate that reached a module not built beforehand.
+
+    A leased run never compiles: the candidate is not timed. A module that failed to build
+    on the CPU is reported with its recorded error (``build_failed``); any other is logged
+    as ``not prebuilt: <module>`` and recorded for the next prebuild."""
+    from . import prebuild
+
+    failed = prebuild.known_failed().get(md_name)
+    if failed:
+        return (
+            "build_failed",
+            f"build_failed: {md_name}: {failed[-200:]}",
+            "build_failed",
+        )
+    prebuild.record_missing(md_name)
+    return "not-prebuilt", f"not prebuilt: {md_name}", "notprebuilt"
+
+
 def _declared_numerics(moe, last_route, kid):
     """Numerics of the kernel that served the last call: ``last_route().numerics``, else
     ``aiter.moe.numerics(id)``; None when aiter's own path served it."""
@@ -138,6 +188,7 @@ class Measurer:
         )  # "source:backend" -> {"total", "ok", "fail", "compile", "error"}
         self.fh, self.case_id = fh, case_id
         self.records = []  # confirmed results for the bar
+        self.routes_disabled = False  # bar mode: assert no route served a call
 
     def measure(self, cand, quick=False, modes=("warm",), check=True):
         """Returns {"ok", "us", "outcome", ...}; emits one ``cand`` event per mode.
@@ -194,6 +245,8 @@ class Measurer:
             with routes.RouteRecorder() as rec:
                 call()
                 torch.cuda.synchronize()
+            if self.routes_disabled:
+                assert_no_route()
             if hasattr(cand, "probe_route"):
                 cand.probe_route("eager")
             route = routes.route_from_record(rec.last()) if rec.records else {}
@@ -325,7 +378,17 @@ class Measurer:
             res["outcome"] = "ok"
             res["us"] = res["by_mode"][modes[0]]["median_us"]
             return res
+        except accuracy.UnknownNumericsKey as e:
+            emit(self.fh, {"event": "harness_stale", "msg": str(e)})
+            os._exit(75)
         except Exception as e:  # noqa: BLE001
+            from . import prebuild
+
+            md = prebuild.not_prebuilt_module(e)
+            if md:
+                status, detail, res["outcome"] = not_prebuilt_row(md)
+                self._emit(base, modes, status=status, detail=detail)
+                return res
             status = "unsupported" if isinstance(e, NotImplementedError) else "error"
             msg = _err(e)
             if _is_gpu_fault(msg):
@@ -476,6 +539,8 @@ def run_bar_group(cases, spec, fh):
 
     modes_req = spec["modes"]
     mode_kind = spec.get("kind", "bar")
+    if mode_kind == "bar":
+        disable_routes()
     dispatch_status = spec.get("dispatch_status", {})
     bad = spec.get("bad_cands", {})
     main_failures = spec.get("main_failures", {})
@@ -601,6 +666,7 @@ def run_bar_group(cases, spec, fh):
             c.id,
             ref_ctx={"S": S, "M": c.token, "rw": rw, "bias": bias, "mask": mask},
         )
+        meas.routes_disabled = mode_kind == "bar"
         results = {}
         skipped = []
         enum_counts, enum_errors = {}, []

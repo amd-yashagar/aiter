@@ -97,7 +97,7 @@ def _guard_builds(a, runner):
     cases = runner.select_cases(a.cases.split(","), a.filter)
     bad = prebuild.known_failed()
     miss = [m for m in prebuild.missing(prebuild.plan(cases)) if m not in bad]
-    if a.launcher == "gpuq" and not a.allow_build:
+    if (a.launcher == "gpuq" or a.no_build) and not a.allow_build:
         prebuild.require_prebuilt(cases)
         fly = prebuild.flydsl_cases_missing(cases)
         if fly:
@@ -237,6 +237,13 @@ def main(argv=None):
         type=int,
         help="cores the prebuild may use (default: all); lower it on a node that is "
         "measuring at the same time",
+    )
+    p.add_argument(
+        "--no-build",
+        action="store_true",
+        help="run as a lease does whatever the launcher: refuse to start if a needed JIT "
+        "module or FlyDSL case is not prebuilt, and skip (log `not prebuilt: <module>`) "
+        "any candidate that would compile",
     )
     p.add_argument(
         "--allow-build",

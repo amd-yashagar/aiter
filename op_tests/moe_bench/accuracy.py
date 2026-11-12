@@ -24,6 +24,7 @@ need validation of aiter's MX quant ops on gfx950 and raise NotImplementedError.
 """
 
 import contextlib
+import os
 import types
 
 import torch
@@ -252,6 +253,41 @@ class NumericsError(ValueError):
     """A kernel's declared numerics are not in core's vocabulary or do not fit the case."""
 
 
+class UnknownNumericsKey(NumericsError):
+    """core declares a numerics key this harness does not know: every kernel that carries
+    it would score against the wrong reference, so the run stops (once, at the first one)
+    rather than reporting no correct candidate on every case."""
+
+    def __init__(self, keys):
+        self.keys = sorted(keys)
+        super().__init__(
+            f"harness {_sha('harness')} doesn't know numerics key "
+            f"{', '.join(map(repr, self.keys))} from core {_sha('core')}; update the harness"
+        )
+
+
+def _sha(which):
+    import subprocess
+
+    try:
+        if which == "harness":
+            from . import runner
+
+            return runner.harness_sha()
+        import aiter
+
+        root = os.path.dirname(os.path.dirname(aiter.__file__))
+    except Exception:  # noqa: BLE001
+        return "?"
+    r = subprocess.run(
+        ["git", "-C", root, "rev-parse", "--short=12", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return r.stdout.strip() or "?"
+
+
 def quant_name(S):
     """The quant family the case implies: per_token_fp8, per_tensor_fp8, per_1x128_fp8,
     mx_fp4 or mx_fp8 (None: bf16 activations). MX families still need a scale rule."""
@@ -334,10 +370,7 @@ def normalize_numerics(S, declared, derived=False):
     }
     extra = set(declared) - allowed_keys
     if extra:
-        raise NumericsError(
-            f"unknown numerics key(s) {sorted(extra)}; core's keys are "
-            "act_quant, inter, inter_quant, combine"
-        )
+        raise UnknownNumericsKey(extra)
     missing = [k for k in ("act_quant", "inter", "combine") if k not in declared]
     if missing:
         raise NumericsError(f"numerics missing {missing}: {declared!r}")
