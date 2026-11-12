@@ -14,7 +14,7 @@ token scales in the lane-native order (common.py), weight scales as aiter's
 e8m0_shuffle (separated or 16-row gate/up interleaved rows).
 
 Epilogue: bias, activation in fp32 (aiter's FlyDSL helpers), then the group-32 MX
-quant of the intermediate straight from fp32 (or from bf16 with round_bf16), values
+quant of the intermediate straight from fp32, values
 by sorted row ([rows, I/2] fp4 or [rows, I] fp8) and scales in the mfma_native order.
 """
 
@@ -67,7 +67,6 @@ def _build_stage1(
     swiglu_limit,
     situ_beta,
     situ_linear_beta,
-    round_bf16,
     tile_n=128,
     ahead=2,
     read_ahead=1,
@@ -713,8 +712,6 @@ def _build_stage1(
                 vals = [v0[i] for i in range_constexpr(4)] + [
                     v1[i] for i in range_constexpr(4)
                 ]
-                if const_expr(round_bf16):
-                    vals = [x.to(fx.BFloat16).to(fx.Float32) for x in vals]
                 lmax = fx.absf(vals[0])
                 for i in range_constexpr(1, 8):
                     lmax = lmax.maximumf(fx.absf(vals[i]))
