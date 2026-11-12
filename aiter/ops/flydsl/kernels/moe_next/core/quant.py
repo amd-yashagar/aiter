@@ -12,6 +12,11 @@ token, as aiter's dynamic_per_group_scaled_quant):
     q     = cvt_pk_fp8_f32(med3(x * rcp(scale), -fp8_max, fp8_max))
 fp8_max is the arch's (240 for gfx942 e4m3fnuz, 448 for gfx950 e4m3fn).
 
+MX (mx_fp4_round_up, mx_fp8_round_up; gfx950): a group is 32 columns of a
+token, scale = RoundUp e8m0 of amax / max_pos (6 for fp4, 448 for fp8), values
+by the hardware scaled conversion, as aiter's per_1x32_mx_quant_hip; scales
+lane-native (quant_mx_block).
+
 The helpers take a workgroup-relative block index, so a quant pass can run as
 standalone kernels or in extra workgroups of the sort launch.
 """
@@ -20,7 +25,7 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 BLOCK = 256
@@ -153,6 +158,104 @@ def quant_token_block(x_it, q_it, s_it, red, row, n_rows, cols, fp8_max):
     fx.ptr_store(scale, s_it + fx.Int64(s))
 
 
+def _pkmax_u16(a, b):
+    va = fx.Vector.from_elements([a], fx.Int32).bitcast(fx.Uint16)
+    vb = fx.Vector.from_elements([b], fx.Int32).bitcast(fx.Uint16)
+    return fx.max(va, vb).bitcast(fx.Int32)[0]
+
+
+def _bf16_amax(dwords):
+    """max |x| of the bf16 pairs in ``dwords``, as an f32 (exact)."""
+    m = dwords[0] & fx.Int32(0x7FFF7FFF)
+    for d in dwords[1:]:
+        m = _pkmax_u16(m, d & fx.Int32(0x7FFF7FFF))
+    lo, hi = m & fx.Int32(0xFFFF), m.shrui(fx.Int32(16))
+    big = (fx.Uint32(lo) > fx.Uint32(hi)).select(lo, hi)
+    return (big << fx.Int32(16)).bitcast(fx.Float32)
+
+
+def _e8m0_round_up(amax, max_pos):
+    """aiter's MxScaleRoundMode RoundUp: the biased exponent of
+    ceil_pow2(amax / max_pos); 0xFF for inf and nan."""
+    u = (amax * fx.Float32(1.0 / max_pos)).bitcast(fx.Int32) & fx.Int32(0x7FFFFFFF)
+    e = (u + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23))
+    return (fx.Uint32(e) < fx.Uint32(0xFF)).select(e, fx.Int32(0xFF))
+
+
+def _bf16x2(d):
+    return _raw(fx.Vector.from_elements([d], fx.Int32).bitcast(fx.BFloat16))
+
+
+def _mx_fp4(dwords, qs):
+    """8 bf16 (4 dwords) -> one dword of 8 fp4, x / qs rounded to nearest even."""
+    pk = _raw(fx.Int32(0))
+    for j, d in enumerate(dwords):
+        pk = rocdl.cvt_scalef32_pk_fp4_bf16(T.i32, pk, _bf16x2(d), _raw(qs), j)
+    return fx.Int32(pk)
+
+
+def _mx_fp8(dwords, qs):
+    """8 bf16 (4 dwords) -> two dwords of 8 fp8 e4m3fn, x / qs (RNE)."""
+    i16x2 = fx.Vector.make_type(2, fx.Int16)
+    out = []
+    for p in range(2):
+        v = _raw(fx.full(2, 0, fx.Int16))
+        for h in range(2):
+            v = rocdl.cvt_scalef32_pk_fp8_bf16(
+                i16x2, v, _bf16x2(dwords[2 * p + h]), _raw(qs), h
+            )
+        out.append(fx.Vector(v).bitcast(fx.Int32)[0])
+    return out
+
+
+def mx_scale_cols(cols):
+    """Bytes per token of the lane-native MX scales: the group count padded to 16."""
+    return -(-(cols // 32) // 16) * 16
+
+
+@flyc.jit
+def quant_mx_block(x_it, q_it, s_it, blk, n_rows, cols, fp4):
+    """MX quant, one (token, 32-column group) per thread, from unit blk * 256;
+    units run over n_rows x mx_scale_cols(cols), and the padding groups get a
+    0 scale. RoundUp e8m0 scales (aiter's per_1x32_mx_quant_hip), stored
+    lane-native: token t, group g at byte t*Gp + (g%4)*(Gp/4) + g/4. ``q_it``
+    iterates the output as int32, ``s_it`` the scales as int8. gfx950 only."""
+    groups, gp = cols // 32, mx_scale_cols(cols)
+    tid = gpu.thread_idx.x
+    u = blk * fx.Int32(BLOCK) + tid
+    t = u // fx.Int32(gp)
+    g = u - t * fx.Int32(gp)
+    live = t < n_rows
+    val = live & (g < fx.Int32(groups))
+    src = val.select(t * fx.Int32(cols) + g * fx.Int32(32), fx.Int32(0))
+    dw = []
+    for i in range_constexpr(4):
+        dw.extend(_load8(x_it, src + fx.Int32(8 * i)))
+    e = _e8m0_round_up(_bf16_amax(dw), 6.0 if fp4 else 448.0)
+    qs = (e << fx.Int32(23)).bitcast(fx.Float32)
+    if const_expr(fp4):
+        out = [_mx_fp4(dw[4 * i : 4 * i + 4], qs) for i in range_constexpr(4)]
+        q = val.select(t * fx.Int32(cols // 8) + g * fx.Int32(4), fx.Int32(OOB))
+        fx.ptr_store(fx.Vector.from_elements(out, fx.Int32), q_it + fx.Int64(q))
+    else:
+        out = []
+        for i in range_constexpr(4):
+            out.extend(_mx_fp8(dw[4 * i : 4 * i + 4], qs))
+        q = t * fx.Int32(cols // 4) + g * fx.Int32(8)
+        for h in range_constexpr(2):
+            qh = val.select(q + fx.Int32(4 * h), fx.Int32(OOB))
+            fx.ptr_store(
+                fx.Vector.from_elements(out[4 * h : 4 * h + 4], fx.Int32),
+                q_it + fx.Int64(qh),
+            )
+    s = t * fx.Int32(gp) + (g & fx.Int32(3)) * fx.Int32(gp // 4) + (g >> fx.Int32(2))
+    e = val.select(e, fx.Int32(0))
+    fx.ptr_store(fx.Int8(e), s_it + fx.Int64(live.select(s, fx.Int32(OOB))))
+
+
+MX_MODES = {"mx_fp4_round_up": True, "mx_fp8_round_up": False}
+
+
 @functools.lru_cache(maxsize=64)
 def build_standalone(mode, cols, fp8_max, has_local):
     """A standalone launcher for one mode (tests, and calls without a sort)."""
@@ -175,6 +278,8 @@ def build_standalone(mode, cols, fp8_max, has_local):
             quant_1x128_block(
                 _it(x), _it(q), _it(s), bid, rows * fx.Int32(cols // 128), fp8_max
             )
+        elif mode in MX_MODES:
+            quant_mx_block(_it(x), _it(q), _it(s), bid, rows, cols, MX_MODES[mode])
         else:
             quant_token_block(
                 _it(x), _it(q), _it(s), lds.red.ptr, bid, rows, cols, fp8_max
@@ -201,4 +306,6 @@ def blocks(mode, m, cols):
     """Workgroups a quant pass needs for ``m`` token rows."""
     if mode == "per_1x128_fp8":
         return -(-(m * (cols // 128)) // (BLOCK // GROUP_LANES))
+    if mode in MX_MODES:
+        return -(-(m * mx_scale_cols(cols)) // BLOCK)
     return m

@@ -58,11 +58,38 @@ class TileMap:
         return self.rows // self.tile_m
 
 
-# Activation quant fused into the sort launch: mode -> scale columns for K.
+# Activation quant fused into the sort launch: mode -> (column multiple, archs).
 QUANT_MODES = {
-    "per_token_fp8": lambda k: 1,
-    "per_1x128_fp8": lambda k: k // 128,
+    "per_token_fp8": (8, None),
+    "per_1x128_fp8": (128, None),
+    "mx_fp4_round_up": (32, ("gfx950",)),
+    "mx_fp8_round_up": (32, ("gfx950",)),
 }
+
+
+def _quant_buffers(mode, m, k, dev):
+    """(a_q, a_scale, kernel views of both, fp8_max). MX scales are e8m0 bytes,
+    [M, k/32 padded to 16], lane-native (see core/quant.py)."""
+    from aiter import dtypes
+    from aiter.ops.flydsl.kernels.moe_next.core.quant import mx_scale_cols
+
+    if mode.startswith("mx_"):
+        if mode.startswith("mx_fp4"):
+            a_q = torch.empty((m, k // 2), dtype=dtypes.fp4x2, device=dev)
+        else:
+            a_q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=dev)
+        s = torch.empty((m, mx_scale_cols(k)), dtype=torch.uint8, device=dev)
+        return (
+            a_q,
+            s.view(dtypes.fp8_e8m0),
+            a_q.view(torch.int32),
+            s.view(torch.int8),
+            0.0,
+        )
+    cols = 1 if mode == "per_token_fp8" else k // 128
+    a_q = torch.empty((m, k), dtype=dtypes.fp8, device=dev)
+    s = torch.empty((m, cols), dtype=torch.float32, device=dev)
+    return a_q, s, a_q.view(torch.int32), s, float(torch.finfo(dtypes.fp8).max)
 
 
 def max_sorted_rows(m: int, topk: int, num_experts: int, tile_m: int) -> int:
@@ -150,27 +177,30 @@ def route_to_tiles(
     quant, qw = None, 0
     qx = qq = qs = _empty_i32(dev)
     if quant_mode is not None:
-        from aiter import dtypes
+        from aiter.jit.utils.chip_info import get_gfx_runtime
         from aiter.ops.flydsl.kernels.moe_next.core.quant import blocks
 
         if quant_mode not in QUANT_MODES:
             raise ValueError(f"quant_mode must be one of {sorted(QUANT_MODES)}")
+        mult, archs = QUANT_MODES[quant_mode]
+        if archs is not None and get_gfx_runtime() not in archs:
+            raise ValueError(
+                f"quant_mode {quant_mode} needs {archs}, not {get_gfx_runtime()}"
+            )
         k = quant_input.shape[-1]
         if (
             quant_input.dtype != torch.bfloat16
             or not quant_input.is_contiguous()
             or quant_input.shape != (m, k)
-            or k % 128
+            or k % mult
         ):
-            raise ValueError("quant_input must be contiguous bf16 [M, K], K % 128 == 0")
-        fp8 = dtypes.fp8
-        tm.a_q = torch.empty((m, k), dtype=fp8, device=dev)
-        tm.a_scale = torch.empty(
-            (m, QUANT_MODES[quant_mode](k)), dtype=torch.float32, device=dev
-        )
-        quant = (quant_mode, k, float(torch.finfo(fp8).max))
+            raise ValueError(
+                f"quant_input must be contiguous bf16 [M, K], K % {mult} == 0"
+            )
+        tm.a_q, tm.a_scale, qq, qs, fp8_max = _quant_buffers(quant_mode, m, k, dev)
+        quant = (quant_mode, k, fp8_max)
         qw = blocks(quant_mode, m, k)
-        qx, qq, qs = quant_input.view(torch.int32), tm.a_q.view(torch.int32), tm.a_scale
+        qx = quant_input.view(torch.int32)
     loc = tm.loc_ids if with_loc_ids else _empty_i32(dev)
     mask = expert_mask if expert_mask is not None else _empty_i32(dev)
     ltok = num_local_tokens if num_local_tokens is not None else _empty_i32(dev)

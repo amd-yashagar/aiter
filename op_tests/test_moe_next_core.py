@@ -159,12 +159,55 @@ def _quant_input(token, K, seed):
     return x
 
 
+MX_TYPES = {"mx_fp4_round_up": dtypes.fp4x2, "mx_fp8_round_up": dtypes.fp8}
+
+
+def _mx_lane_native(rs, m, k):
+    """aiter's row-major [M, G] e8m0 scales in core's lane-native order."""
+    from aiter.ops.flydsl.kernels.moe_next.core.quant import mx_scale_cols
+
+    groups, gp = k // 32, mx_scale_cols(k)
+    out = torch.zeros((m, gp), dtype=torch.uint8, device=rs.device)
+    g = torch.arange(groups, device=rs.device)
+    out[:, (g % 4) * (gp // 4) + g // 4] = rs.view(torch.uint8)[:m, :groups]
+    return out
+
+
 def _check_quant(tm, x, mode, local):
-    kw = {"quant_dtype": dtypes.fp8}
     rows = x.shape[0]
+    nr = None
     if local is not None:
-        kw["num_rows"] = torch.tensor([local], dtype=torch.int32)
+        nr = torch.tensor([local], dtype=torch.int32)
         rows = local
+    if mode in MX_TYPES:
+        from aiter.ops.quant import per_1x32_mx_quant_hip
+
+        rq, rs = per_1x32_mx_quant_hip(
+            x, quant_dtype=MX_TYPES[mode], scale_type=dtypes.fp8_e8m0, num_rows=nr
+        )
+        rs = _mx_lane_native(rs, x.shape[0], x.shape[1])
+        bad = []
+        # Token-major: one scale row per token and none for the sentinel token
+        # that padding slots name, so stage 1 must mask those rows. Padding
+        # groups (K/32 up to a multiple of 16) are 0, the byte aiter's sorted
+        # Triton quant writes for its padding, finite so that a padding K-step
+        # times zero activations stays 0.
+        if tm.a_scale.shape[0] != x.shape[0]:
+            bad.append("a_scale rows")
+        gp, groups = tm.a_scale.shape[1], x.shape[1] // 32
+        g = torch.arange(groups, gp, device=x.device)
+        if tm.a_scale[:rows].view(torch.uint8)[:, (g % 4) * (gp // 4) + g // 4].any():
+            bad.append("a_scale padding")
+        if not torch.equal(
+            tm.a_q[:rows].view(torch.uint8), rq[:rows].view(torch.uint8)
+        ):
+            bad.append("a_q")
+        if not torch.equal(tm.a_scale[:rows].view(torch.uint8), rs[:rows]):
+            bad.append("a_scale")
+        return bad
+    kw = {"quant_dtype": dtypes.fp8}
+    if nr is not None:
+        kw["num_rows"] = nr
     rq, rs = aiter.get_hip_quant(QUANT_TYPES[mode])(x, **kw)
     bad = []
     if not torch.equal(tm.a_q[:rows].view(torch.uint8), rq[:rows].view(torch.uint8)):
@@ -182,13 +225,18 @@ def test_fused_quant():
     quant op for each mode, on the one-shot and two-launch paths, and with the
     tile map still exact."""
     rows = []
-    for mode in QUANT_TYPES:
-        for token, E, topk, K, local in [
+    modes = [*QUANT_TYPES, *(MX_TYPES if get_gfx_runtime() == "gfx950" else ())]
+    for mode in modes:
+        cases = [
             (8, 256, 8, 7168, None),
             (200, 128, 8, 4096, 150),
             (3000, 256, 8, 7168, None),
             (2050, 385, 7, 2048, 2000),
-        ]:
+        ]
+        if mode in MX_TYPES:
+            # K = 2880: 90 groups padded to 96, and a 128-column step half padding
+            cases += [(8, 128, 4, 2880, None), (300, 128, 4, 2880, 250)]
+        for token, E, topk, K, local in cases:
             ti, tw, _ = routing(token, E, topk)
             x = _quant_input(token, K, token)
             nl = torch.tensor([local], dtype=torch.int32) if local is not None else None
