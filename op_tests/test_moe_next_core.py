@@ -119,6 +119,49 @@ def test_graph_capture(token=256, E=256, topk=8, tile_m=32):
     return [{"check": f"graph capture and replay M={token} E={E}"}]
 
 
+def test_host_time(calls=300):
+    """Eager host time per route_to_tiles call stays in microseconds: launches go
+    through cached compiled handles, not a re-trace per call."""
+    import time
+
+    rows = []
+    for token, E, topk, tile_m in [
+        (8, 256, 8, 16),
+        (512, 256, 8, 32),
+        (4096, 512, 11, 64),
+    ]:
+        ti, tw, _ = routing(token, E, topk)
+        out = torch.empty((token, 4096), dtype=dtypes.bf16)
+        kw = {"num_experts": E, "tile_m": tile_m, "zero_output": out}
+        for _ in range(5):
+            route_to_tiles(ti, tw, **kw)
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        for _ in range(calls):
+            route_to_tiles(ti, tw, **kw)
+        host_us = (time.perf_counter() - t) * 1e6 / calls
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        for _ in range(calls):
+            _moe_sorting_impl(
+                ti, tw, E, 4096, dtypes.bf16, tile_m, None, None, 0, True, output=out
+            )
+        opus_us = (time.perf_counter() - t) * 1e6 / calls
+        torch.cuda.synchronize()
+        assert host_us < 300, f"route_to_tiles host time {host_us:.0f} us per call"
+        rows.append(
+            {
+                "token": token,
+                "E": E,
+                "topk": topk,
+                "tile_m": tile_m,
+                "new host us": host_us,
+                "opus host us": opus_us,
+            }
+        )
+    return rows
+
+
 def _graph_us(fn, iters=20, per_graph=20):
     for _ in range(3):
         fn()
@@ -240,6 +283,9 @@ def main():
         rows.append(row)
     aiter.logger.info(
         "tile map edge cases:\n%s", pd.DataFrame(rows).to_markdown(index=False)
+    )
+    aiter.logger.info(
+        "eager host time:\n%s", pd.DataFrame(test_host_time()).to_markdown(index=False)
     )
     checks = test_graph_capture() + test_intermediate()
     aiter.logger.info("checks:\n%s", pd.DataFrame(checks).to_markdown(index=False))

@@ -12,7 +12,9 @@ import torch
 from aiter.jit.utils.chip_info import get_cu_num
 
 TILE_M = (16, 32, 64, 128)
-# Above this many route slots (M * topk) the sort runs as count + scatter.
+# Up to STAGE_ROUTES route slots (M * topk) one workgroup sorts from registers;
+# up to ONESHOT_MAX_ROUTES it streams them; above, the sort is count + scatter.
+STAGE_ROUTES = 2048
 ONESHOT_MAX_ROUTES = 2048
 CHUNK_MIN_ROUTES = 1024
 MAX_CHUNKS = 128
@@ -66,6 +68,17 @@ def _cu_num() -> int:
 def persistent_grid(k: int = 1) -> int:
     """A persistent grid of ``k`` workgroups per CU, looping over the live tiles."""
     return k * _cu_num()
+
+
+def _launch(fn, *args, device):
+    """Launch through aiter's compiled-handle cache: compiling (and launching)
+    once per device, then dispatching the cached handle. Calling the
+    ``@flyc.jit`` launcher directly re-traces on every call (tens of ms of
+    host time). Every other launch input is fixed by the build key: dtypes,
+    ranks and unit strides of the tensors, and the constexprs."""
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+    _run_compiled(fn, *args, specialization_key=(device.index,))
 
 
 def _empty_i32(device):
@@ -131,17 +144,19 @@ def route_to_tiles(
     else:
         zbuf, zero_v4, row_v4 = _empty_i32(dev), 0, 0
     z_wg = min(-(-zero_v4 * 16 // ZERO_BYTES_PER_WG), 8 * _cu_num()) if zero_v4 else 0
+    n_routes = m * topk
     oneshot, count, scatter = build(
         num_experts,
         topk,
         tile_m,
         expert_mask is not None,
         num_local_tokens is not None,
+        STAGE_ROUTES < n_routes <= ONESHOT_MAX_ROUTES,
     )
     stream = torch.cuda.current_stream(dev)
-    n_routes = m * topk
     if n_routes <= ONESHOT_MAX_ROUTES:
-        oneshot(
+        _launch(
+            oneshot,
             ids,
             w,
             tm.sorted_token_ids,
@@ -157,6 +172,7 @@ def route_to_tiles(
             row_v4,
             1 + z_wg,
             stream,
+            device=dev,
         )
         return tm
     n_chunks = min(MAX_CHUNKS, -(-n_routes // CHUNK_MIN_ROUTES))
@@ -164,7 +180,8 @@ def route_to_tiles(
     chunk = -(-per_chunk // 256) * 256
     n_chunks = -(-n_routes // chunk)
     counts = torch.empty(n_chunks * num_experts, dtype=torch.int32, device=dev)
-    count(
+    _launch(
+        count,
         ids,
         mask,
         ltok,
@@ -176,8 +193,10 @@ def route_to_tiles(
         row_v4,
         max(n_chunks, z_wg),
         stream,
+        device=dev,
     )
-    scatter(
+    _launch(
+        scatter,
         ids,
         w,
         tm.sorted_token_ids,
@@ -193,6 +212,7 @@ def route_to_tiles(
         chunk,
         n_chunks,
         stream,
+        device=dev,
     )
     return tm
 

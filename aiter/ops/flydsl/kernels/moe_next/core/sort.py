@@ -154,8 +154,8 @@ def _histogram(hist, mask_lds, tid, ids_it, begin, end, num_experts, topk, has_m
             _load_route(ids_it, None, i0 + fx.Int32(k * BLOCK), end, False)
             for k in range_constexpr(STAGE_ROUNDS)
         ]
-        for k in range_constexpr(STAGE_ROUNDS):
-            e, valid = _check(
+        routes = [
+            _check(
                 raw[k][0],
                 raw[k][1],
                 mask_lds,
@@ -165,6 +165,10 @@ def _histogram(hist, mask_lds, tid, ids_it, begin, end, num_experts, topk, has_m
                 i0 + fx.Int32(k * BLOCK),
                 topk,
             )
+            for k in range_constexpr(STAGE_ROUNDS)
+        ]
+        for k in range_constexpr(STAGE_ROUNDS):
+            e, valid = routes[k]
             if valid:
                 fx.atomic_add(hist + fx.Int64(e), fx.Int32(1), syncscope="workgroup")
     gpu.barrier()
@@ -240,6 +244,19 @@ def _write_meta(nv_it, nlive_it, tid, tokens, total, tile_m):
         _st(nlive_it, total // fx.Int32(tile_m), c0)
 
 
+def _expert_of(hist, start, row, num_experts, key_bits):
+    """(expert, end of its real rows): the last expert whose padded start is at
+    or below ``row``."""
+    c1 = fx.Int32(1)
+    lo, hi = fx.Int32(0), fx.Int32(num_experts - 1)
+    for _ in range_constexpr(key_bits + 1):
+        mid = (lo + hi + c1) >> c1
+        ok = _lds(start, mid) <= row
+        lo = ok.select(mid, lo)
+        hi = ok.select(hi, mid - c1)
+    return lo, _lds(start, lo) + _lds(hist, lo)
+
+
 @flyc.jit
 def _write_tile_list(
     hist,
@@ -247,45 +264,61 @@ def _write_tile_list(
     local,
     seid_it,
     live_it,
-    sids_it,
-    sw_it,
     total,
     first,
     stride,
-    tokens,
     num_experts,
-    topk,
     tile_m,
     key_bits,
 ):
-    """sorted_expert_ids, live_tiles and the padding rows, one tile per thread
-    across the grid; a tile's expert is the last one whose padded start is at
-    or below it. A tile's padding rows (its tail past the real rows) get the
-    sentinel and weight 0 through tile_m unrolled, predicated stores."""
+    """sorted_expert_ids and live_tiles, one tile per thread across the grid."""
     c0, c1, cT = fx.Int32(0), fx.Int32(1), fx.Int32(tile_m)
-    sentinel = (fx.Int32(topk) << fx.Int32(24)) | tokens
     n_tiles = total // cT
     iters = (n_tiles - first + stride - c1) // stride
     for j in range(c0, iters, c1):
         t = first + fx.Int32(j) * stride
         row = t * cT
-        lo, hi = c0, fx.Int32(num_experts - 1)
-        for _ in range_constexpr(key_bits + 1):
-            mid = (lo + hi + c1) >> c1
-            ok = _lds(start, mid) <= row
-            lo = ok.select(mid, lo)
-            hi = ok.select(hi, mid - c1)
-        rows = _lds(start, lo) + _lds(hist, lo) - row
-        rows = (rows < cT).select(rows, cT)
+        lo, real_end = _expert_of(hist, start, row, num_experts, key_bits)
+        rows = real_end - row
         lid = _lds(local, lo)
         _st(seid_it, lid, t)
         _st(live_it, lid, t * fx.Int32(3))
         _st(live_it, row, t * fx.Int32(3) + c1)
-        _st(live_it, rows, t * fx.Int32(3) + fx.Int32(2))
-        for q in range_constexpr(tile_m):
-            p = (fx.Int32(q) >= rows).select(row + fx.Int32(q), fx.Int32(OOB))
-            _st(sids_it, sentinel, p)
-            _st(sw_it, fx.Float32(0.0), p)
+        _st(live_it, (rows < cT).select(rows, cT), t * fx.Int32(3) + fx.Int32(2))
+
+
+@flyc.jit
+def _write_padding(
+    hist, start, sids_it, sw_it, tid, tokens, num_experts, topk, tile_m, ept
+):
+    """Each expert's padding rows (its tail past the real rows, under tile_m):
+    sentinel id and weight 0. A thread takes its experts; quads wholly in
+    padding take one 16-byte store per array, the boundary quad scalar stores.
+    At most tile_m / 4 quads per expert, whatever the routing skew."""
+    c0, c1, c4 = fx.Int32(0), fx.Int32(1), fx.Int32(4)
+    cT = fx.Int32(tile_m)
+    sentinel = (fx.Int32(topk) << fx.Int32(24)) | tokens
+    vsent = fx.full(4, 0, fx.Int32) + sentinel
+    vzero = fx.full(4, 0.0, fx.Float32)
+    for k in range_constexpr(ept):
+        e = tid * fx.Int32(ept) + fx.Int32(k)
+        live = e < fx.Int32(num_experts)
+        es = live.select(e, c0)
+        cnt = live.select(_lds(hist, es), c0)
+        pad_beg = _lds(start, es) + cnt
+        pad_end = pad_beg + (cnt + cT - c1) // cT * cT - cnt
+        q0 = pad_beg // c4
+        for q in range_constexpr(tile_m // 4 + 1):
+            p = (q0 + fx.Int32(q)) * c4
+            if (p >= pad_beg) & (p + c4 <= pad_end):
+                fx.ptr_store(vsent, sids_it + fx.Int64(p))
+                fx.ptr_store(vzero, sw_it + fx.Int64(p))
+            if (p < pad_end) & ((p < pad_beg) | (p + c4 > pad_end)):
+                for r in range_constexpr(4):
+                    row = p + fx.Int32(r)
+                    ok = (row >= pad_beg) & (row < pad_end)
+                    _st(sids_it, sentinel, ok.select(row, fx.Int32(OOB)))
+                    _st(sw_it, fx.Float32(0.0), ok.select(row, fx.Int32(OOB)))
 
 
 @flyc.jit
@@ -343,18 +376,22 @@ def _rank_and_scatter(
             _load_route(ids_it, w_it, base + fx.Int32(k * BLOCK) + tid, end, True)
             for k in range_constexpr(STAGE_ROUNDS)
         ]
+        routes = [
+            _check(
+                raw[k][0],
+                raw[k][1],
+                mask_lds,
+                num_experts,
+                has_mask,
+                ids_it,
+                base + fx.Int32(k * BLOCK) + tid,
+                topk,
+            )
+            for k in range_constexpr(STAGE_ROUNDS)
+        ]
         for k in range_constexpr(STAGE_ROUNDS):
             if base + fx.Int32(k * BLOCK) < end:
-                e, valid = _check(
-                    raw[k][0],
-                    raw[k][1],
-                    mask_lds,
-                    num_experts,
-                    has_mask,
-                    ids_it,
-                    base + fx.Int32(k * BLOCK) + tid,
-                    topk,
-                )
+                e, valid = routes[k]
                 _rank_round(
                     run,
                     tbl,
@@ -443,16 +480,15 @@ def _oneshot_body(
         local,
         seid_it,
         live_it,
-        sids_it,
-        sw_it,
         total,
         tid,
         fx.Int32(BLOCK),
-        tokens,
         num_experts,
-        topk,
         tile_m,
         key_bits,
+    )
+    _write_padding(
+        hist, start, sids_it, sw_it, tid, tokens, num_experts, topk, tile_m, ept
     )
     for k in range_constexpr(0, e_cap, BLOCK):
         e = fx.Int32(k) + tid
@@ -511,9 +547,90 @@ def _store_counts(hist, c_it, tid, bid, num_experts, e_cap):
             _st(c_it, _lds(hist, e), bid * fx.Int32(num_experts) + e)
 
 
+@flyc.jit
+def _oneshot_big(
+    hist,
+    run,
+    local,
+    start,
+    tbl,
+    scan,
+    mask_lds,
+    tid,
+    ids_it,
+    w_it,
+    mask_it,
+    sids_it,
+    sw_it,
+    seid_it,
+    nv_it,
+    live_it,
+    nlive_it,
+    tokens,
+    num_experts,
+    topk,
+    tile_m,
+    has_mask,
+    key_bits,
+    ept,
+    e_cap,
+):
+    """The whole sort in one workgroup for more than STAGE routes: the routes
+    stream through in stages, once for the histogram and once to scatter."""
+    n = tokens * fx.Int32(topk)
+    if has_mask:
+        _load_mask(mask_lds, mask_it, tid, num_experts, e_cap)
+    _clear(hist, e_cap, tid)
+    _clear(tbl, 2 * WAVES * e_cap, tid)
+    gpu.barrier()
+    _histogram(hist, mask_lds, tid, ids_it, fx.Int32(0), n, num_experts, topk, has_mask)
+    total = _expert_scan(
+        hist, start, local, scan, tid, mask_lds, num_experts, tile_m, ept, has_mask
+    )
+    _write_meta(nv_it, nlive_it, tid, tokens, total, tile_m)
+    _write_tile_list(
+        hist,
+        start,
+        local,
+        seid_it,
+        live_it,
+        total,
+        tid,
+        fx.Int32(BLOCK),
+        num_experts,
+        tile_m,
+        key_bits,
+    )
+    _write_padding(
+        hist, start, sids_it, sw_it, tid, tokens, num_experts, topk, tile_m, ept
+    )
+    for k in range_constexpr(0, e_cap, BLOCK):
+        e = fx.Int32(k) + tid
+        _lds_st(run, _lds(start, e), e)
+    gpu.barrier()
+    _rank_and_scatter(
+        run,
+        tbl,
+        mask_lds,
+        tid,
+        ids_it,
+        w_it,
+        sids_it,
+        sw_it,
+        fx.Int32(0),
+        n,
+        num_experts,
+        topk,
+        has_mask,
+        key_bits,
+        e_cap,
+    )
+
+
 @functools.lru_cache(maxsize=128)
-def build(num_experts, topk, tile_m, has_mask, has_local):
-    """Compile-time specialisation; returns (oneshot, count, scatter) launchers."""
+def build(num_experts, topk, tile_m, has_mask, has_local, big=False):
+    """Compile-time specialisation; returns (oneshot, count, scatter) launchers.
+    ``big`` makes the one-shot stream more than STAGE routes."""
     E = num_experts
     key_bits = max(1, (E - 1).bit_length())
     ept = -(-E // BLOCK)  # experts per thread in the expert scan
@@ -567,7 +684,8 @@ def build(num_experts, topk, tile_m, has_mask, has_local):
                 _zero_rows(tokens, m_cap) * row_v4,
             )
         if bid == c0:
-            _oneshot_body(
+            body = _oneshot_big if big else _oneshot_body
+            body(
                 hist,
                 run,
                 local,
@@ -686,17 +804,26 @@ def build(num_experts, topk, tile_m, has_mask, has_local):
             local,
             _it(sorted_eids),
             _it(live_tiles),
-            _it(sorted_ids),
-            _it(sorted_w),
             total,
             bid * fx.Int32(BLOCK) + tid,
             n_chunks * fx.Int32(BLOCK),
-            tokens,
             E,
-            topk,
             tile_m,
             key_bits,
         )
+        if bid == c0:
+            _write_padding(
+                hist,
+                start,
+                _it(sorted_ids),
+                _it(sorted_w),
+                tid,
+                tokens,
+                E,
+                topk,
+                tile_m,
+                ept,
+            )
         for k in range_constexpr(0, e_cap, BLOCK):
             e = fx.Int32(k) + tid
             _lds_st(run, _lds(run, e) + _lds(start, e), e)
