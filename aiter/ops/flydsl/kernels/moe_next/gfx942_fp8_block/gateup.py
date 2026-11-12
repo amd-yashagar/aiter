@@ -29,14 +29,21 @@ SCALE_BLOCK = 128
 TILE_K = 128
 
 
-def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
-    """N = 2 * inter_dim (gate rows then up rows), K = model_dim."""
+def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu", OUT_FP8=False):
+    """N = 2 * inter_dim (gate rows then up rows), K = model_dim.
+
+    OUT_FP8 writes the intermediate as aiter's per_1x128 quant of the bf16 result
+    would ([M * TOPK, I] fp8 plus [M * TOPK, I / 128] fp32 scales), computed in the
+    epilogue; it needs BLOCK_N = 256 so a workgroup owns one 128-column group.
+    """
     assert activation in ("silu", "gelu")
     assert BLOCK_N in (128, 256), "each wave owns BLOCK_N // 8 gate and up channels"
     assert 32 <= BLOCK_M <= 256 and BLOCK_M % 32 == 0
     assert K % (2 * TILE_K) == 0, "the 2-stage pipeline needs an even K-tile count"
     assert (N // 2) % (BLOCK_N // 2) == 0
     contiguous_n = BLOCK_N // 2
+    assert not OUT_FP8 or contiguous_n == SCALE_BLOCK
+    IB = (N // 2) // SCALE_BLOCK
     assert SCALE_BLOCK % contiguous_n == 0 or contiguous_n % SCALE_BLOCK == 0
     assert contiguous_n <= SCALE_BLOCK, "one weight scale per gate/up sub-tile"
     KB = K // SCALE_BLOCK
@@ -384,6 +391,79 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
         pipeline_stage(1, s1, fx.Int32(0), False)
         return c_gate, c_up
 
+    INV_FP8_MAX = 1.0 / 240.0
+    COLS = SCALE_BLOCK // (256 // BLOCK_M)
+
+    def _quant_store(lds_c, row, part, sid, blk_n, p_output, p_out_scale, M):
+        """One row of 128 bf16 values is read by 256 / BLOCK_M threads; same math
+        and rounding as aiter's per_1x128 quant on gfx942: amax (floor 1e-10),
+        scale = amax * fp32(1/240), q = med3(x * (1 / scale), -240, 240) -> fp8."""
+        TPR = 256 // BLOCK_M
+        vals = []
+        for c in range_constexpr(COLS // 8):
+            col = part * COLS + c * 8
+            v = fxh.atom_tensor(lds_c, (row, col), 128).load()
+            for j in range_constexpr(8):
+                vals.append(Vec(v)[j].to(fx.Float32))
+        amax = fx.Float32(1e-10)
+        for x in vals:
+            amax = amax.maximumf(fx.absf(x))
+        for sh in range_constexpr(TPR.bit_length() - 1):
+            amax = amax.maximumf(amax.shuffle_xor(fx.Int32(1 << sh), fx.Int32(64)))
+        scale = amax * fx.Float32(INV_FP8_MAX)
+        inv = fx.Float32(1.0) / scale
+        hi = fx.Float32(240.0)
+        lo = fx.Float32(-240.0)
+        words = []
+        for w in range_constexpr(COLS // 4):
+            q = []
+            for j in range_constexpr(4):
+                y = vals[w * 4 + j] * inv
+                q.append(y.maximumf(lo).minimumf(hi))
+            pk = rocdl.cvt_pk_fp8_f32(
+                T.i32, _raw(q[0]), _raw(q[1]), _raw(fx.Int32(0)), False
+            )
+            pk = rocdl.cvt_pk_fp8_f32(T.i32, _raw(q[2]), _raw(q[3]), pk, True)
+            words.append(fx.Int32(pk))
+        tok = fx.Int32(sid & 0xFFFFFF)
+        slot = fx.Int32(sid >> 24)
+        valid = (tok < M) & (slot < TOPK)
+        out_row = tok * TOPK + slot
+        out_rsrc = fx.rocdl.get_buffer_rsrc(
+            fx.get_iter(
+                fx.rocdl.make_buffer_tensor(
+                    fx.make_view(
+                        fx.recast_iter(fx.Uint8, fxh._as_ptr(p_output)),
+                        fx.make_layout(M * TOPK * (N // 2), 1),
+                    ),
+                    max_size=False,
+                )
+            )
+        )
+        scale_rsrc = fx.rocdl.get_buffer_rsrc(
+            fx.get_iter(
+                fx.rocdl.make_buffer_tensor(
+                    fx.make_view(
+                        fx.recast_iter(fx.Float32, fxh._as_ptr(p_out_scale)),
+                        fx.make_layout(M * TOPK * IB, 1),
+                    ),
+                    max_size=False,
+                )
+            )
+        )
+        base = out_row * (N // 2) + blk_n * SCALE_BLOCK + part * COLS
+        for c in range_constexpr(COLS // 16):
+            buffer_ops.buffer_store(
+                Vec.from_elements(words[c * 4 : c * 4 + 4], fx.Int32),
+                out_rsrc,
+                base + c * 16,
+                mask=valid,
+                offset_is_bytes=True,
+            )
+        buffer_ops.buffer_store(
+            scale, scale_rsrc, out_row * IB + blk_n, mask=valid & (part == 0)
+        )
+
     @flyc.kernel
     def gateup_blockscale(
         p_input: fx.Pointer,
@@ -394,6 +474,7 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
         p_num_valid_ids: fx.Pointer,
         p_w_scale: fx.Pointer,
         p_a_scale: fx.Pointer,
+        p_out_scale: fx.Pointer,
         M: fx.Int32,
     ):
         tid = gpu.thread_idx.x
@@ -476,6 +557,10 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
                 ),
                 max_size=False,
             )
+            TPR = 256 // BLOCK_M
+            q_row = tid // TPR
+            q_part = tid % TPR
+            q_sid = sorted_view[q_row].bitcast(fx.Uint32)
 
             c_gate_frag, c_up_frag = gemm_blockscale(
                 blk_n,
@@ -517,9 +602,14 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
                 store_c.partition_D(lds_c_store),
             )
             gpu.barrier()
-            rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
-            fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
-            c_out.copy(buf_atom_w128, blk_n, rd)
+            if const_expr(not OUT_FP8):
+                rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
+                fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
+                c_out.copy(buf_atom_w128, blk_n, rd)
+            else:
+                _quant_store(
+                    lds_c, q_row, q_part, q_sid, blk_n, p_output, p_out_scale, M
+                )
 
     @flyc.jit
     def launch(
@@ -531,6 +621,7 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
         p_num_valid_ids: fx.Pointer,
         p_w_scale: fx.Pointer,
         p_a_scale: fx.Pointer,
+        p_out_scale: fx.Pointer,
         M: fx.Int32,
         task_num: fx.Int32,
         stream: fx.Stream,
@@ -545,6 +636,7 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
             p_num_valid_ids,
             p_w_scale,
             p_a_scale,
+            p_out_scale,
             M,
         ).launch(
             grid=(N // BLOCK_N, task_num, 1),

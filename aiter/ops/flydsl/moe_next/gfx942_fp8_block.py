@@ -53,13 +53,19 @@ def _tile(config, gpu, inter_dim):
 
 
 @functools.cache
-def _gateup(N, K, topk, block_m, block_n, act):
+def _gateup(N, K, topk, block_m, block_n, act, out_fp8):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_block.gateup import (
         compile_gateup,
     )
 
     return compile_gateup(
-        N=N, K=K, TOPK=topk, BLOCK_M=block_m, BLOCK_N=block_n, activation=act
+        N=N,
+        K=K,
+        TOPK=topk,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        activation=act,
+        OUT_FP8=out_fp8,
     )
 
 
@@ -175,21 +181,32 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
         quant = aiter.get_hip_quant(QuantType.per_1x128)
         xq, xs = quant(x, quant_dtype=dtypes.fp8)
         tasks = int(sorted_eids.shape[0])
-        inter = torch.empty((M, topk, I), dtype=torch.bfloat16, device=x.device)
+        fused_quant = block_n == 256
+        if fused_quant:
+            aq = torch.empty((M * topk, I), dtype=dtypes.fp8, device=x.device)
+            as_ = torch.empty(
+                (M * topk, I // 128), dtype=torch.float32, device=x.device
+            )
+            out1, out1_scale = aq, as_
+        else:
+            out1 = torch.empty((M, topk, I), dtype=torch.bfloat16, device=x.device)
+            out1_scale = xs
         _launch(
-            _gateup(2 * I, D, topk, block_m, block_n, act),
+            _gateup(2 * I, D, topk, block_m, block_n, act, fused_quant),
             xq,
             w.w1,
-            inter,
+            out1,
             sorted_ids,
             sorted_eids,
             num_valid,
             w.w1_scale,
             xs,
+            out1_scale,
             M,
             tasks,
         )
-        aq, as_ = quant(inter.view(M * topk, I), quant_dtype=dtypes.fp8)
+        if not fused_quant:
+            aq, as_ = quant(out1.view(M * topk, I), quant_dtype=dtypes.fp8)
         rows = torch.empty((tasks * block_m, D), dtype=torch.bfloat16, device=x.device)
         _launch(
             _down(D, I, topk, block_m, n_split, down_m),
