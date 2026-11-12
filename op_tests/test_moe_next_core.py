@@ -856,6 +856,158 @@ def _direct_probe(E, topk, has_mask, has_local):
     return launch, words
 
 
+@functools.cache
+def _slot_probe(E, topk, tile_m, has_mask, has_local):
+    """One workgroup per route slot running route_slot; thread 0 dumps
+    (expert, rank, leader), a leader dumps its tile list."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.kernels.moe_next.core.direct import (
+        route_slot,
+        slot_lds_words,
+    )
+
+    words = -(-slot_lds_words(tile_m) // 16) * 16
+
+    @fx.struct
+    class Lds:
+        w: fx.Array[fx.Int32, words, 16]
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def probe(
+        ids: fx.Tensor,
+        mask: fx.Tensor,
+        ltok: fx.Tensor,
+        meta: fx.Tensor,
+        tiles: fx.Tensor,
+        m_cap: fx.Int32,
+    ):
+        lds = fx.SharedAllocator().allocate(Lds).peek()
+        bid = fx.gpu.block_idx.x
+        tid = fx.gpu.thread_idx.x
+        expert, rank, leader = route_slot(
+            lds.w.ptr, ids, mask, ltok, m_cap, bid, E, topk, tile_m, has_mask, has_local
+        )
+        mi = fx.get_iter(fx.rocdl.make_buffer_tensor(meta, max_size=True))
+        ti = fx.get_iter(fx.rocdl.make_buffer_tensor(tiles, max_size=True))
+        if tid == fx.Int32(0):
+            fx.ptr_store(expert, mi + fx.Int64(bid * fx.Int32(3)))
+            fx.ptr_store(rank, mi + fx.Int64(bid * fx.Int32(3) + fx.Int32(1)))
+            fx.ptr_store(
+                leader.select(fx.Int32(1), fx.Int32(0)),
+                mi + fx.Int64(bid * fx.Int32(3) + fx.Int32(2)),
+            )
+        if leader & (tid < fx.Int32(tile_m)):
+            fx.ptr_store(
+                fx.ptr_load(lds.w.ptr + fx.Int64(tid)),
+                ti + fx.Int64(bid * fx.Int32(tile_m) + tid),
+            )
+
+    @flyc.jit
+    def launch(
+        ids: fx.Tensor,
+        mask: fx.Tensor,
+        ltok: fx.Tensor,
+        meta: fx.Tensor,
+        tiles: fx.Tensor,
+        m_cap: fx.Int32,
+        grid: fx.Int32,
+        stream: fx.Stream = None,
+    ):
+        probe(ids, mask, ltok, meta, tiles, m_cap).launch(
+            grid=(grid, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+def _slot_expected(tm, topk, n_slots):
+    """Per route: (expert, rank) from a tile map, and each tile's routes."""
+    nv = int(tm.num_valid_ids[0])
+    sid = tm.sorted_token_ids[:nv].cpu()
+    eid = tm.sorted_expert_ids.cpu()
+    want = {u: (-1, None) for u in range(n_slots)}
+    tiles = {}
+    start_of = {}
+    for r in range(nv):
+        tok, k = int(sid[r]) & 0xFFFFFF, int(sid[r]) >> 24
+        if k >= topk:
+            continue
+        e = int(eid[r // tm.tile_m])
+        start_of.setdefault(e, r)
+        u = tok * topk + k
+        want[u] = (e, r - start_of[e])
+        tiles.setdefault(r // tm.tile_m, []).append(u)
+    leaders = {v[0]: (want[v[0]][0], v) for v in tiles.values()}
+    return want, leaders
+
+
+def test_route_slot():
+    """direct.route_slot (one workgroup per slot) against the core sort's tile
+    map: every slot's expert and rank, which slots lead a tile, and each
+    leader's route list; M * topk up to 256, EP, -1 ids, num_local_tokens,
+    repeats, tile_m 16 and 32."""
+    rows_out = []
+    shapes = [(1, 256, 8), (8, 256, 8), (8, 385, 7), (8, 896, 16), (8, 513, 11)]
+    shapes += [(16, 64, 4), (13, 128, 5), (16, 512, 11), (32, 256, 8), (2, 16, 2)]
+    for token, E, topk in shapes:
+        for case in ("random", "mixed", "dup", "pad", "all_empty", "onehot"):
+            for mask in (False, True):
+                for local in (None, max(0, token - 2)):
+                    for tile_m in (16, 32):
+                        ti, tw, em = routing(token, E, topk, case, mask)
+                        nl = (
+                            None
+                            if local is None
+                            else torch.tensor([local], dtype=torch.int32)
+                        )
+                        n = token * topk
+                        meta = torch.full((n * 3,), -7, dtype=torch.int32)
+                        tiles = torch.full((n * tile_m,), -7, dtype=torch.int32)
+                        launch = _slot_probe(E, topk, tile_m, mask, local is not None)
+                        launch(
+                            ti,
+                            em if mask else ti,
+                            nl if nl is not None else ti,
+                            meta,
+                            tiles,
+                            token,
+                            n,
+                        )
+                        tm = route_to_tiles(
+                            ti,
+                            tw,
+                            num_experts=E,
+                            tile_m=tile_m,
+                            expert_mask=em,
+                            num_local_tokens=nl,
+                        )
+                        want, leaders = _slot_expected(tm, topk, n)
+                        m = meta.cpu().view(n, 3).tolist()
+                        tl = tiles.cpu().view(n, tile_m).tolist()
+                        bad = []
+                        for u in range(n):
+                            e, rank, lead = m[u]
+                            we, wr = want[u]
+                            if e != we or (we >= 0 and rank != wr):
+                                bad.append(f"slot {u}: {e, rank} vs {we, wr}")
+                            if bool(lead) != (u in leaders):
+                                bad.append(f"slot {u}: leader {lead}")
+                            elif lead:
+                                routes = leaders[u][1]
+                                got = tl[u][: len(routes)]
+                                rest = tl[u][len(routes) :]
+                                if got != routes or any(x != -1 for x in rest):
+                                    bad.append(f"slot {u}: tile {tl[u]} vs {routes}")
+                        assert not bad, (
+                            f"route_slot M={token} E={E} topk={topk} {case} "
+                            f"mask={mask} local={local} tile_m={tile_m}: {bad[:3]}"
+                        )
+                        rows_out.append({"token": token, "E": E, "exact": True})
+    return rows_out
+
+
 def _direct_expected(tm, topk):
     """(order, weight bits, group experts, group starts) from a tile map."""
     nv = int(tm.num_valid_ids[0])
@@ -1148,6 +1300,10 @@ def main():
     aiter.logger.info(
         "dynamic per-tensor:\n%s",
         pd.DataFrame(test_dynamic_tensor()).to_markdown(index=False),
+    )
+    slots = pd.DataFrame(test_route_slot())
+    aiter.logger.info(
+        "direct-mode route_slot: %d cases exact (M x topk up to 256)", len(slots)
     )
     direct = pd.DataFrame(test_direct_grouping())
     aiter.logger.info(

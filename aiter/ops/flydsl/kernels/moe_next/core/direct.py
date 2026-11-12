@@ -16,7 +16,8 @@ type (16-byte stores; rows must be a multiple of 16 bytes).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr.typing import T
 
 from .sort import (
     BLOCK,
@@ -29,6 +30,7 @@ from .sort import (
     _lds_st,
     _load_mask,
     _load_route,
+    _raw,
     _zero_fill,
 )
 
@@ -169,6 +171,110 @@ def group_routes(
     gpu.barrier()
 
 
+def slot_lds_words(tile_m):
+    """Int32 LDS words ``route_slot`` needs: the tile list, per-wave counts
+    (expert routes, EP experts below), the slot's validity and rank, a dump."""
+    return tile_m + 2 * WAVES + 3
+
+
+@flyc.jit
+def route_slot(
+    lds,
+    ids,
+    mask,
+    ltok,
+    m_cap,
+    slot,
+    num_experts,
+    topk,
+    tile_m,
+    has_mask,
+    has_local,
+):
+    """The light direct-mode entry: for route slot ``slot`` (a workgroup per
+    slot), its expert, its rank among that expert's routes, whether it leads a
+    tile (rank % tile_m == 0), and that tile's route list, without ordering
+    the other experts. Same rules and order as the sort (and group_routes).
+    Every thread of a 256-thread workgroup calls it, up to 256 routes; two
+    barriers. Returns (expert, rank, leader), workgroup-uniform; ``expert`` is
+    the local id under EP and -1 when the slot's route is dropped. Afterwards
+    ``lds[0:tile_m]`` holds the tile's route indices (token * topk + k) in
+    sort order, -1 past its routes (only meaningful when ``leader``)."""
+    E = num_experts
+    tid = gpu.thread_idx.x
+    wave, lane = tid // fx.Int32(WAVE), tid % fx.Int32(WAVE)
+    c0, c1 = fx.Int32(0), fx.Int32(1)
+    o_cnt, o_low = tile_m, tile_m + WAVES
+    o_valid, o_rank = tile_m + 2 * WAVES, tile_m + 2 * WAVES + 1
+    dump = fx.Int32(tile_m + 2 * WAVES + 2)
+    tokens = m_cap
+    if has_local:
+        t = _ld(_it(ltok), c0)
+        tokens = (t < m_cap).select(t, m_cap)
+    n = tokens * fx.Int32(topk)
+    mask_it = _it(mask)
+    ids_it = _it(ids)
+    inb = tid < n
+    u = inb.select(tid, c0)
+    e = inb.select(_ld(ids_it, u), fx.Int32(-1))
+    # the slot's expert, read once (uniform)
+    e_r = _ld(ids_it, slot)
+    # a repeated expert within a token keeps its last slot: drop this slot if
+    # a later slot of the token has the same id (the loads hit the same lines)
+    tok = u // fx.Int32(topk)
+    k0 = u - tok * fx.Int32(topk)
+    dup = tid < c0
+    for k in range_constexpr(1, topk):
+        sk = k0 + fx.Int32(k)
+        ok = inb & (sk < fx.Int32(topk))
+        other = _ld(ids_it, tok * fx.Int32(topk) + ok.select(sk, k0))
+        dup = dup | (ok & (other == e))
+    valid = inb & (e >= c0) & (e < fx.Int32(E)) & ~dup
+    if has_mask:
+        valid = valid & (_ld(mask_it, valid.select(e, c0)) != c0)
+    match = valid & (e == e_r)
+    peers = fx.Uint64(rocdl.ballot(T.i64, match))
+    lo, hi = fx.Uint32(peers), fx.Uint32(peers >> fx.Uint64(32))
+    below = fx.Int32(
+        rocdl.mbcnt_hi(T.i32, _raw(hi), _raw(rocdl.mbcnt_lo(T.i32, _raw(lo), _raw(c0))))
+    )
+    count = fx.Int32(fx.math.ctpop(lo)) + fx.Int32(fx.math.ctpop(hi))
+    first_lane = lane == c0
+    _lds_st(lds, count, first_lane.select(fx.Int32(o_cnt) + wave, dump))
+    if has_mask:
+        # local id of e_r: experts below it in the mask, one or more per thread
+        low = c0
+        for k in range_constexpr(-(-E // BLOCK)):
+            x = fx.Int32(k * BLOCK) + tid
+            ok = x < e_r
+            low = low + (ok & (_ld(mask_it, ok.select(x, c0)) != c0)).select(c1, c0)
+        for sh in range_constexpr(6):
+            low = low + low.shuffle_xor(fx.Int32(1 << sh), fx.Int32(WAVE))
+        _lds_st(lds, low, first_lane.select(fx.Int32(o_low) + wave, dump))
+    _lds_st(lds, valid.select(c1, c0), (tid == slot).select(fx.Int32(o_valid), dump))
+    _lds_st(lds, fx.Int32(-1), (tid < fx.Int32(tile_m)).select(tid, dump))
+    gpu.barrier()
+    off = c0
+    loc = c0
+    for w in range_constexpr(WAVES):
+        before = wave > fx.Int32(w)
+        off = off + before.select(_lds(lds, fx.Int32(o_cnt + w)), c0)
+        if has_mask:
+            loc = loc + _lds(lds, fx.Int32(o_low + w))
+    rank_u = off + below
+    _lds_st(lds, rank_u, (tid == slot).select(fx.Int32(o_rank), dump))
+    gpu.barrier()
+    r_valid = _lds(lds, fx.Int32(o_valid)) != c0
+    rank = _lds(lds, fx.Int32(o_rank))
+    leader = r_valid & ((rank % fx.Int32(tile_m)) == c0)
+    j = rank_u - rank
+    put = match & (j >= c0) & (j < fx.Int32(tile_m))
+    _lds_st(lds, tid, put.select(j, dump))
+    gpu.barrier()
+    expert = loc if has_mask else e_r
+    return r_valid.select(expert, fx.Int32(-1)), rank, leader
+
+
 def zero_rows(out, first, stride, tokens, m_cap, row_v4):
     """Zero output rows below min(tokens, m_cap): ``row_v4`` 16-byte vectors a
     row, grid-stride from vector ``first`` by ``stride`` (int32 tensor view)."""
@@ -181,5 +287,7 @@ __all__ = [
     "group_routes",
     "lds_words",
     "offsets",
+    "route_slot",
+    "slot_lds_words",
     "zero_rows",
 ]
