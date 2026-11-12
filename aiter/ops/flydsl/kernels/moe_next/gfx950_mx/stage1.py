@@ -66,6 +66,7 @@ def _build_stage1(
     round_bf16,
     tile_n=128,
     ahead=2,
+    read_ahead=1,
 ):
     K = int(model_dim)
     INTER = int(inter_dim)
@@ -329,20 +330,30 @@ def _build_stage1(
                         s_pend[nk // 2] = load_a_scales(nk)
                 frags, wsc = w_pend.pop(kt)
                 a_sc = s_pend[kt // 2]
-                for ks in range_constexpr(2):
+                # With read_ahead, LDS operand reads run one token tile ahead of
+                # their MFMAs.
+                order = [(ks, j) for ks in range(2) for j in range(MT)]
+                af_next = read_a_frag(slot, 0, 0) if read_ahead else None
+                for n in range_constexpr(len(order)):
+                    ks, j = order[n]
                     oa = (2 * kt + ks) % 4
-                    for j in range_constexpr(MT):
+                    if const_expr(read_ahead):
+                        af = af_next
+                        if const_expr(n + 1 < len(order)):
+                            nks, nj = order[n + 1]
+                            af_next = read_a_frag(slot, nj, nks)
+                    else:
                         af = read_a_frag(slot, j, ks)
-                        for t in range_constexpr(NT):
-                            fx.gemm(
-                                atoms[(oa, ks * 2 + half_of[t])],
-                                acc[j][t],
-                                af,
-                                frags[t][ks],
-                                acc[j][t],
-                                scale_a=a_sc[j],
-                                scale_b=wsc[pair_of[t]],
-                            )
+                    for t in range_constexpr(NT):
+                        fx.gemm(
+                            atoms[(oa, ks * 2 + half_of[t])],
+                            acc[j][t],
+                            af,
+                            frags[t][ks],
+                            acc[j][t],
+                            scale_a=a_sc[j],
+                            scale_b=wsc[pair_of[t]],
+                        )
                 if const_expr(kt + 1 < KT):
                     store_a_tile(a_pend.pop(kt + 1), 1 - slot)
                 gpu.barrier()
