@@ -96,10 +96,13 @@ class _MxGfx950(MoeKernel):
             return "doweight_stage1 not implemented"
         if spec.has_bias:
             return "bias not implemented"
-        if spec.hidden_pad or spec.intermediate_pad:
-            return "padding not implemented"
-        if spec.model_dim % 256 or spec.inter_dim % 128:
-            return "model_dim % 256 or inter_dim % 128"
+        # intermediate_pad: the padded weight rows and columns are zero (as aiter's
+        # tests and the frameworks build them), so computing the padded width
+        # adds exact zeros; with a bias that would not hold.
+        if spec.hidden_pad:
+            return "hidden_pad not implemented"
+        if spec.model_dim % 256 or spec.inter_dim % 32:
+            return "model_dim % 256 or inter_dim % 32"
         if spec.out_dtype not in (None, torch.bfloat16):
             return "output dtype is not bf16"
         if spec.global_experts != spec.experts:
@@ -150,7 +153,9 @@ class _MxGfx950(MoeKernel):
         w = _DT[spec.w_dtype]
         cfg = parse_config(config)
         bm = cfg.get("bm") or tile_m_for(m, topk, spec.experts, self.prefill)
-        tn = cfg.get("tn") or 128
+        tn = cfg.get("tn") or (
+            128 if spec.inter_dim % 128 == 0 or spec.inter_dim % 64 else 64
+        )
         la = cfg.get("la") or (
             (3 if self.prefill else 4) if spec.w_dtype != dtypes.fp8 else 2
         )

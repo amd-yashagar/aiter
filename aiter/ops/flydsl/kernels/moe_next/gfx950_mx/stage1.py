@@ -85,7 +85,10 @@ def _build_stage1(
     ALA = min(LA, 2)  # token tiles: two register sets (tiles kt+1, kt+2) at most
     STATIC_HALF = interleave or (WCOLS // 16) % 2 == 0
     assert K % 256 == 0, f"model_dim={K} must be a multiple of 256"
-    assert INTER % BNH == 0, f"inter_dim={INTER} must be a multiple of {BNH}"
+    assert INTER % 32 == 0, f"inter_dim={INTER} must be a multiple of 32"
+    # Column blocks past inter_dim (inter_dim % tile_n != 0): their weight tiles
+    # load the last real tile and their columns are not stored.
+    RAGGED = INTER % BNH != 0
     assert BM in (16, 32, 64, 128)
     KT = K // 256
     MT = BM // 16
@@ -123,7 +126,7 @@ def _build_stage1(
     XCD = bool(xcd) and not DIRECT
     assert not INLINE or (A_RESIDENT and BM == 16), "inline quant: BM 16, resident A"
     assert not DIRECT or BM == 16, "direct mode needs BM 16"
-    NX = INTER // BNH
+    NX = -(-INTER // BNH)
     ZCPW = -(-K // (8 * max(TOPK, 1) * NX))  # zero-fill 16 B chunks per workgroup
     G = K // 32
     region0 = max((KT if A_RESIDENT else 2) * a_lds_bytes, acc_bytes)
@@ -365,7 +368,7 @@ def _build_stage1(
         nblk = fx.Int32(gpu.block_id("x"))
         mblk = fx.Int32(gpu.block_id("y"))
         if const_expr(XCD):
-            nblk, mblk = cm.xcd_tile(nblk, mblk, INTER // BNH)
+            nblk, mblk = cm.xcd_tile(nblk, mblk, NX)
         m_row = mblk * fx.Int32(BM)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base = fx.Int32(fx.ptrtoint(lds.buf.ptr))
@@ -499,8 +502,14 @@ def _build_stage1(
             # parity is shifted down at load so the MFMA opsel stays static.
             ct0 = nblk * fx.Int32(BNH // 16) + wave * fx.Int32(WCOLS // 16)
             e_tile0 = e * fx.Int32(N_TILES)
+
+            def clamp_ct(ct):
+                if const_expr(RAGGED):
+                    return fx.min(ct, fx.Int32(INTER // 16 - 1))
+                return ct
+
             tiles = [
-                phys_tile(ct0 + fx.Int32(t % (NT // 2)), t // (NT // 2))
+                phys_tile(clamp_ct(ct0 + fx.Int32(t % (NT // 2))), t // (NT // 2))
                 for t in range(NT)
             ]
             w_base_dw = [(e_tile0 + t) * fx.Int32(W_TILE_BYTES // 4) for t in tiles]
@@ -728,7 +737,7 @@ def _build_stage1(
                 qs = (e8 << fx.Int32(23)).bitcast(fx.Float32)
                 srow = m_row + r
                 gcol = nblk * fx.Int32(BNH) + chunk * fx.Int32(8)
-                if r < fx.Int32(BM):
+                if (r < fx.Int32(BM)) & (gcol < fx.Int32(INTER)):
                     if const_expr(o_f8):
                         dws = cm.quant_f32_fp8(vals, qs)
                         cm.global_vec_store(
@@ -797,7 +806,7 @@ def _build_stage1(
             arg_zero,
             i32_hstride,
         ).launch(
-            grid=(INTER // BNH, fx.Int64(i32_m_blocks), 1),
+            grid=(NX, fx.Int64(i32_m_blocks), 1),
             block=(256, 1, 1),
             stream=stream,
         )
