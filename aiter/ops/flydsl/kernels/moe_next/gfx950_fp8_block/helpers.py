@@ -30,8 +30,21 @@ def encode_waitcnt(vmcnt=63, expcnt=7, lgkmcnt=63):
     return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
 
 
-def make_1x4_tiled_mma(elem_t):
-    """B-first: weights are MFMA operand A (channels on M), tokens operand B."""
+def make_1x4_tiled_mma(elem_t, wide_k=False):
+    """B-first: weights are MFMA operand A (channels on M), tokens operand B.
+
+    wide_k: gfx950's 16x16x128 f8f6f4 MFMA (unit scales, as aiter's dense blockscale
+    GEMM uses it): one MFMA per 128-K scale group. Each lane takes 32 consecutive K of
+    both operands; the same permutation on A and B leaves the product unchanged."""
+    if wide_k:
+        mma_atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, elem_t))
+        mma_atom = fx.atom_set_value(mma_atom, "scale_a", fx.Int32(0))
+        mma_atom = fx.atom_set_value(mma_atom, "scale_b", fx.Int32(0))
+        k_perm = fx.make_layout((32, 4), (1, 32))
+        tiled_mma = fx.make_tiled_mma(
+            mma_atom, fx.make_layout((4, 1, 1), (1, 0, 0)), (None, None, k_perm)
+        )
+        return mma_atom, tiled_mma
     mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, elem_t))
     k_perm = fx.make_layout((8, 4, 2), (1, 16, 8))
     tiled_mma = fx.make_tiled_mma(
