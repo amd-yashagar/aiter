@@ -9,6 +9,7 @@ The harness measures any aiter tree given as ``--aiter <path>``.
 import argparse
 import os
 import sys
+import tempfile
 
 DEFAULT_TIERS = os.environ.get("MOE_BENCH_TIERS", "")
 
@@ -23,6 +24,13 @@ def add_launcher(p):
         "none: inherit the environment",
     )
     p.add_argument("--tmpdir", default=None, help="private TMPDIR for workers")
+    p.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=15.0,
+        help="pause at start while the work disk has less "
+        "free space than this; 0 disables",
+    )
     p.add_argument(
         "--wait", type=int, default=0, help="seconds to wait for an idle GPU"
     )
@@ -258,6 +266,9 @@ def main(argv=None):
 
         return routes_cmd.cmd_coverage(a)
     if a.fn == "run":
+        from . import runner as _runner
+
+        _runner.wait_for_disk(tempfile.gettempdir(), a.min_free_gb)
         if a.launcher == "gpuq" and not a.inner:
             from . import batch
 

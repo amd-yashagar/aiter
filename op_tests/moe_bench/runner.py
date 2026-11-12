@@ -625,6 +625,22 @@ def drift_check(args, base_rows, meta, tmpdir):
     return drift
 
 
+def wait_for_disk(path, min_gb, poll=60, log_every=10):
+    """Block while ``path``'s filesystem has under ``min_gb`` GiB free (shared nodes)."""
+    import shutil
+
+    n = 0
+    while min_gb and shutil.disk_usage(path).free / 2**30 < min_gb:
+        if n % log_every == 0:
+            free = shutil.disk_usage(path).free / 2**30
+            print(
+                f"paused: {free:.1f} GiB free on {path}, waiting for {min_gb:g}",
+                flush=True,
+            )
+        n += 1
+        time.sleep(poll)
+
+
 def cmd_run(args):
     node = args.node or socket.gethostname()
     tmpdir = args.tmpdir or os.path.join(tempfile.gettempdir(), "moe-bench-tmp")
