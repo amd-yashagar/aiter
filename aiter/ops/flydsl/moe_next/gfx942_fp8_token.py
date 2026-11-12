@@ -47,9 +47,10 @@ class _Tile:
     block_k: int
     own_gateup: bool
     atomic: bool
+    down_n_split: int
 
 
-def _tile(config, gpu, model_dim, inter_dim):
+def _tile(config, gpu, model_dim, inter_dim, combine=None):
     cfg = dict(_configs(gpu).get("default", {}))
     cfg.update(_configs(gpu).get(config or "default", {}))
     own = cfg.get("gateup", "own") == "own"
@@ -65,8 +66,15 @@ def _tile(config, gpu, model_dim, inter_dim):
         block_n=block_n,
         block_k=block_k,
         own_gateup=own,
-        atomic=cfg.get("combine", "atomic") == "atomic",
+        atomic=(combine or cfg.get("combine", "atomic")) == "atomic",
+        down_n_split=_n_split(int(cfg.get("down_n_split", 1)), model_dim),
     )
+
+
+def _n_split(n_split, model_dim):
+    while n_split > 1 and (model_dim // 64) % (2 * n_split):
+        n_split //= 2
+    return n_split
 
 
 @functools.cache
@@ -110,11 +118,17 @@ def _gateup(N, K, topk, block_n, block_k, quant, act, swiglu_limit):
 
 
 @functools.cache
-def _down(N, K, topk, tile_m, per_tensor, atomic):
+def _down(N, K, topk, tile_m, per_tensor, atomic, n_split):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token.down import compile_down
 
     return compile_down(
-        N=N, K=K, TOPK=topk, BLOCK_M=tile_m, PER_TENSOR=per_tensor, ATOMIC=atomic
+        N=N,
+        K=K,
+        TOPK=topk,
+        BLOCK_M=tile_m,
+        PER_TENSOR=per_tensor,
+        ATOMIC=atomic,
+        N_SPLIT=n_split,
     )
 
 
@@ -151,6 +165,8 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
         "inter": "bf16_then_per_token_fp8",
         "combine": "bf16_atomic",
     }
+    # None follows the route config's "combine"; subclasses pin it.
+    combine: ClassVar[str | None] = "atomic"
 
     def supports(self, spec, m, topk, call=None):
         if spec.quant not in _QUANTS:
@@ -212,7 +228,7 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
 
         spec = weights.spec
         D, I = spec.model_dim, spec.inter_dim
-        t = _tile(config, self._gpu(weights), D, I)
+        t = _tile(config, self._gpu(weights), D, I, self.combine)
         per_tensor = spec.quant == QuantType.per_Tensor
         with compile_only():
             gu = self._gateup_fn(spec, topk, t)
@@ -223,7 +239,7 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
                 types += (fx.Int32,) * 2
             types += (fx.Float32,) * 2
             gu(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
-            dn = _down(D, I, topk, t.tile_m, per_tensor, t.atomic)
+            dn = _down(D, I, topk, t.tile_m, per_tensor, t.atomic, t.down_n_split)
             types = (fx.Uint8, fx.Uint8, fx.BFloat16, fx.Int32, fx.Float32)
             types += (fx.Int32, fx.Int32, fx.Float32, fx.Float32)
             dn(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
@@ -247,7 +263,7 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
         x = call.hidden_states
         M, D, I, topk = call.m, spec.model_dim, spec.inter_dim, call.topk
         per_tensor = spec.quant == QuantType.per_Tensor
-        t = _tile(call.config, self._gpu(call.weights), D, I)
+        t = _tile(call.config, self._gpu(call.weights), D, I, self.combine)
         atomic = t.atomic
         dev = x.device
         nlt = call.num_local_tokens
@@ -302,7 +318,7 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
         if not atomic:
             rows = torch.empty((tasks * t.tile_m, D), dtype=torch.bfloat16, device=dev)
         _launch(
-            _down(D, I, topk, t.tile_m, per_tensor, atomic),
+            _down(D, I, topk, t.tile_m, per_tensor, atomic, t.down_n_split),
             aq,
             call.w2,
             rows,
@@ -318,3 +334,17 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
         if not atomic:
             _sorted_sum(topk, D)(sort[6], rows, out, M)
         return out
+
+
+@register_kernel
+class Gfx942Fp8TokenPrefillRows(Gfx942Fp8TokenPrefill):
+    """Deterministic variant: one bf16 row per route, summed per token in fp32."""
+
+    id = "gfx942_fp8_token.prefill_rows"
+    epilogue = "reduce"
+    numerics: ClassVar[dict] = {
+        "act_quant": "per_token_fp8",
+        "inter": "bf16_then_per_token_fp8",
+        "combine": "bf16_rows_fp32_sum",
+    }
+    combine: ClassVar[str | None] = "rows"

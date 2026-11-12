@@ -21,11 +21,13 @@ from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import common as fxh
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _f32_to_bf16
 
 
-def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True):
+def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True, N_SPLIT=1):
     """N = model_dim, K = inter_dim. ATOMIC adds into out[token]; otherwise each
-    sorted row is stored to out[sorted_row] for a separate per-token sum."""
+    sorted row is stored to out[sorted_row] for a separate per-token sum. Each
+    workgroup walks 1 / N_SPLIT of the N tiles."""
     assert K % 64 == 0
     assert N % 128 == 0, "pairs of 64-column N tiles"
+    assert (N // 64) % (2 * N_SPLIT) == 0, "each split walks pairs of N tiles"
     assert BLOCK_M % 32 == 0 and 32 <= BLOCK_M <= 128
     assert BLOCK_M * K <= 48 * 1024, "A tile must fit LDS beside the C buffers"
     weight_dtype = fx.Float8E4M3FNUZ
@@ -52,6 +54,7 @@ def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True):
         # kernel (warmup, then a new specialization) must not reuse them.
         flyobj.clear_all()
         e_idx = fx.gpu.block_idx.y
+        n_split = fx.gpu.block_idx.x
         tid = fx.gpu.thread_idx.x
         flyobj.bid = e_idx
 
@@ -164,7 +167,8 @@ def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True):
 
             weight = fx.flat_divide(arg_p_weight, (BLOCK_N, BLOCK_K))
             ldsA = fx.flat_divide(ldsA0, (BLOCK_M, BLOCK_K))
-            nBN = N // BLOCK_N
+            nBN = N // BLOCK_N // N_SPLIT
+            n0 = n_split * nBN
 
             mm = flyobj.create_thr_mma(weight_dtype, (4, 1, 1))
             c_fake_tensor = fx.make_view(
@@ -268,36 +272,36 @@ def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True):
 
             frag_weights = [None, None]
             frag_weights[0] = flyobj.load_tiled_mma_fragA(
-                mm, weight, [None, None, 0, None]
+                mm, weight, [None, None, n0, None]
             )
-            gemm_compute(0, frag_weights[0], fragC[0])
+            gemm_compute(n0, frag_weights[0], fragC[0])
             frag_weights[1] = flyobj.load_tiled_mma_fragA(
-                mm, weight, [None, None, 1, None]
+                mm, weight, [None, None, n0 + 1, None]
             )
-            postprocess_store2lds(0, fragC[0], 0)
+            postprocess_store2lds(n0, fragC[0], 0)
             fx.gpu.barrier()
             for n, state in range(0, nBN - 2, 2, init=[]):
-                postprocess_atomic(n, 0)
+                postprocess_atomic(n0 + n, 0)
                 flyobj.load_tiled_mma_fragA(
-                    mm, weight, [None, None, n + 2, None], frag_weights[0]
+                    mm, weight, [None, None, n0 + n + 2, None], frag_weights[0]
                 )
-                gemm_compute(n + 1, frag_weights[1], fragC[1])
-                postprocess_store2lds(n + 1, fragC[1], 1)
+                gemm_compute(n0 + n + 1, frag_weights[1], fragC[1])
+                postprocess_store2lds(n0 + n + 1, fragC[1], 1)
                 fx.gpu.barrier()
 
-                postprocess_atomic(n + 1, 1)
+                postprocess_atomic(n0 + n + 1, 1)
                 flyobj.load_tiled_mma_fragA(
-                    mm, weight, [None, None, n + 3, None], frag_weights[1]
+                    mm, weight, [None, None, n0 + n + 3, None], frag_weights[1]
                 )
-                gemm_compute(n + 2, frag_weights[0], fragC[0])
-                postprocess_store2lds(n + 2, fragC[0], 0)
+                gemm_compute(n0 + n + 2, frag_weights[0], fragC[0])
+                postprocess_store2lds(n0 + n + 2, fragC[0], 0)
                 fx.gpu.barrier()
 
-            postprocess_atomic(nBN - 2, 0)
-            gemm_compute(nBN - 1, frag_weights[1], fragC[1])
-            postprocess_store2lds(nBN - 1, fragC[1], 1)
+            postprocess_atomic(n0 + nBN - 2, 0)
+            gemm_compute(n0 + nBN - 1, frag_weights[1], fragC[1])
+            postprocess_store2lds(n0 + nBN - 1, fragC[1], 1)
             fx.gpu.barrier()
-            postprocess_atomic(nBN - 1, 1)
+            postprocess_atomic(n0 + nBN - 1, 1)
 
     @flyc.jit
     def launch(
@@ -326,6 +330,6 @@ def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True):
             p_w_scale,
             p_a_scale,
             M,
-        ).launch(grid=(1, task_num, 1), block=(256, 1, 1), stream=stream)
+        ).launch(grid=(N_SPLIT, task_num, 1), block=(256, 1, 1), stream=stream)
 
     return launch
