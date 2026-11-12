@@ -34,7 +34,14 @@ from aiter.fused_moe_registry import (
     FusedMoeRequest,
     resolve_fused_moe_impl,
 )
-from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
+from aiter.jit.core import (
+    AITER_CONFIGS,
+    AITER_CSRC_DIR,
+    AITER_ROOT_DIR,
+    PY,
+    bd_dir,
+    mp_lock,
+)
 from aiter.jit.utils.chip_info import (
     get_cu_num,
     get_gfx,
@@ -4032,6 +4039,31 @@ def _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled):
         )
 
 
+@functools.lru_cache(maxsize=1)
+def _ck_blockscale_swiglu_oai_supported():
+    """Whether the CK checkout has the swiglu_oai epilogue in its blockscale MoE GEMM.
+
+    Older checkouts fail a static_assert in gridwise_moe_gemm_blockscale.hpp for every
+    stage-1 instance of the Swiglu module, after a JIT build of several minutes.
+    """
+    header = os.path.join(
+        AITER_ROOT_DIR,
+        "3rdparty",
+        "composable_kernel",
+        "include",
+        "ck",
+        "tensor_operation",
+        "gpu",
+        "grid",
+        "gridwise_moe_gemm_blockscale.hpp",
+    )
+    try:
+        with open(header) as f:
+            return "Activation::swiglu_oai_and_mul" in f.read()
+    except OSError:
+        return False
+
+
 def _swiglu_limit_is_active(swiglu_limit) -> bool:
     """True only when the caller asked for a finite positive clamp bound.
 
@@ -5538,6 +5570,21 @@ def get_2stage_cfgs(
             ]
         )
     ):
+        if q_type == QuantType.per_1x128 and activation == ActivationType.Swiglu:
+            if not _ck_blockscale_swiglu_oai_supported():
+                raise NotImplementedError(
+                    "CK blockscale (per_1x128) has no Swiglu epilogue in this "
+                    "composable_kernel checkout: every stage-1 instance fails a "
+                    "static_assert at JIT build. Use a composable_kernel with "
+                    "swiglu_oai_and_mul in gridwise_moe_gemm_blockscale.hpp "
+                    f"(token={token}, model_dim={model_dim}, inter_dim={inter_dim}, "
+                    f"expert={expert}, topk={topk})."
+                )
+            if swiglu_limit is not None and float(swiglu_limit) not in (0.0, 7.0):
+                raise NotImplementedError(
+                    "CK blockscale Swiglu clamps at 7.0; "
+                    f"swiglu_limit={swiglu_limit} is not supported."
+                )
         if kernelName2 and kernelName2.startswith("flydsl_"):
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
@@ -6695,6 +6742,8 @@ def ck_moe_stage1(
         valid_out = tmp_out[: token_num * topk, :]
         if activation == ActivationType.Silu:
             aiter.silu_and_mul(out, valid_out.view(dtypes.fp32))
+        elif activation == ActivationType.Swiglu:
+            aiter.swiglu_and_mul(out, valid_out.view(dtypes.fp32))
         elif activation == ActivationType.Gelu:
             aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
         else:
