@@ -279,10 +279,22 @@ def _block_excl_scan2(scan, tid, a, b):
 
 
 def _expert_scan(
-    hist, start, local, scan, tid, mask_lds, num_experts, tile_m, ept, has_mask
+    hist,
+    start,
+    local,
+    scan,
+    tid,
+    mask_lds,
+    num_experts,
+    tile_m,
+    ept,
+    has_mask,
+    pad=None,
 ):
     """hist (raw counts) -> start[e] (padded exclusive prefix) and local[e]
-    (local expert id); returns the padded total."""
+    (local expert id); returns the padded total. ``pad`` = (sids_it, sw_it,
+    sentinel, on) also writes each expert's padding rows (_pad_tail) from the
+    values in registers."""
     cE, cT, c0, c1 = fx.Int32(num_experts), fx.Int32(tile_m), fx.Int32(0), fx.Int32(1)
     base = tid * fx.Int32(ept)
     vals = []
@@ -294,14 +306,16 @@ def _expert_scan(
             on = live & (_lds(mask_lds, live.select(e, c0)) != c0)
         else:
             on = live
-        vals.append((e, (cnt + cT - c1) // cT * cT, on.select(c1, c0)))
+        vals.append((e, (cnt + cT - c1) // cT * cT, on.select(c1, c0), cnt))
     acc, lacc = c0, c0
-    for _, p, l1 in vals:
+    for _, p, l1, _ in vals:
         acc, lacc = acc + p, lacc + l1
     acc, lacc, total = _block_excl_scan2(scan, tid, acc, lacc)
-    for e, p, l1 in vals:
+    for e, p, l1, cnt in vals:
         _lds_st(start, acc, e)
         _lds_st(local, lacc, e)
+        if pad is not None:
+            _pad_tail(*pad, acc + cnt, acc + p, tile_m)
         acc, lacc = acc + p, lacc + l1
     gpu.barrier()
     return total
@@ -361,37 +375,27 @@ def _write_tile_list(
 
 
 @flyc.jit
-def _write_padding(
-    hist, start, sids_it, sw_it, tid, tokens, num_experts, topk, tile_m, ept
-):
-    """Each expert's padding rows (its tail past the real rows, under tile_m):
-    sentinel id and weight 0. A thread takes its experts; quads wholly in
-    padding take one 16-byte store per array, the boundary quad scalar stores.
-    At most tile_m / 4 quads per expert, whatever the routing skew."""
-    c0, c1, c4 = fx.Int32(0), fx.Int32(1), fx.Int32(4)
-    cT = fx.Int32(tile_m)
-    sentinel = (fx.Int32(topk) << fx.Int32(24)) | tokens
-    vsent = fx.full(4, 0, fx.Int32) + sentinel
-    vzero = fx.full(4, 0.0, fx.Float32)
-    for k in range_constexpr(ept):
-        e = tid * fx.Int32(ept) + fx.Int32(k)
-        live = e < fx.Int32(num_experts)
-        es = live.select(e, c0)
-        cnt = live.select(_lds(hist, es), c0)
-        pad_beg = _lds(start, es) + cnt
-        pad_end = pad_beg + (cnt + cT - c1) // cT * cT - cnt
-        q0 = pad_beg // c4
-        for q in range_constexpr(tile_m // 4 + 1):
-            p = (q0 + fx.Int32(q)) * c4
-            if (p >= pad_beg) & (p + c4 <= pad_end):
-                fx.ptr_store(vsent, sids_it + fx.Int64(p))
-                fx.ptr_store(vzero, sw_it + fx.Int64(p))
-            if (p < pad_end) & ((p < pad_beg) | (p + c4 > pad_end)):
-                for r in range_constexpr(4):
-                    row = p + fx.Int32(r)
-                    ok = (row >= pad_beg) & (row < pad_end)
-                    _st(sids_it, sentinel, ok.select(row, fx.Int32(OOB)))
-                    _st(sw_it, fx.Float32(0.0), ok.select(row, fx.Int32(OOB)))
+def _pad_tail(sids_it, sw_it, sentinel, on, beg, end, tile_m):
+    """Padding rows [beg, end) of one expert (end - beg < tile_m): sentinel id
+    and weight 0. The 1 to 3 rows before the first whole quad take one 1- to
+    3-dword store, each whole quad one 16-byte store, each under a branch so
+    lanes with nothing to write send no data."""
+    c3, c4 = fx.Int32(3), fx.Int32(4)
+    lead = (c4 - (beg & c3)) & c3
+    lead = (lead < end - beg).select(lead, end - beg)
+    if on & (lead == fx.Int32(1)):
+        _st(sids_it, sentinel, beg)
+        _st(sw_it, fx.Float32(0.0), beg)
+    for n in range_constexpr(2, 4):
+        if on & (lead == fx.Int32(n)):
+            fx.ptr_store(fx.full(n, 0, fx.Int32) + sentinel, sids_it + fx.Int64(beg))
+            fx.ptr_store(fx.full(n, 0.0, fx.Float32), sw_it + fx.Int64(beg))
+    q0 = beg + lead
+    for q in range_constexpr((tile_m - 1) // 4):
+        p = q0 + fx.Int32(4 * q)
+        if on & (p < end):
+            fx.ptr_store(fx.full(4, 0, fx.Int32) + sentinel, sids_it + fx.Int64(p))
+            fx.ptr_store(fx.full(4, 0.0, fx.Float32), sw_it + fx.Int64(p))
 
 
 @flyc.jit
@@ -580,8 +584,19 @@ def _oneshot_body(
                 hist + fx.Int64(routes[k][0]), fx.Int32(1), syncscope="workgroup"
             )
     gpu.barrier()
+    sentinel = (fx.Int32(topk) << fx.Int32(24)) | tokens
     total = _expert_scan(
-        hist, start, local, scan, tid, mask_lds, num_experts, tile_m, ept, has_mask
+        hist,
+        start,
+        local,
+        scan,
+        tid,
+        mask_lds,
+        num_experts,
+        tile_m,
+        ept,
+        has_mask,
+        (sids_it, sw_it, sentinel, fx.Boolean(True)),
     )
     _write_meta(nv_it, nlive_it, tid, tokens, total, tile_m)
     _write_tile_list(
@@ -596,9 +611,6 @@ def _oneshot_body(
         num_experts,
         tile_m,
         key_bits,
-    )
-    _write_padding(
-        hist, start, sids_it, sw_it, tid, tokens, num_experts, topk, tile_m, ept
     )
     for k in range_constexpr(0, e_cap, BLOCK):
         e = fx.Int32(k) + tid
@@ -944,8 +956,19 @@ def build(
             _clear(tbl, 2 * WAVES * e_cap, tid)
             gpu.barrier()
             _sum_counts(hist, run, _it(counts), tid, bid, n_chunks, E, e_cap)
+            sentinel = (fx.Int32(topk) << fx.Int32(24)) | tokens
             total = _expert_scan(
-                hist, start, local, scan, tid, mask_lds, E, tile_m, ept, has_mask
+                hist,
+                start,
+                local,
+                scan,
+                tid,
+                mask_lds,
+                E,
+                tile_m,
+                ept,
+                has_mask,
+                (_it(sorted_ids), _it(sorted_w), sentinel, bid == c0),
             )
             if bid == c0:
                 _write_meta(_it(num_valid), _it(num_live), tid, tokens, total, tile_m)
@@ -962,19 +985,6 @@ def build(
                 tile_m,
                 key_bits,
             )
-            if bid == c0:
-                _write_padding(
-                    hist,
-                    start,
-                    _it(sorted_ids),
-                    _it(sorted_w),
-                    tid,
-                    tokens,
-                    E,
-                    topk,
-                    tile_m,
-                    ept,
-                )
             for k in range_constexpr(0, e_cap, BLOCK):
                 e = fx.Int32(k) + tid
                 _lds_st(run, _lds(run, e) + _lds(start, e), e)
