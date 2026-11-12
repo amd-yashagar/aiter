@@ -205,7 +205,14 @@ def _seed(*parts):
 
 def _expert_chunk(S):
     per = (2 if S.g1u1 else 1) * S.I * S.D + S.D * S.I
-    return max(1, min(S.E_local, CHUNK_ELEMS // max(per, 1)))
+    ec = max(1, min(S.E_local, CHUNK_ELEMS // max(per, 1)))
+    if S.E_local > ec:
+        # e8m0_shuffle permutes within 32-row tiles: chunks made of whole tiles compose
+        # into the one shuffle over all experts (chunks of 100 rows do not).
+        n1 = (2 if S.g1u1 else 1) * S.I
+        g = math.lcm(32 // math.gcd(32, n1), 32 // math.gcd(32, S.D))
+        ec = max(g, ec - ec % g)
+    return min(ec, S.E_local)
 
 
 def _quant_block_128(aiter, weight, quant_dtype):
@@ -275,6 +282,9 @@ def quantize_chunk(S, w1, w2):
     ref = {"w1": w1q, "w2": w2q, "w1_scale": w1s, "w2_scale": w2s}
 
     w1a, w2a, w1sa, w2sa = w1q, w2q, w1s, w2s
+    shuffled = (
+        set()
+    )  # scales through e8m0_shuffle: its 256-row padding spans all experts
     if qT == aiter.QuantType.per_1x32 and WQ == dtypes.i4x2:
         w1a = pack_int8_to_packed_int4(shuffle_weight(w1a.view(dtypes.i8), (16, 16)))
         w1a = w1a.view(e, w1.shape[1], w1.shape[2] // 2).view(dtypes.i4x2)
@@ -291,6 +301,7 @@ def quantize_chunk(S, w1, w2):
         )
         w1sa = fp4_utils.e8m0_shuffle(w1s)
         w2sa = fp4_utils.e8m0_shuffle(w2s)
+        shuffled |= {"w1_scale", "w2_scale"}
     elif (
         qT == aiter.QuantType.per_1x32
         and AQ in (dtypes.bf16, dtypes.fp16, dtypes.fp8)
@@ -306,11 +317,13 @@ def quantize_chunk(S, w1, w2):
         w1sa = shuffle_scale_a16w4(w1s, e, True)
         w2a = shuffle_weight_a16w4(w2a, 16, False)
         w2sa = fp4_utils.e8m0_shuffle(w2s)
+        shuffled.add("w2_scale")
     else:
         w1a = shuffle_weight(w1a, layout=(16, 16))
         w2a = shuffle_weight(w2a, layout=(16, 16))
         w1sa = fp4_utils.e8m0_shuffle(w1s)
         w2sa = fp4_utils.e8m0_shuffle(w2s)
+        shuffled |= {"w1_scale", "w2_scale"}
     attrs = {
         "w1": {"gate_up_interleave": getattr(w1a, "gate_up_interleave", None)},
         "w2": {"gate_up_interleave": getattr(w2a, "gate_up_interleave", None)},
@@ -321,6 +334,7 @@ def quantize_chunk(S, w1, w2):
         "w1_scale": w1sa,
         "w2_scale": w2sa,
         "_attrs": attrs,
+        "_shuffled": shuffled,
     }
 
 
@@ -333,15 +347,40 @@ def _scale_view(t, e):
     return t.reshape(e, t.shape[0] // e, *t.shape[1:])
 
 
-def _alloc_like_chunks(chunks, E):
-    """Allocate full tensors from the first chunk's per-expert shapes."""
+SCALE_ROW_PAD = 256  # e8m0_shuffle pads the scale rows of a call to this multiple
+
+
+def _pad_rows(n):
+    return -(-n // SCALE_ROW_PAD) * SCALE_ROW_PAD
+
+
+def _valid_rows(ref_chunk, key):
+    """Rows per expert of an unshuffled scale (the reference chunk's, exactly e x rows)."""
+    t, e = ref_chunk[key], ref_chunk["_e"]
+    return t.shape[1] if t.shape[0] == e else t.shape[0] // e
+
+
+def _alloc_like_chunks(chunks, E, rows=None):
+    """Allocate full tensors from the first chunk's per-expert shapes.
+
+    A scale that went through ``e8m0_shuffle`` (``chunks["_shuffled"]``) is padded to 256
+    rows across all experts together, not per expert: the full tensor is one such
+    shuffle over E x rows, so it has ``pad256(E * rows)`` rows (zero padding at the end)
+    and a chunk contributes its first ``e * rows`` rows (``rows``: per expert, from the
+    reference's unshuffled scale).
+    """
     out = {}
     e0 = chunks["_e"]
+    shuffled = chunks.get("_shuffled") or set()
     for k, t in chunks.items():
-        if k in ("_e", "_attrs"):
+        if k in ("_e", "_attrs", "_shuffled"):
             continue
         if t is None:
             out[k] = None
+            continue
+        if k in shuffled:
+            shape = (_pad_rows(E * rows[k]), *t.shape[1:])
+            out[k] = torch.zeros(shape, dtype=t.dtype, device=t.device)
             continue
         if t.shape[0] == e0:
             shape = (E, *t.shape[1:])
@@ -352,9 +391,13 @@ def _alloc_like_chunks(chunks, E):
     return out
 
 
-def _store(full, chunk, e0, e):
+def _store(full, chunk, e0, e, rows=None):
+    shuffled = chunk.get("_shuffled") or set()
     for k, t in chunk.items():
-        if t is None or k in ("_e", "_attrs"):
+        if t is None or k in ("_e", "_attrs", "_shuffled"):
+            continue
+        if k in shuffled:
+            full[k][e0 * rows[k] : (e0 + e) * rows[k]].copy_(t[: e * rows[k]])
             continue
         per = t.shape[0] // chunk["_e"]
         full[k][e0 * per : (e0 + e) * per].copy_(t)
@@ -371,16 +414,18 @@ def build_group(S, same_chunk=False):
     E = S.E_local
     n1 = (2 if S.g1u1 else 1) * S.I
     ec = _expert_chunk(S)
-    ref_full = aiter_full = attrs = None
+    ref_full = aiter_full = attrs = rows = None
+    shuffled_keys = ()
     base = _seed("weights", S.D, S.I, E, S.g1u1, S.qtype, S.wq, S.aq)
     for ci, e0 in enumerate(range(0, E, ec)):
         e = min(ec, E - e0)
         if same_chunk and ci > 0:
-            for full in (ref_full, aiter_full):
-                for t in full.values():
-                    if t is not None:
-                        per = t.shape[0] // E
-                        t[e0 * per : (e0 + e) * per].copy_(t[: e * per])
+            for full, padded in ((ref_full, ()), (aiter_full, shuffled_keys)):
+                for k, t in full.items():
+                    if t is None:
+                        continue
+                    per = rows[k] if k in padded else t.shape[0] // E
+                    t[e0 * per : (e0 + e) * per].copy_(t[: e * per])
             continue
         g = torch.Generator(device=dev).manual_seed(base + ci)
         w1 = torch.randn((e, n1, S.D), dtype=S.dtype, device=dev, generator=g)
@@ -398,10 +443,12 @@ def build_group(S, same_chunk=False):
         if attrs is None:
             attrs = aiter_c["_attrs"]
         if ref_full is None:
+            shuffled_keys = aiter_c["_shuffled"]
+            rows = {k: _valid_rows(ref_c, k) for k in shuffled_keys}
             ref_full = _alloc_like_chunks(ref_c, E)
-            aiter_full = _alloc_like_chunks(aiter_c, E)
+            aiter_full = _alloc_like_chunks(aiter_c, E, rows)
         _store(ref_full, ref_c, e0, e)
-        _store(aiter_full, aiter_c, e0, e)
+        _store(aiter_full, aiter_c, e0, e, rows)
         del ref_c, aiter_c
     for k in ("w1", "w2"):
         aiter_full[k].is_shuffled = True
