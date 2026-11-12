@@ -33,7 +33,8 @@ class TileMap:
     requested) is route (t, k)'s sorted row, -1 for a dropped route (masked,
     -1 id, or a repeated expert's earlier slot); tokens at or past the token
     count are not written. ``ready_flags`` is reserved for a single persistent
-    launch over both stages (not allocated today).
+    launch over both stages (not allocated today). ``a_q`` / ``a_scale`` are
+    the quantized activations when ``quant_mode`` was given (QUANT_MODES).
     """
 
     tile_m: int
@@ -44,6 +45,8 @@ class TileMap:
     live_tiles: torch.Tensor
     num_live_tiles: torch.Tensor
     loc_ids: torch.Tensor | None = None
+    a_q: torch.Tensor | None = None
+    a_scale: torch.Tensor | None = None
     ready_flags: torch.Tensor | None = None
 
     @property
@@ -53,6 +56,13 @@ class TileMap:
     @property
     def max_tiles(self) -> int:
         return self.rows // self.tile_m
+
+
+# Activation quant fused into the sort launch: mode -> scale columns for K.
+QUANT_MODES = {
+    "per_token_fp8": lambda k: 1,
+    "per_1x128_fp8": lambda k: k // 128,
+}
 
 
 def max_sorted_rows(m: int, topk: int, num_experts: int, tile_m: int) -> int:
@@ -101,6 +111,8 @@ def route_to_tiles(
     num_local_tokens: torch.Tensor | None = None,
     zero_output: torch.Tensor | None = None,
     with_loc_ids: bool = False,
+    quant_input: torch.Tensor | None = None,
+    quant_mode: str | None = None,
 ) -> TileMap:
     """Sort routes into tiles of ``tile_m`` rows and zero ``zero_output``'s rows
     below the token count (``num_local_tokens`` when given), as aiter's sort does.
@@ -135,6 +147,30 @@ def route_to_tiles(
     )
     if with_loc_ids:
         tm.loc_ids = torch.empty((m, topk), dtype=torch.int32, device=dev)
+    quant, qw = None, 0
+    qx = qq = qs = _empty_i32(dev)
+    if quant_mode is not None:
+        from aiter import dtypes
+        from aiter.ops.flydsl.kernels.moe_next.core.quant import blocks
+
+        if quant_mode not in QUANT_MODES:
+            raise ValueError(f"quant_mode must be one of {sorted(QUANT_MODES)}")
+        k = quant_input.shape[-1]
+        if (
+            quant_input.dtype != torch.bfloat16
+            or not quant_input.is_contiguous()
+            or quant_input.shape != (m, k)
+            or k % 128
+        ):
+            raise ValueError("quant_input must be contiguous bf16 [M, K], K % 128 == 0")
+        fp8 = dtypes.fp8
+        tm.a_q = torch.empty((m, k), dtype=fp8, device=dev)
+        tm.a_scale = torch.empty(
+            (m, QUANT_MODES[quant_mode](k)), dtype=torch.float32, device=dev
+        )
+        quant = (quant_mode, k, float(torch.finfo(fp8).max))
+        qw = blocks(quant_mode, m, k)
+        qx, qq, qs = quant_input.view(torch.int32), tm.a_q.view(torch.int32), tm.a_scale
     loc = tm.loc_ids if with_loc_ids else _empty_i32(dev)
     mask = expert_mask if expert_mask is not None else _empty_i32(dev)
     ltok = num_local_tokens if num_local_tokens is not None else _empty_i32(dev)
@@ -163,6 +199,7 @@ def route_to_tiles(
         num_local_tokens is not None,
         rounds=min(8, max(1, -(-n_routes // 256))),
         with_loc=with_loc_ids,
+        quant=quant,
     )
     stream = torch.cuda.current_stream(dev)
     if n_routes <= ONESHOT_MAX_ROUTES:
@@ -180,9 +217,13 @@ def route_to_tiles(
             mask,
             ltok,
             zbuf,
+            qx,
+            qq,
+            qs,
             m,
             row_v4,
-            1 + z_wg,
+            qw,
+            1 + qw + z_wg,
             stream,
             device=dev,
         )
@@ -200,11 +241,15 @@ def route_to_tiles(
         ltok,
         counts,
         zbuf,
+        qx,
+        qq,
+        qs,
         m,
         chunk,
         n_chunks,
         row_v4 if early else 0,
-        max(n_chunks, z_wg) if early else n_chunks,
+        qw,
+        max(n_chunks + qw, z_wg) if early else n_chunks + qw,
         stream,
         device=dev,
     )

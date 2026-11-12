@@ -144,6 +144,107 @@ def test_graph_capture(token=256, E=256, topk=8, tile_m=32):
     return [{"check": f"graph capture and replay M={token} E={E}"}]
 
 
+QUANT_TYPES = {
+    "per_token_fp8": QuantType.per_Token,
+    "per_1x128_fp8": QuantType.per_1x128,
+}
+
+
+def _quant_input(token, K, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn((token, K), dtype=dtypes.bf16, generator=g) * 3
+    x[0, 5] = 400.0
+    if token > 2:
+        x[1].zero_()
+    return x
+
+
+def _check_quant(tm, x, mode, local):
+    kw = {"quant_dtype": dtypes.fp8}
+    rows = x.shape[0]
+    if local is not None:
+        kw["num_rows"] = torch.tensor([local], dtype=torch.int32)
+        rows = local
+    rq, rs = aiter.get_hip_quant(QUANT_TYPES[mode])(x, **kw)
+    bad = []
+    if not torch.equal(tm.a_q[:rows].view(torch.uint8), rq[:rows].view(torch.uint8)):
+        bad.append("a_q")
+    rs = rs.view(x.shape[0], -1)
+    if not torch.equal(
+        tm.a_scale[:rows].view(torch.int32), rs[:rows].view(torch.int32)
+    ):
+        bad.append("a_scale")
+    return bad
+
+
+def test_fused_quant():
+    """Activation quant fused into the sort launch, bit-exact with aiter's
+    quant op for each mode, on the one-shot and two-launch paths, and with the
+    tile map still exact."""
+    rows = []
+    for mode in QUANT_TYPES:
+        for token, E, topk, K, local in [
+            (8, 256, 8, 7168, None),
+            (200, 128, 8, 4096, 150),
+            (3000, 256, 8, 7168, None),
+            (2050, 385, 7, 2048, 2000),
+        ]:
+            ti, tw, _ = routing(token, E, topk)
+            x = _quant_input(token, K, token)
+            nl = torch.tensor([local], dtype=torch.int32) if local is not None else None
+            out_a = torch.full((token, 1024), 3.0, dtype=dtypes.bf16)
+            out_b = out_a.clone()
+            kw = {"num_experts": E, "tile_m": 32, "num_local_tokens": nl}
+            a = route_to_tiles(
+                ti, tw, zero_output=out_a, quant_input=x, quant_mode=mode, **kw
+            )
+            b = reference_tile_map(ti, tw, zero_output=out_b, **kw)
+            bad = compare(a, b, 32, out_a, out_b) + _check_quant(a, x, mode, local)
+            assert not bad, f"{mode} M={token} K={K}: {bad}"
+            rows.append(
+                {
+                    "mode": mode,
+                    "token": token,
+                    "E": E,
+                    "K": K,
+                    "local": local,
+                    "exact": True,
+                }
+            )
+    # graph capture: replay with new activations written into the same input
+    x = _quant_input(256, 7168, 1)
+    ti, tw, _ = routing(256, 256, 8)
+    route_to_tiles(
+        ti, tw, num_experts=256, tile_m=32, quant_input=x, quant_mode="per_1x128_fp8"
+    )
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        tm = route_to_tiles(
+            ti,
+            tw,
+            num_experts=256,
+            tile_m=32,
+            quant_input=x,
+            quant_mode="per_1x128_fp8",
+        )
+    x.copy_(_quant_input(256, 7168, 9))
+    g.replay()
+    torch.cuda.synchronize()
+    bad = _check_quant(tm, x, "per_1x128_fp8", None)
+    assert not bad, f"graph replay: {bad}"
+    rows.append(
+        {
+            "mode": "per_1x128_fp8 graph replay",
+            "token": 256,
+            "E": 256,
+            "K": 7168,
+            "local": None,
+            "exact": True,
+        }
+    )
+    return rows
+
+
 def test_host_time(calls=300):
     """Eager host time per route_to_tiles call stays in microseconds: launches go
     through cached compiled handles, not a re-trace per call."""
@@ -309,6 +410,9 @@ def main():
         rows.append(row)
     aiter.logger.info(
         "tile map edge cases:\n%s", pd.DataFrame(rows).to_markdown(index=False)
+    )
+    aiter.logger.info(
+        "fused quant:\n%s", pd.DataFrame(test_fused_quant()).to_markdown(index=False)
     )
     aiter.logger.info(
         "eager host time:\n%s", pd.DataFrame(test_host_time()).to_markdown(index=False)

@@ -34,6 +34,8 @@ import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
+from .quant import quant_1x128_block, quant_token_block
+
 BLOCK = 256
 WAVE = 64
 WAVES = BLOCK // WAVE
@@ -652,11 +654,21 @@ def _store_counts(hist, c_it, tid, bid, num_experts, e_cap):
 
 @functools.lru_cache(maxsize=128)
 def build(
-    num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS, with_loc=False
+    num_experts,
+    topk,
+    tile_m,
+    has_mask,
+    has_local,
+    rounds=STAGE_ROUNDS,
+    with_loc=False,
+    quant=None,
 ):
     """Compile-time specialisation; returns (oneshot, count, scatter) launchers.
     ``rounds`` bounds the one-shot's 256-route rounds (from M * topk);
-    ``with_loc`` also writes loc_ids (each route's sorted row)."""
+    ``with_loc`` also writes loc_ids (each route's sorted row). ``quant`` =
+    (mode, cols, fp8_max) adds workgroups that quantize the token rows (see
+    quant.py): in the one-shot launch after workgroup 0, in the count launch
+    after the chunk workgroups."""
     E = num_experts
     key_bits = max(1, (E - 1).bit_length())
     ept = -(-E // BLOCK)  # experts per thread in the expert scan
@@ -671,6 +683,19 @@ def build(
         tbl: fx.Array[fx.Int32, 2 * WAVES * e_cap + 1, 16]
         mask: fx.Array[fx.Int32, e_cap, 16]
         scan: fx.Array[fx.Int32, 2 * WAVES + 1, 16]
+        red: fx.Array[fx.Float32, 8, 16]
+
+    def run_quant(lds, qx, qq, qs, blk, tokens, m_cap):
+        mode, cols, fp8_max = quant
+        rows = (tokens < m_cap).select(tokens, m_cap)
+        if mode == "per_1x128_fp8":
+            quant_1x128_block(
+                _it(qx), _it(qq), _it(qs), blk, rows * fx.Int32(cols // 128), fp8_max
+            )
+        else:
+            quant_token_block(
+                _it(qx), _it(qq), _it(qs), lds.red.ptr, blk, rows, cols, fp8_max
+            )
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def oneshot_kernel(
@@ -686,9 +711,14 @@ def build(
         mask: fx.Tensor,
         ltok: fx.Tensor,
         zbuf: fx.Tensor,
+        qx: fx.Tensor,
+        qq: fx.Tensor,
+        qs: fx.Tensor,
         m_cap: fx.Int32,
         row_v4: fx.Int32,
+        qw: fx.Int32,
     ):
+        """Workgroup 0 sorts; 1..qw quantize; the rest zero-fill."""
         bid = gpu.block_idx.x
         tid = gpu.thread_idx.x
         c0, c1 = fx.Int32(0), fx.Int32(1)
@@ -704,12 +734,16 @@ def build(
         if has_local:
             tokens = _ld(_it(ltok), c0)
         if bid != c0:
-            _zero_fill(
-                _it(zbuf),
-                (bid - c1) * fx.Int32(BLOCK) + tid,
-                (gpu.grid_dim.x - c1) * fx.Int32(BLOCK),
-                _zero_rows(tokens, m_cap) * row_v4,
-            )
+            if quant is not None:  # noqa: SIM102 - trace-time test, then a device one
+                if bid <= qw:
+                    run_quant(lds, qx, qq, qs, bid - c1, tokens, m_cap)
+            if bid > qw:
+                _zero_fill(
+                    _it(zbuf),
+                    (bid - c1 - qw) * fx.Int32(BLOCK) + tid,
+                    (gpu.grid_dim.x - c1 - qw) * fx.Int32(BLOCK),
+                    _zero_rows(tokens, m_cap) * row_v4,
+                )
         if bid == c0:
             _oneshot_body(
                 hist,
@@ -749,11 +783,17 @@ def build(
         ltok: fx.Tensor,
         counts: fx.Tensor,
         zbuf: fx.Tensor,
+        qx: fx.Tensor,
+        qq: fx.Tensor,
+        qs: fx.Tensor,
         m_cap: fx.Int32,
         chunk: fx.Int32,
         n_chunks: fx.Int32,
         row_v4: fx.Int32,
+        qw: fx.Int32,
     ):
+        """Workgroups below n_chunks count a chunk each, the next qw quantize;
+        with row_v4 > 0 every workgroup also takes a share of the zero-fill."""
         bid = gpu.block_idx.x
         tid = gpu.thread_idx.x
         c0 = fx.Int32(0)
@@ -786,6 +826,9 @@ def build(
                 key_bits,
             )
             _store_counts(hist, _it(counts), tid, bid, E, e_cap)
+        if quant is not None:  # noqa: SIM102 - trace-time test, then a device one
+            if (bid >= n_chunks) & (bid < n_chunks + qw):
+                run_quant(lds, qx, qq, qs, bid - n_chunks, tokens, m_cap)
         if row_v4 > fx.Int32(0):
             _zero_fill(
                 _it(zbuf),
@@ -925,8 +968,12 @@ def build(
         mask: fx.Tensor,
         ltok: fx.Tensor,
         zbuf: fx.Tensor,
+        qx: fx.Tensor,
+        qq: fx.Tensor,
+        qs: fx.Tensor,
         m_cap: fx.Int32,
         row_v4: fx.Int32,
+        qw: fx.Int32,
         grid: fx.Int32,
         stream: fx.Stream = None,
     ):
@@ -943,8 +990,12 @@ def build(
             mask,
             ltok,
             zbuf,
+            qx,
+            qq,
+            qs,
             m_cap,
             row_v4,
+            qw,
         ).launch(grid=(grid, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     @flyc.jit
@@ -954,15 +1005,31 @@ def build(
         ltok: fx.Tensor,
         counts: fx.Tensor,
         zbuf: fx.Tensor,
+        qx: fx.Tensor,
+        qq: fx.Tensor,
+        qs: fx.Tensor,
         m_cap: fx.Int32,
         chunk: fx.Int32,
         n_chunks: fx.Int32,
         row_v4: fx.Int32,
+        qw: fx.Int32,
         grid: fx.Int32,
         stream: fx.Stream = None,
     ):
         count_kernel(
-            ids, mask, ltok, counts, zbuf, m_cap, chunk, n_chunks, row_v4
+            ids,
+            mask,
+            ltok,
+            counts,
+            zbuf,
+            qx,
+            qq,
+            qs,
+            m_cap,
+            chunk,
+            n_chunks,
+            row_v4,
+            qw,
         ).launch(grid=(grid, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     @flyc.jit
