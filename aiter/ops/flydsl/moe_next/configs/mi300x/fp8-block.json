@@ -1,0 +1,5 @@
+{
+  "default": {"block_m": 128, "block_n": 128},
+  "prefill-bm64": {"block_m": 64, "block_n": 128},
+  "prefill-bm128": {"block_m": 128, "block_n": 128}
+}
