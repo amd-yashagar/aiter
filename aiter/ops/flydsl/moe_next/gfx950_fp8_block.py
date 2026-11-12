@@ -46,6 +46,12 @@ class _Fp8BlockGfx950(MoeKernel):
     archs = ("gfx950",)
     routing = "tiles"
     epilogue = "atomic"
+    # The *_af32 / *_rows configs combine in fp32, rounding less than bf16 atomics.
+    numerics = {
+        "act_quant": "per_1x128_fp8",
+        "inter": "bf16_then_per_1x128_fp8",
+        "combine": "bf16_atomic",
+    }
     handles_kwargs = frozenset()
 
     def supports(self, spec, m, topk, call=None):
@@ -137,8 +143,9 @@ class _Fp8BlockGfx950(MoeKernel):
     def __call__(self, call: MoeCall) -> torch.Tensor:
         import flydsl.expr as fx
 
-        from aiter.fused_moe import moe_sorting
         from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+        from aiter.ops.flydsl.moe_next.core.intermediate import Layout
+        from aiter.ops.flydsl.moe_next.core.tile_map import route_to_tiles
         from aiter.ops.quant import per_group_quant_hip
 
         spec, weights = call.spec, call.weights
@@ -154,27 +161,29 @@ class _Fp8BlockGfx950(MoeKernel):
         xq, xs = per_group_quant_hip(x, quant_dtype=dtypes.fp8, group_size=128)
         # atomic_bf16: the sort zeroes the output (or output=); atomic_f32: it zeroes
         # an f32 buffer; rows_f32 writes every route row, so nothing is zeroed.
-        # As fused_moe sorts: global expert count, EP mask (local expert ids out, masked and
-        # -1 routes dropped, their rows zeroed), num_local_tokens.
-        sorted_ids, sorted_w, sorted_e, nvalid, buf = moe_sorting(
-            call.topk_ids,
-            call.topk_weight,
-            call.global_experts,
-            D,
-            torch.float32 if combine == "atomic_f32" else torch.bfloat16,
-            block_size=tm,
-            expert_mask=call.expert_mask,
-            num_local_tokens=call.num_local_tokens,
-            output=call.output if combine == "atomic_bf16" else None,
-            accumulate=combine != "rows_f32",
-        )
-        if combine == "rows_f32":
+        if combine == "atomic_bf16":
+            buf = call.output
+            if buf is None:
+                buf = torch.empty((M, D), dtype=torch.bfloat16, device=x.device)
+        elif combine == "atomic_f32":
+            buf = torch.empty((M, D), dtype=torch.float32, device=x.device)
+        else:
             # zeroed: masked, -1 and past-num_local_tokens routes write no row
             buf = torch.zeros((M * call.topk, D), dtype=torch.float32, device=x.device)
-        rows = sorted_ids.numel()
-        tiles = sorted_e.numel()
-        inter = torch.empty((rows, I), dtype=dtypes.fp8, device=x.device)
-        inter_s = torch.empty((rows, I // 128), dtype=torch.float32, device=x.device)
+        tmap = route_to_tiles(
+            call.topk_ids.to(torch.int32),
+            call.topk_weight.to(torch.float32),
+            num_experts=call.global_experts,
+            tile_m=tm,
+            expert_mask=call.expert_mask,
+            num_local_tokens=call.num_local_tokens,
+            zero_output=None if combine == "rows_f32" else buf,
+        )
+        sorted_ids, sorted_w = tmap.sorted_token_ids, tmap.sorted_weights
+        sorted_e, nvalid = tmap.sorted_expert_ids, tmap.num_valid_ids
+        rows, tiles = tmap.rows, tmap.max_tiles
+        inter = Layout.for_spec(spec, M, call.topk, tm).alloc(x.device)
+        inter, inter_s = inter.values, inter.scales
         stream = fx.Stream(torch.cuda.current_stream(x.device))
         _run_compiled(
             s1,
