@@ -32,15 +32,19 @@ def cmd_cases(a):
     from . import schema
 
     paths = schema.tier_paths(a.tiers_dir)
-    problems, total = [], {}
+    problems, warnings, total = [], [], {}
     for name, p in paths.items():
         cases = schema.load_tier(p)
         total[name] = len(cases)
-        problems += schema.validate(cases, name)
+        errs, warns = schema.validate(cases, name)
+        problems += errs
+        warnings += warns
     for name, n in total.items():
         print(f"{name}: {n} rows")
     for pr in problems[:100]:
         print("PROBLEM", pr)
+    for pr in warnings[:100]:
+        print("WARN", pr)
     if a.aiter:
         from .catalogue import regen
 

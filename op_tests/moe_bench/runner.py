@@ -533,6 +533,13 @@ def cmd_run(args):
     meta = probe_meta(tree, node, args.launcher, tmpdir)
     with open(os.path.splitext(args.out)[0] + ".meta.json", "w") as f:
         json.dump(meta, f, indent=1)
+    for c in cases:
+        if c.kind in schema.RUNNABLE_KINDS and c.token <= 0:
+            for m in [m for m in c.modes if m in modes_req]:
+                if (c.id, m) not in res.done:
+                    ev = {"mode": m, "status": "invalid", "detail": f"token={c.token}"}
+                    res.add(make_row(c, ev, meta))
+    cases = [c for c in cases if c.token > 0 or c.kind not in schema.RUNNABLE_KINDS]
     groups, _ = make_groups(cases, modes_req, res.done)
     groups = shard_groups(groups, parse_shard(args.shard))
     opts = {"case_timeout": args.case_timeout, "setup_timeout": args.setup_timeout}

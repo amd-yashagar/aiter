@@ -133,8 +133,10 @@ def write_tier(path, rows):
 
 
 def validate(cases, name="tier", strict_provenance=True):
-    """Return a list of problems (empty when the file is valid)."""
+    """Return (errors, warnings). Errors break the schema; warnings are rows whose
+    data aiter's own tables gave us that ``run`` reports as ``invalid``."""
     problems = []
+    warnings = []
     seen = set()
     for c in cases:
         r, cid = c.row, c.row["case_id"]
@@ -142,14 +144,18 @@ def validate(cases, name="tier", strict_provenance=True):
             problems.append(f"{name}: duplicate case_id {cid}")
         seen.add(cid)
         for k in REQUIRED:
-            if r[k] == "":
+            if r[k] == "" and (
+                k in ("case_id", "kind", "modes") or r["kind"] in RUNNABLE_KINDS
+            ):
                 problems.append(f"{name}:{cid}: empty required column {k}")
         if r["kind"] not in KINDS:
             problems.append(f"{name}:{cid}: unknown kind {r['kind']!r}")
         if r["kind"] == "fused":
             for k in FUSED_REQUIRED:
-                if r[k] == "":
+                if r[k] == "" and k != "act_type":
                     problems.append(f"{name}:{cid}: fused row has empty {k}")
+            if r["act_type"] == "":
+                warnings.append(f"{name}:{cid}: empty act_type (Silu is used)")
         if r["q_type"] not in QTYPES and r["q_type"] != "":
             problems.append(f"{name}:{cid}: unknown q_type {r['q_type']!r}")
         if r["act_type"] not in ACTS:
@@ -164,15 +170,17 @@ def validate(cases, name="tier", strict_provenance=True):
                 except ValueError:
                     problems.append(f"{name}:{cid}: {k}={r[k]!r} is not an integer")
                     continue
-                if v < 0 or (k == "token" and v == 0):
-                    problems.append(f"{name}:{cid}: {k}={v} is not positive")
+                if r["kind"] in RUNNABLE_KINDS and (v < 0 or (k == "token" and v == 0)):
+                    warnings.append(
+                        f"{name}:{cid}: {k}={v} is not positive (run: invalid)"
+                    )
         bad = [m for m in c.modes if m not in MODES]
         if bad:
             problems.append(f"{name}:{cid}: unknown modes {bad}")
         needs_provenance = strict_provenance and r["added_by"] != "build_tiers"
         if needs_provenance and (not r["reason"] or not r["added_by"]):
             problems.append(f"{name}:{cid}: added row needs reason and added_by")
-    return problems
+    return problems, warnings
 
 
 def case_signature(c):
