@@ -39,13 +39,27 @@ SWEEP_ARGS = [
 ]
 
 
+def _called_from_sweep_loop():
+    # Only the module-level case loop is non-strict; the targeted tests that run
+    # before it assert strictly and must see the real output.
+    frame = sys._getframe(2)
+    while frame is not None:
+        if frame.f_code.co_name == "test_fmoe":
+            caller = frame.f_back
+            while caller is not None and caller.f_code.co_name == "wrapper":
+                caller = caller.f_back
+            return caller is not None and caller.f_code.co_name == "<module>"
+        frame = frame.f_back
+    return False
+
+
 def _run_sweep(monkeypatch, extra_args=()):
     real_perftest = test_common.run_perftest
     real_fused_moe = fused_moe_module.fused_moe
 
     def wrong_perftest(func, *args, **kwargs):
         out, us = real_perftest(func, *args, **kwargs)
-        if func is real_fused_moe:
+        if func is real_fused_moe and _called_from_sweep_loop():
             out = torch.zeros_like(out)
         return out, us
 

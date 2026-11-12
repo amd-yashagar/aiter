@@ -151,7 +151,11 @@ def test_fmoe(
     expected_kernel1: str | None = None,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
-        return
+        # A silent return was recorded as a result, so these paths looked checked
+        # on gfx942. The case loop skips them with a message before this point.
+        raise RuntimeError(
+            f"test_fmoe: per_1x32 MoE is gfx950-only, not checkable on {get_gfx()}"
+        )
     if actType == aiter.ActivationType.Situv2:
         beta = DEFAULT_SITUV2_BETA if beta is None else float(beta)
         linear_beta = (
@@ -681,6 +685,11 @@ def test_fmoe(
         elif err != 0 and logits_diff > 0.01:
             logger.warning(
                 f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
+            )
+            accuracy_failed = True
+        elif asm_flat_mxfp4 and logits_diff >= 2e-3:
+            logger.warning(
+                f"accuracy check failed (non-strict, asm FLAT MXFP4): logits_diff={logits_diff}"
             )
             accuracy_failed = True
 
@@ -1308,6 +1317,11 @@ def _format_moe_2stage_case(kwargs):
 
 
 def _moe_2stage_skip_reason(kwargs):
+    if get_gfx() != "gfx950" and kwargs["qType"] == aiter.QuantType.per_1x32:
+        return (
+            "per_1x32 MoE (a4w4, a8w4, a16w4, a16wi4, mxfp8) is gfx950-only and "
+            f"cannot be checked on {get_gfx()}"
+        )
     route_workspace_reason = _moe_2stage_route_workspace_skip_reason(kwargs)
     if route_workspace_reason is not None:
         return route_workspace_reason
