@@ -117,8 +117,10 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
         D, I = spec.model_dim, spec.inter_dim
         if D % 256 or D % 128 or I % 128:
             return "model_dim % 256 and inter_dim % 128"
-        if 32 * I > _LDS_BYTES:
-            return "inter_dim too large for the Down LDS tile"
+        # Down holds the tile's whole intermediate rows in registers (BLOCK_M x I / 256
+        # VGPRs at BLOCK_M >= 32); larger inter_dim needs a K-chunked Down.
+        if I > 512:
+            return "inter_dim > 512 not implemented yet"
         if topk > 255:
             return "topk"
         if call is not None:
