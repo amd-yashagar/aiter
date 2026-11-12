@@ -18,7 +18,8 @@ Epilogue: acc * sorted_weight[row] (unless doweight_stage1), then by `combine`:
                over topk in fp32 and rounded once by combine.py (deterministic)
   rows_f32     f32 per-route rows [M, topk, N] (row = token * topk + slot), summed over
                topk in fp32 and rounded once after (deterministic)
-Padding rows (token >= M) are skipped.
+Padding rows (token >= M) are skipped. `atom_cache` (a Python int of core/atomics.py's SC0 | NT |
+SC1) sets the atomics' cache-policy bits.
 """
 
 import functools
@@ -59,6 +60,7 @@ def _build_stage2(
     combine,
     wide_k,
     rows_nt=False,
+    atom_cache=0,
 ):
     elem_t = fx.Float8E4M3FN
     K = int(inter_dim)
@@ -487,6 +489,7 @@ def _build_stage2(
                     out_bytes=out_bytes,
                     row_stride=N,
                     row_limit=tokens,
+                    cache=atom_cache,
                 )
             else:
                 c_out.copy(buf_atom, blk_n, rd)
@@ -540,6 +543,7 @@ def compile_stage2(
     combine="atomic_bf16",
     wide_k=True,
     rows_nt=False,
+    atom_cache=0,
 ):
     return _build_stage2(
         model_dim=model_dim,
@@ -552,4 +556,5 @@ def compile_stage2(
         combine=combine,
         wide_k=wide_k,
         rows_nt=rows_nt,
+        atom_cache=atom_cache,
     )

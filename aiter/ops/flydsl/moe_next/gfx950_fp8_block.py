@@ -77,6 +77,14 @@ def _unused_i32(device):
     return t
 
 
+def _atom_cache(cfg):
+    """Stage 2's atomic cache-policy bits from the config's "atom_cache" names (sc0, nt, sc1)."""
+    from aiter.ops.flydsl.kernels.moe_next.core import atomics as A
+
+    bits = {"sc0": A.SC0, "nt": A.NT, "sc1": A.SC1}
+    return sum(bits[b] for b in cfg.get("atom_cache", ()))
+
+
 def _tile_config(gpu, config, m, topk, experts):
     table = _configs(gpu)
     if config:
@@ -205,6 +213,7 @@ class _Fp8BlockGfx950(MoeKernel):
             doweight_stage1=spec.doweight_stage1,
             combine=self._combine or cfg.get("combine", "atomic_bf16"),
             rows_nt=bool(cfg.get("rows_nt", False)),
+            atom_cache=_atom_cache(cfg),
         )
         return s1, s2
 

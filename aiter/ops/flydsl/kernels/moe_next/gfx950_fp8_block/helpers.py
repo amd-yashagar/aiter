@@ -6,14 +6,15 @@
 
 Adapted from FlyDSL's kernels/moe/moe_gemm_2stage/layout_helpers.py (upstream
 19418894): the B-first 1x4 tiled MMA, the shuffle_weight(16, 16) weight views,
-the sorted-index gather/scatter and the pk-bf16 buffer atomics.
+and the sorted-index gather/scatter (atomic scatter through core/atomics.py).
 """
 
 import flydsl.expr as fx
 import numpy as np
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr.typing import Vector as Vec
+from flydsl.expr import const_expr, range_constexpr
+
+from ..core.atomics import buffer_atomic_add_f32, buffer_atomic_add_pk
 
 FP8_MAX = 448.0  # OCP e4m3fn on gfx950
 FP8_MAX_RCP = float(np.float32(1.0) / np.float32(FP8_MAX))
@@ -124,23 +125,6 @@ def load_sorted_weight_frag(arg_sorted_weights, row0, BM, tid):
     return tw_frag
 
 
-def buffer_atomic_pk(rsrc, elem_idx, reg_vec, elem_bytes):
-    """Pairwise buffer atomic add of a bf16 vector (one pk pair per instruction)."""
-    z = fx.Int32(0)
-    for i in range_constexpr(reg_vec.numel // 2):
-        pair = Vec.from_elements([reg_vec[i * 2], reg_vec[i * 2 + 1]], reg_vec.dtype)
-        byte_off = (elem_idx + fx.Int32(i * 2)) * fx.Int32(elem_bytes)
-        rocdl.raw_ptr_buffer_atomic_fadd(pair, rsrc, byte_off, z, z)
-
-
-def buffer_atomic_f32(rsrc, elem_idx, reg_vec):
-    """Scalar buffer atomic add of an f32 vector."""
-    z = fx.Int32(0)
-    for i in range_constexpr(reg_vec.numel):
-        byte_off = (elem_idx + fx.Int32(i)) * fx.Int32(4)
-        rocdl.raw_ptr_buffer_atomic_fadd(reg_vec[i], rsrc, byte_off, z, z)
-
-
 class TensorWithIndex:
     """Gather/scatter of per-thread tiles by packed sorted ids (token | slot << 24)."""
 
@@ -190,6 +174,7 @@ class TensorWithIndex:
         out_bytes=None,
         row_stride=None,
         row_limit=None,
+        cache=0,
     ):
         layout = fx.get_layout(self.fake_tensor_thr)
         rep_m = reps(self.fake_tensor_thr, 1)
@@ -223,9 +208,11 @@ class TensorWithIndex:
                             aligned, fx.Int32(row_limit) * fx.Int32(row_stride)
                         )
                         if const_expr(out_bytes == 4):
-                            buffer_atomic_f32(atomic_rsrc, elem_idx, reg_vec)
+                            buffer_atomic_add_f32(atomic_rsrc, elem_idx, reg_vec, cache=cache)
                         else:
-                            buffer_atomic_pk(atomic_rsrc, elem_idx, reg_vec, out_bytes)
+                            buffer_atomic_add_pk(
+                                atomic_rsrc, elem_idx, reg_vec, out_bytes, cache=cache
+                            )
                 continue
             if const_expr(rank == 3):
                 # [tokens, topk, N] rows: (token, slot) from the packed sorted id

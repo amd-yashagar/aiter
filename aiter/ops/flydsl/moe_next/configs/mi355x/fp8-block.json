@@ -104,6 +104,53 @@
       "tile_m": 32,
       "tile_n2": 128,
       "rows_nt": true
+    },
+    "p128w8_ant": {
+      "tile_m": 128,
+      "tile_n2": 128,
+      "stage1": "8wave",
+      "atom_cache": [
+        "nt"
+      ]
+    },
+    "p128w8_asc1": {
+      "tile_m": 128,
+      "tile_n2": 128,
+      "stage1": "8wave",
+      "atom_cache": [
+        "sc1"
+      ]
+    },
+    "p128w8_antsc1": {
+      "tile_m": 128,
+      "tile_n2": 128,
+      "stage1": "8wave",
+      "atom_cache": [
+        "nt",
+        "sc1"
+      ]
+    },
+    "p64_ant": {
+      "tile_m": 64,
+      "tile_n2": 128,
+      "atom_cache": [
+        "nt"
+      ]
+    },
+    "p64_asc1": {
+      "tile_m": 64,
+      "tile_n2": 128,
+      "atom_cache": [
+        "sc1"
+      ]
+    },
+    "p64_antsc1": {
+      "tile_m": 64,
+      "tile_n2": 128,
+      "atom_cache": [
+        "nt",
+        "sc1"
+      ]
     }
   },
   "default": [
