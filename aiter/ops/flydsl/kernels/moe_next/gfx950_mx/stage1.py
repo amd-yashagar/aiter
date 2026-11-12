@@ -64,12 +64,19 @@ def _build_stage1(
     situ_beta,
     situ_linear_beta,
     round_bf16,
+    tile_n=128,
+    ahead=2,
 ):
     K = int(model_dim)
     INTER = int(inter_dim)
     BM = int(tile_m)
-    BNH = 128
+    BNH = int(tile_n)
+    assert BNH in (64, 128)
     WCOLS = BNH // 4
+    NT = WCOLS // 8  # weight tiles per wave: NT // 2 gate tiles, then their up tiles
+    LA = int(ahead)
+    ALA = min(LA, 2)  # token tiles: two register sets (tiles kt+1, kt+2) at most
+    STATIC_HALF = interleave or (WCOLS // 16) % 2 == 0
     assert K % 256 == 0, f"model_dim={K} must be a multiple of 256"
     assert INTER % BNH == 0, f"inter_dim={INTER} must be a multiple of {BNH}"
     assert BM in (16, 32, 64, 128)
@@ -222,32 +229,36 @@ def _build_stage1(
                 f.store(v)
                 return f
 
-            # Weight tiles of this wave: gate t0, gate t1, up t0, up t1.
+            # Weight tiles of this wave: gate tiles then the matching up tiles. Each
+            # tile's e8m0 dword holds [k step parity][16-row tile parity]; the row
+            # parity is shifted down at load so the MFMA opsel stays static.
             ct0 = nblk * fx.Int32(BNH // 16) + wave * fx.Int32(WCOLS // 16)
-            tiles = [
-                phys_tile(ct0, 0),
-                phys_tile(ct0 + fx.Int32(1), 0),
-                phys_tile(ct0, 1),
-                phys_tile(ct0 + fx.Int32(1), 1),
-            ]
             e_tile0 = e * fx.Int32(N_TILES)
+            tiles = [
+                phys_tile(ct0 + fx.Int32(t % (NT // 2)), t // (NT // 2))
+                for t in range(NT)
+            ]
             w_base = [fx.Int64(e_tile0 + t) * fx.Int64(W_TILE_BYTES) for t in tiles]
-            if const_expr(interleave):
-                sc_pairs = [
-                    e * fx.Int32(INTER // 16) + ct0,
-                    e * fx.Int32(INTER // 16) + ct0 + fx.Int32(1),
-                ]
-                tile_pair = [(0, 0), (1, 0), (0, 1), (1, 1)]
+            if const_expr(STATIC_HALF):
+                # One dword per 32-row pair; the tile's half is a static opsel.
+                if const_expr(interleave):
+                    pair_of = [t % (NT // 2) for t in range(NT)]
+                    half_of = [t // (NT // 2) for t in range(NT)]
+                else:
+                    pair_of = [t // (NT // 2) for t in range(NT)]
+                    half_of = [t % (NT // 2) for t in range(NT)]
+                lead = [pair_of.index(q) for q in range(max(pair_of) + 1)]
+                sc_row = [(e_tile0 + tiles[t]) // fx.Int32(2) for t in lead]
+                sc_shift = [None] * len(lead)
             else:
-                sc_pairs = [
-                    (e_tile0 + tiles[0]) // fx.Int32(2),
-                    (e_tile0 + tiles[2]) // fx.Int32(2),
-                ]
-                tile_pair = [(0, 0), (0, 1), (1, 0), (1, 1)]
+                pair_of = list(range(NT))
+                half_of = [0] * NT
+                sc_row = [(e_tile0 + t) // fx.Int32(2) for t in tiles]
+                sc_shift = [(t & fx.Int32(1)) * fx.Int32(8) for t in tiles]
 
             def load_w(kt):
                 frags = []
-                for t in range_constexpr(4):
+                for t in range_constexpr(NT):
                     per_ks = []
                     for ks in range_constexpr(2):
                         off = (
@@ -266,13 +277,16 @@ def _build_stage1(
                         per_ks.append(f)
                     frags.append(per_ks)
                 scales = []
-                for q in range_constexpr(2):
+                for q in range_constexpr(len(sc_row)):
                     off = (
-                        fx.Int64(sc_pairs[q]) * fx.Int64(GP8 * 32)
+                        fx.Int64(sc_row[q]) * fx.Int64(GP8 * 32)
                         + fx.Int64(kt * 256)
                         + fx.Int64(lane * fx.Int32(4))
                     )
-                    scales.append(cm.global_vec_load(arg_ws, off, 1))
+                    v = cm.global_vec_load(arg_ws, off, 1)
+                    if const_expr(sc_shift[q] is not None):
+                        v = v.shrui(sc_shift[q])
+                    scales.append(v)
                 return frags, scales
 
             def load_a_scales(kt):
@@ -290,45 +304,44 @@ def _build_stage1(
             atoms = _scale_atoms(a_dtype, w_dtype)
             zero4 = fx.full(4, 0.0, fx.Float32)
             acc = [
-                [fx.make_rmem_tensor(4, fx.Float32) for _ in range_constexpr(4)]
+                [fx.make_rmem_tensor(4, fx.Float32) for _ in range_constexpr(NT)]
                 for _ in range_constexpr(MT)
             ]
             for j in range_constexpr(MT):
-                for t in range_constexpr(4):
+                for t in range_constexpr(NT):
                     acc[j][t].store(zero4)
 
-            # Software pipeline: token tile kt+2 and weights kt+2 are issued while
-            # tile kt computes; tile kt+1's registers go to LDS at the end of kt.
-            a_pend = {0: load_a_tile(0)}
-            if const_expr(KT > 1):
-                a_pend[1] = load_a_tile(1)
-            w_pend = {i: load_w(i) for i in range(min(2, KT))}
-            s_pend = {0: load_a_scales(0)}
+            # Software pipeline: weights are issued LA tiles ahead, token tiles ALA;
+            # tile kt+1's registers go to LDS at the end of tile kt.
+            a_pend = {i: load_a_tile(i) for i in range(min(ALA, KT))}
+            w_pend = {i: load_w(i) for i in range(min(LA, KT))}
+            s_pend = {p: load_a_scales(2 * p) for p in range((min(LA, KT) + 1) // 2)}
             store_a_tile(a_pend.pop(0), 0)
             gpu.barrier()
             for kt in range_constexpr(KT):
                 slot = kt % 2
-                if const_expr(kt + 2 < KT):
-                    a_pend[kt + 2] = load_a_tile(kt + 2)
-                    w_pend[kt + 2] = load_w(kt + 2)
-                    if const_expr(kt % 2 == 0):
-                        s_pend[(kt + 2) // 2] = load_a_scales(kt + 2)
+                nk = kt + LA
+                if const_expr(kt + ALA < KT):
+                    a_pend[kt + ALA] = load_a_tile(kt + ALA)
+                if const_expr(nk < KT):
+                    w_pend[nk] = load_w(nk)
+                    if const_expr(nk % 2 == 0 and nk // 2 not in s_pend):
+                        s_pend[nk // 2] = load_a_scales(nk)
                 frags, wsc = w_pend.pop(kt)
                 a_sc = s_pend[kt // 2]
                 for ks in range_constexpr(2):
                     oa = (2 * kt + ks) % 4
                     for j in range_constexpr(MT):
                         af = read_a_frag(slot, j, ks)
-                        for t in range_constexpr(4):
-                            q, half = tile_pair[t]
+                        for t in range_constexpr(NT):
                             fx.gemm(
-                                atoms[(oa, ks * 2 + half)],
+                                atoms[(oa, ks * 2 + half_of[t])],
                                 acc[j][t],
                                 af,
                                 frags[t][ks],
                                 acc[j][t],
                                 scale_a=a_sc[j],
-                                scale_b=wsc[q],
+                                scale_b=wsc[pair_of[t]],
                             )
                 if const_expr(kt + 1 < KT):
                     store_a_tile(a_pend.pop(kt + 1), 1 - slot)
@@ -337,9 +350,9 @@ def _build_stage1(
             # Epilogue 1: bias + activation in registers, f32 results to LDS.
             col_w = wave * fx.Int32(WCOLS)
             for j in range_constexpr(MT):
-                for h in range_constexpr(2):
+                for h in range_constexpr(NT // 2):
                     g = Vec(acc[j][h].load())
-                    u = Vec(acc[j][h + 2].load())
+                    u = Vec(acc[j][h + NT // 2].load())
                     gv = [g[i] for i in range_constexpr(4)]
                     uv = [u[i] for i in range_constexpr(4)]
                     col = col_w + fx.Int32(h * 16) + lane16
@@ -368,12 +381,14 @@ def _build_stage1(
             gpu.barrier()
 
             # Epilogue 2: group-32 MX quant of 8 columns per thread, quads reduce amax.
-            prow = tid // fx.Int32(16)
-            chunk = tid % fx.Int32(16)
+            CPR = BNH // 8
+            RPP = 256 // CPR
+            prow = tid // fx.Int32(CPR)
+            chunk = tid % fx.Int32(CPR)
             sp = cm.global_ptr(arg_out_scale, fx.Int8.ir_type, 1)
-            for p in range_constexpr((BM + 15) // 16):
-                r = prow + fx.Int32(p * 16)
-                off = r * fx.Int32(acc_stride) + chunk * fx.Int32(32)
+            for p in range_constexpr((BM + RPP - 1) // RPP):
+                r = prow + fx.Int32(p * RPP)
+                off = (r % fx.Int32(BM)) * fx.Int32(acc_stride) + chunk * fx.Int32(32)
                 v0 = Vec(
                     lds_vec_load(
                         lds_base,
