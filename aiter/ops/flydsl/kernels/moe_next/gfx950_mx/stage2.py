@@ -54,6 +54,7 @@ def _build_stage2(
     blocks=1,
     nt=False,
     direct=False,
+    xcd=False,
 ):
     D = int(model_dim)
     INTER = int(inter_dim)
@@ -86,6 +87,7 @@ def _build_stage2(
     lds_bytes = (KS if PRE else 2) * a_lds_bytes
     # Prefetch the next block's W2 while this one computes, when registers allow.
     W_AHEAD = 4 * KS * W_NDW <= 64
+    XCD = bool(xcd) and not direct
 
     @fx.struct
     class SharedStorage:
@@ -109,15 +111,21 @@ def _build_stage2(
         wave = fx.Int32(rocdl.readfirstlane(T.i32, cm._raw(tid // fx.Int32(64))))
         ngrp = fx.Int32(gpu.block_id("x"))
         mblk = fx.Int32(gpu.block_id("y"))
+        if const_expr(XCD):
+            ngrp, mblk = cm.xcd_tile(ngrp, mblk, D // (BN * NBW))
         m_row = mblk * fx.Int32(BM)
-        e = fx.Int32(
-            rocdl.readfirstlane(T.i32, cm._raw(cm.global_ptr(arg_eids, T.i32)[mblk]))
-        )
+        eids = cm.global_ptr(arg_eids, T.i32)
         if const_expr(direct):
             # Direct mode: one tile per route slot; non-leading slots hold -1.
+            e = fx.Int32(rocdl.readfirstlane(T.i32, cm._raw(eids[mblk])))
             cond = e >= fx.Int32(0)
         else:
             cond = m_row < cm.global_ptr(arg_nvalid, T.i32)[0]
+            e = fx.Int32(
+                rocdl.readfirstlane(
+                    T.i32, cm._raw(eids[cond.select(mblk, fx.Int32(0))])
+                )
+            )
         if cond:
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
             lds_base = fx.Int32(fx.ptrtoint(lds.buf.ptr))

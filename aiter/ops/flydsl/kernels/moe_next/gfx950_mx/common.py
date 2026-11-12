@@ -158,3 +158,20 @@ def buffer_load16(addr_i64, base_dw, lane_dw, nt=False):
     frag = fx.make_rmem_tensor(4, fx.Int32)
     fx.copy(atom, view[lane_dw, None], frag)
     return fx.Vector(frag.load())
+
+
+def xcd_tile(bx, by, nx):
+    """(column block, tile) for a grid of nx column blocks by a multiple of 8 tiles,
+    so every column block of tile m runs on XCD m % 8 (workgroup id w is dispatched
+    to XCD w % 8): a tile's token rows are then fetched into one XCD's L2."""
+    pid = by * fx.Int32(nx) + bx
+    xc = pid & fx.Int32(7)
+    q = pid >> fx.Int32(3)
+    n = q % fx.Int32(nx)
+    m = (q // fx.Int32(nx)) * fx.Int32(8) + xc
+    return n, m
+
+
+def xcd_rows(m_blocks):
+    """Grid rows for xcd_tile: the tile count rounded up to a multiple of 8."""
+    return (m_blocks + 7) // 8 * 8

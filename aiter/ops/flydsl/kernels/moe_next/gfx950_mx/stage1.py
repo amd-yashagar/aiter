@@ -72,6 +72,7 @@ def _build_stage1(
     direct_topk=0,
     experts_total=0,
     inline_quant=True,
+    xcd=False,
 ):
     K = int(model_dim)
     INTER = int(inter_dim)
@@ -119,6 +120,7 @@ def _build_stage1(
     DIRECT = int(direct_topk) > 0
     TOPK = int(direct_topk)
     INLINE = DIRECT and inline_quant
+    XCD = bool(xcd) and not DIRECT
     assert not INLINE or (A_RESIDENT and BM == 16), "inline quant: BM 16, resident A"
     assert not DIRECT or BM == 16, "direct mode needs BM 16"
     NX = INTER // BNH
@@ -362,6 +364,8 @@ def _build_stage1(
         wave = fx.Int32(rocdl.readfirstlane(T.i32, cm._raw(tid // fx.Int32(64))))
         nblk = fx.Int32(gpu.block_id("x"))
         mblk = fx.Int32(gpu.block_id("y"))
+        if const_expr(XCD):
+            nblk, mblk = cm.xcd_tile(nblk, mblk, INTER // BNH)
         m_row = mblk * fx.Int32(BM)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base = fx.Int32(fx.ptrtoint(lds.buf.ptr))
@@ -384,7 +388,10 @@ def _build_stage1(
             cond = m_row < nvalid
             e = fx.Int32(
                 rocdl.readfirstlane(
-                    T.i32, cm._raw(cm.global_ptr(arg_eids, T.i32)[mblk])
+                    T.i32,
+                    cm._raw(
+                        cm.global_ptr(arg_eids, T.i32)[cond.select(mblk, fx.Int32(0))]
+                    ),
                 )
             )
         if cond:

@@ -57,7 +57,7 @@ def parse_config(config):
     out = {}
     for tok in (config or "").split("_"):
         key = tok.rstrip("0123456789")
-        keys = ("bm", "tn", "la", "nb", "ra", "nt", "ar", "dm", "iq")
+        keys = ("bm", "tn", "la", "nb", "ra", "nt", "ar", "dm", "iq", "xc")
         if key in keys and tok[len(key) :]:
             out[key] = int(tok[len(key) :])
     return out
@@ -159,6 +159,7 @@ class _MxGfx950(MoeKernel):
         live = min(spec.experts, routes) * -(-per_expert // bm)
         nb = cfg.get("nb") or blocks_per_wg(spec.model_dim, live)
         reduce = self.epilogue == "reduce"
+        xcd = bool(cfg.get("xc", 1 if self.prefill else 0))
         a_bytes = spec.model_dim if a == "fp8" else spec.model_dim // 2
         direct = (
             not self.prefill
@@ -193,6 +194,7 @@ class _MxGfx950(MoeKernel):
             direct_topk=topk if direct else 0,
             experts_total=spec.experts,
             inline_quant=bool(cfg.get("iq", 0)),
+            xcd=xcd,
         )
         s2 = compile_stage2(
             model_dim=spec.model_dim,
@@ -207,9 +209,10 @@ class _MxGfx950(MoeKernel):
             blocks=1 if direct else nb,
             nt=bool(cfg.get("nt", 1)),
             direct=direct,
+            xcd=xcd,
         )
         r = compile_reduce(model_dim=spec.model_dim, topk=topk) if reduce else None
-        return bm, a, q, s1, s2, r, (direct, bool(cfg.get("iq", 0)))
+        return bm, a, q, s1, s2, r, (direct, bool(cfg.get("iq", 0)), xcd)
 
     def warmup(self, weights, m, topk, config):
         import flydsl.expr as fx
@@ -287,6 +290,8 @@ class _MxGfx950(MoeKernel):
                 output=out,
             )
         rows, mblocks = sids.numel(), se.numel()
+        if direct[2]:
+            mblocks = (mblocks + 7) // 8 * 8
         stream = fx.Stream(torch.cuda.current_stream(dev))
         aq = torch.empty(
             (M, D // 2 if a == "fp4" else D), dtype=torch.uint8, device=dev
@@ -442,7 +447,7 @@ def _direct_call(self, call, spec, M, D, I, a, q, s1, s2, inline):
 
 _MxGfx950._direct_call = _direct_call
 
-_ACT_TERM = {"fp4": "mx_fp4", "fp8": "mx_fp8"}
+_ACT_TERM = {"fp4": "mx_fp4_round_up", "fp8": "mx_fp8_round_up"}
 _FAMILIES = {
     # family: (activation dtype, weight dtype)
     "a4w4": (dtypes.fp4x2, dtypes.fp4x2),
