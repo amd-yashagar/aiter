@@ -16,16 +16,7 @@ import os
 import torch
 
 from aiter import ActivationType, QuantType, dtypes
-from aiter.moe import (  # noqa: F401  entry re-exported: importing this module registers its kernels
-    CALL_KWARGS,
-    PREPARE_KWARGS,
-    MoeCall,
-    MoeKernel,
-    explain,
-    forward,
-    prepare,
-    register_kernel,
-)
+from aiter.moe import MoeCall, MoeKernel, register_kernel
 from aiter.ops.flydsl.moe_common import GateMode
 
 _CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
@@ -92,19 +83,25 @@ class _Fp8BlockGfx950(MoeKernel):
             return "prequantized activations not implemented"
         if call.extra:
             return f"{sorted(call.extra)} not implemented"
+        if call.out_dtype != torch.bfloat16:
+            return "output dtype is not bf16"
+        if call.global_experts != spec.experts:
+            return "EP not implemented"
+        nb1 = spec.experts * (2 * spec.inter_dim // 128) * (spec.model_dim // 128)
+        nb2 = spec.experts * (spec.model_dim // 128) * (spec.inter_dim // 128)
+        for s, n in ((call.w1_scale, nb1), (call.w2_scale, nb2)):
+            if (
+                s is None
+                or s.dtype != torch.float32
+                or not s.is_contiguous()
+                or s.numel() != n
+            ):
+                return "weight scales are not fp32 contiguous [E, N/128, K/128]"
+        if not (call.w1.is_contiguous() and call.w2.is_contiguous()):
+            return "weights are not contiguous"
         if call.output is not None and call.output.dtype != torch.bfloat16:
             return "output= is not bf16"
         return None
-
-    def prepare_weights(self, weights):
-        s = weights.spec
-        w1s = weights.w1_scale.to(torch.float32).contiguous().view(-1)
-        w2s = weights.w2_scale.to(torch.float32).contiguous().view(-1)
-        assert w1s.numel() == s.experts * (2 * s.inter_dim // 128) * (
-            s.model_dim // 128
-        )
-        assert w2s.numel() == s.experts * (s.model_dim // 128) * (s.inter_dim // 128)
-        return {"w1_scale": w1s, "w2_scale": w2s}
 
     def warmup(self, weights, m, topk, config):
         self._launchers(
@@ -149,7 +146,9 @@ class _Fp8BlockGfx950(MoeKernel):
         from aiter.ops.quant import per_group_quant_hip
 
         spec, weights = call.spec, call.weights
-        state = weights.state[self.id]
+        # The caller's own tensors, in aiter's layout (fp32 scales viewed, never copied).
+        w1s = call.w1_scale.view(-1)
+        w2s = call.w2_scale.view(-1)
         cfg = _tile_config(weights.gpu, call.config, call.m, call.topk, spec.experts)
         tm = cfg["tile_m"]
         s1, s2 = self._launchers(call.topk, spec, cfg)
@@ -182,8 +181,8 @@ class _Fp8BlockGfx950(MoeKernel):
             inter_s,
             xq.view(torch.int8),
             xs,
-            weights.w1.view(torch.int8),
-            state["w1_scale"],
+            call.w1.view(torch.int8),
+            w1s,
             sorted_ids,
             sorted_e,
             sorted_w,
@@ -198,8 +197,8 @@ class _Fp8BlockGfx950(MoeKernel):
             buf,
             inter.view(torch.int8),
             inter_s,
-            weights.w2.view(torch.int8),
-            state["w2_scale"],
+            call.w2.view(torch.int8),
+            w2s,
             sorted_ids,
             sorted_e,
             sorted_w,
