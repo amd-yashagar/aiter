@@ -19,6 +19,7 @@ import torch
 import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.moe import MoeKernel, register_kernel
+from aiter.ops.flydsl.moe_common import GateMode
 
 _CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
 _ACTS = {ActivationType.Silu: "silu", ActivationType.Gelu: "gelu"}
@@ -105,6 +106,8 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
             return f"activation {spec.act}"
         if spec.doweight_stage1:
             return "doweight_stage1"
+        if spec.gate_mode != GateMode.SEPARATED:
+            return "gate/up must be separated"
         if (
             spec.has_bias
             or spec.swiglu_limit
