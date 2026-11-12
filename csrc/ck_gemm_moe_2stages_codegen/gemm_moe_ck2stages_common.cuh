@@ -270,14 +270,15 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
     static constexpr ck::index_t CShuffleNLane =
         ck::is_same_v<B0DataType, I4> ? 32 : NPerBlock / 2 / NXDLPerWave; // 64
     static constexpr ck::index_t CShuffleMLane = BLOCKSIZE / CShuffleNLane;
-    // Note: some fp8 instances didn't compile with AK1/BK1=16
+    // Note: some fp8 instances didn't compile with AK1=16. BK1 must stay 16 bytes: the
+    // preshuffled B layout (KPack = lcm(AK1, BK1)) is written for 16 bytes per lane.
     static constexpr ck::index_t K1 =
         (BLOCKSIZE == 256 && KPerBlock == 64 && sizeof(A0DataType) == 1 && sizeof(B0DataType) == 1)
             ? 8
             : 16;
     static constexpr ck::index_t AK1 = K1 / sizeof(A0DataType);
     static constexpr ck::index_t BK1 =
-        ck::is_same_v<B0DataType, I4> ? 32 / sizeof(B0DataType) : K1 / sizeof(B0DataType);
+        ck::is_same_v<B0DataType, I4> ? 32 / sizeof(B0DataType) : 16 / sizeof(B0DataType);
     static constexpr ck::index_t EVec  = 2;
     static constexpr ck::index_t D0Vec = 1;
     static constexpr ck::index_t D1Vec = PerTensorQuant ? 1 : EVec;
