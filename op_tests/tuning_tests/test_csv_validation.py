@@ -7,6 +7,7 @@ Catches: duplicates, invalid times, high errRatio, git merge conflicts,
 missing untuned files.
 """
 
+import glob
 import os
 import re
 import unittest
@@ -170,6 +171,47 @@ class TestCSVValidation(unittest.TestCase):
                 "_tag",
             ],
         )
+
+    def _fmoe_model_csvs(self):
+        """Tuned fmoe tables looked up by ``get_2stage_cfgs`` (not the untuned or grouped ones)."""
+        paths = sorted(
+            glob.glob(os.path.join(CONFIGS_DIR, "**", "*fmoe*.csv"), recursive=True)
+        )
+        for path in paths:
+            name = os.path.basename(path)
+            if "untuned" in name or "grouped" in name:
+                continue
+            df = pd.read_csv(path)
+            df.columns = df.columns.str.strip()
+            if "token" in df.columns:
+                yield os.path.relpath(path, CONFIGS_DIR), df
+
+    def test_fmoe_asm_mode_and_run_1stage_columns_are_valid(self):
+        # A row with its trailing columns shifted left puts a throughput in `flat`.
+        for name, df in self._fmoe_model_csvs():
+            with self.subTest(file=name):
+                if "flat" in df.columns:
+                    bad = df[df["flat"].notna() & ~df["flat"].isin([0, 1, 2, 3])]
+                    self.assertEqual(len(bad), 0, f"{name}: invalid flat:\n{bad}")
+                if "run_1stage" in df.columns:
+                    bad = df[df["run_1stage"].notna() & ~df["run_1stage"].isin([0, 1])]
+                    self.assertEqual(len(bad), 0, f"{name}: invalid run_1stage:\n{bad}")
+
+    def test_fmoe_tokens_are_reachable_by_padded_m(self):
+        # get_2stage_cfgs looks rows up by get_padded_M(M), so any other token is dead.
+        from aiter.fused_moe import get_padded_M
+
+        reachable = {get_padded_M(m) for m in range(1, 33000)}
+        reachable |= {get_padded_M(m) for m in (65536, 131072, 200000)}
+        for name, df in self._fmoe_model_csvs():
+            with self.subTest(file=name):
+                bad = df[~df["token"].isin(reachable)]
+                self.assertEqual(
+                    len(bad),
+                    0,
+                    f"{name}: tokens no padded M maps to (lines "
+                    f"{(bad.index + 2).tolist()}): {bad['token'].tolist()}",
+                )
 
     def test_flydsl_stage2_sort_block_matches_fmoe_config(self):
         """Stage2 must consume the same sorting layout emitted by stage1."""
