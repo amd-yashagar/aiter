@@ -442,3 +442,34 @@ def test_compare_reports_mx_rule_and_rounding_separately():
         )
         == "combine"
     )
+
+
+def _exact_only(logits, rel=0.05, nan=0, sentinel=True, seeds=3):
+    per = [{"exact_logits_diff": logits, "exact_rel_l2": rel} for _ in range(seeds)]
+    return {
+        "per_seed": per,
+        "nan_inf": nan,
+        "sentinel_ok": sentinel,
+        "mean": {"exact_rel_l2": rel, "exact_logits_diff": logits},
+    }
+
+
+def test_in_kernel_path_must_pass_the_strict_rule_against_ref_exact():
+    # EMSORT-class (logits_diff about 6e-4) is eligible as a bar
+    assert accuracy.rule(_exact_only(6e-4)) is True
+    assert accuracy.rule(_exact_only(0.01)) is True
+    # a loose kernel must not set the bar, even below the garbage guard
+    assert accuracy.rule(_exact_only(0.02, rel=0.2)) is False
+    # one bad seed fails it
+    res = _exact_only(6e-4)
+    res["per_seed"][1]["exact_logits_diff"] = 0.05
+    assert accuracy.rule(res) is False
+    # NaN/Inf and the sentinel still fail; the rel_l2 garbage guard stays
+    assert accuracy.rule(_exact_only(6e-4, nan=1)) is False
+    assert accuracy.rule(_exact_only(6e-4, sentinel=False)) is False
+    assert accuracy.rule(_exact_only(6e-4, rel=0.9)) is False
+    # no exact metrics at all: undecided, not a pass
+    assert (
+        accuracy.rule({"per_seed": [{}], "nan_inf": 0, "sentinel_ok": True, "mean": {}})
+        is None
+    )

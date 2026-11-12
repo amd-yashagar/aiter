@@ -788,10 +788,16 @@ def rule(res, flat_mxfp4=False):
     if res["nan_inf"] or res["sentinel_ok"] is False:
         return False
     if "path_allclose" not in res["mean"]:
-        # ref_path is n/a (an in-kernel MX quant): the garbage guard on ref_exact only;
-        # the verdict against the bar stays on ref_exact in compare
+        # ref_path is n/a (an in-kernel MX quant). Eligibility as a bar needs aiter's
+        # strict logits_diff limit against ref_exact (a loose kernel must not set the
+        # bar); the rel_l2 limit stays as a garbage guard. The verdict against the bar
+        # is still on ref_exact in compare.
         e = res["mean"].get("exact_rel_l2")
-        return None if e is None else e <= EXACT_ONLY_LIMIT
+        if e is None or any("exact_logits_diff" not in m for m in res["per_seed"]):
+            return None
+        if e > EXACT_ONLY_LIMIT:
+            return False
+        return all(m["exact_logits_diff"] <= LOGITS_DIFF_LIMIT for m in res["per_seed"])
     for m in res["per_seed"]:
         if m["path_allclose"] > 0 and m["path_logits_diff"] > LOGITS_DIFF_LIMIT:
             return False
