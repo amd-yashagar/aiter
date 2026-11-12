@@ -4032,6 +4032,65 @@ def _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled):
         )
 
 
+# FlyDSL MXFP4 stage1 tiles N in 128s and stage2 K = inter_dim in 128 or 256, so
+# inter_dim % 128 != 0 has no FlyDSL kernel. This ASM no-sort kernel takes any
+# inter_dim that is a multiple of 32 (the MXFP4 scale group) for fp4 x fp4 Silu.
+_A4W4_SILU_ASM_FLAT_KERNEL = (
+    "_ZN5aiter49fmoe_bf16_pertokenMXfp4_g1u1_flat_novs_silu_16x32E"
+)
+
+
+def _a4w4_silu_asm_flat_kernel(
+    *,
+    gfx,
+    model_dim,
+    inter_dim,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    activation,
+    use_g1u1,
+    doweight_stage1,
+    gate_mode,
+    weights_shuffled,
+    has_bias,
+    is_ep,
+    has_stage2_scatter,
+    has_activation_scales,
+    has_num_local_tokens,
+    hidden_pad,
+    intermediate_pad,
+):
+    """The ASM 1-stage kernel for an fp4 x fp4 Silu shape FlyDSL can't tile, or None."""
+    if (
+        gfx == "gfx950"
+        and q_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and activation == ActivationType.Silu
+        and dtype == dtypes.bf16
+        and use_g1u1
+        and not doweight_stage1
+        and gate_mode == GateMode.SEPARATED
+        and weights_shuffled
+        and model_dim % 256 == 0
+        and inter_dim % 128 != 0
+        and inter_dim % 32 == 0
+        and not (
+            has_bias
+            or is_ep
+            or has_stage2_scatter
+            or has_activation_scales
+            or has_num_local_tokens
+            or hidden_pad
+            or intermediate_pad
+        )
+    ):
+        return _A4W4_SILU_ASM_FLAT_KERNEL
+    return None
+
+
 def _swiglu_limit_is_active(swiglu_limit) -> bool:
     """True only when the caller asked for a finite positive clamp bound.
 
@@ -4866,6 +4925,41 @@ def get_2stage_cfgs(
             )
         )
         use_non_temporal_load = use_nt(token, topk, expert)
+        asm_flat_kernel = _a4w4_silu_asm_flat_kernel(
+            gfx=gfx,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            dtype=dtype,
+            q_dtype_a=q_dtype_a,
+            q_dtype_w=q_dtype_w,
+            q_type=q_type,
+            activation=activation,
+            use_g1u1=use_g1u1,
+            doweight_stage1=doweight_stage1,
+            gate_mode=gate_mode,
+            weights_shuffled=bool(weights_shuffled),
+            has_bias=has_stage1_bias or has_stage2_bias,
+            is_ep=is_ep,
+            has_stage2_scatter=has_stage2_scatter,
+            has_activation_scales=has_activation_scales,
+            has_num_local_tokens=has_num_local_tokens,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+        )
+        if asm_flat_kernel is not None:
+            # FlyDSL tiles inter_dim in 128s, so it can't run this shape.
+            logger.warning(
+                f"[fused_moe] fp4 x fp4 Silu with inter_dim={inter_dim} has no "
+                f"FlyDSL kernel (tiles are multiples of 128) for {keys}; using "
+                "the ASM no-sort kernel, which is correct but slower at large M. "
+                "Padding inter_dim up to a multiple of 128 and passing "
+                "intermediate_pad gives the fast FlyDSL path."
+            )
+            run_1stage = run_1stage_xbf16 = True
+            kernelName1 = asm_flat_kernel
+            cfg_flat = AsmMoeMode.NO_SORT
+            block_m = 16
+            ksplit = 0
         aiter.logger.info(
             f"run_1stage = {run_1stage}, xbf16 = {run_1stage_xbf16}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
@@ -5375,6 +5469,14 @@ def get_2stage_cfgs(
             get_flydsl_kernel_params,
             pick_flydsl_stage2_tile_k,
         )
+
+        if inter_dim % 128 != 0:
+            raise NotImplementedError(
+                f"No FlyDSL MXFP4 kernel tiles inter_dim={inter_dim} (stage1 N "
+                "tiles and stage2 K tiles are multiples of 128), and no other "
+                "backend covers this call (activation, dtypes, bias, padding or "
+                "layout)"
+            )
 
         _out_type = "bf16" if dtype == dtypes.bf16 else "f16"
         # a-dtype routing:
