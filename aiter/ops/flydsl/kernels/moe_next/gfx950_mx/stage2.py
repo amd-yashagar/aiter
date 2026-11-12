@@ -65,7 +65,9 @@ def _build_stage2(
     a_lds_bytes = BM * TRB
     c_stride = BN * 2 + 16
     c_bytes = BM * c_stride
-    lds_bytes = max(2 * a_lds_bytes, c_bytes)
+    # Whole-K preload (every A step in LDS, every W step in VGPRs) when it fits.
+    PRE = KS <= 8 and KS * a_lds_bytes <= 96 * 1024
+    lds_bytes = max((KS if PRE else 2) * a_lds_bytes, c_bytes)
 
     @fx.struct
     class SharedStorage:
@@ -230,42 +232,72 @@ def _build_stage2(
                 for t in range_constexpr(4):
                     acc[j][t].store(zero4)
 
-            a_regs = load_a(0)
-            w_cur = load_w(0)
-            ws = load_w_scales(0)
-            as_ = load_a_scales(0)
-            store_a(a_regs, 0)
-            gpu.barrier()
-            for ks in range_constexpr(KS):
-                slot = ks % 2
-                if const_expr(ks + 1 < KS):
-                    a_regs = load_a(ks + 1)
-                    w_nxt = load_w(ks + 1)
-                if const_expr(ks % 2 == 1 and ks + 1 < KS):
-                    ws_nxt = load_w_scales((ks + 1) // 2)
-                    as_nxt = load_a_scales((ks + 1) // 2)
-                for j in range_constexpr(MT):
-                    af = read_a(slot, j)
-                    # Scale bytes are [k step parity][16-row tile parity]; the A tile
-                    # parity is shifted down so opsel stays static.
-                    sa = as_[j].shrui(a_half[j] * fx.Int32(8))
-                    for t in range_constexpr(4):
-                        fx.gemm(
-                            atoms[((ks % 2) * 2, (ks % 2) * 2 + t % 2)],
-                            acc[j][t],
-                            af,
-                            w_cur[t],
-                            acc[j][t],
-                            scale_a=sa,
-                            scale_b=ws[t // 2],
-                        )
-                if const_expr(ks + 1 < KS):
-                    store_a(a_regs, 1 - slot)
-                    w_cur = w_nxt
-                    if const_expr(ks % 2 == 1):
-                        ws = ws_nxt
-                        as_ = as_nxt
+            if const_expr(PRE):
+                a_all = [load_a(ks) for ks in range(KS)]
+                w_all = [load_w(ks) for ks in range(KS)]
+                ws_all = [load_w_scales(kp) for kp in range((KS + 1) // 2)]
+                as_all = [load_a_scales(kp) for kp in range((KS + 1) // 2)]
+                for ks in range_constexpr(KS):
+                    store_a(a_all[ks], ks)
                 gpu.barrier()
+                for ks in range_constexpr(KS):
+                    slot = ks
+                    w_cur = w_all[ks]
+                    ws = ws_all[ks // 2]
+                    as_ = as_all[ks // 2]
+                    for j in range_constexpr(MT):
+                        af = read_a(slot, j)
+                        # Scale bytes are [k step parity][16-row tile parity]; the A tile
+                        # parity is shifted down so opsel stays static.
+                        sa = as_[j].shrui(a_half[j] * fx.Int32(8))
+                        for t in range_constexpr(4):
+                            fx.gemm(
+                                atoms[((ks % 2) * 2, (ks % 2) * 2 + t % 2)],
+                                acc[j][t],
+                                af,
+                                w_cur[t],
+                                acc[j][t],
+                                scale_a=sa,
+                                scale_b=ws[t // 2],
+                            )
+                gpu.barrier()
+            else:
+                a_regs = load_a(0)
+                w_cur = load_w(0)
+                ws = load_w_scales(0)
+                as_ = load_a_scales(0)
+                store_a(a_regs, 0)
+                gpu.barrier()
+                for ks in range_constexpr(KS):
+                    slot = ks % 2
+                    if const_expr(ks + 1 < KS):
+                        a_regs = load_a(ks + 1)
+                        w_nxt = load_w(ks + 1)
+                    if const_expr(ks % 2 == 1 and ks + 1 < KS):
+                        ws_nxt = load_w_scales((ks + 1) // 2)
+                        as_nxt = load_a_scales((ks + 1) // 2)
+                    for j in range_constexpr(MT):
+                        af = read_a(slot, j)
+                        # Scale bytes are [k step parity][16-row tile parity]; the A tile
+                        # parity is shifted down so opsel stays static.
+                        sa = as_[j].shrui(a_half[j] * fx.Int32(8))
+                        for t in range_constexpr(4):
+                            fx.gemm(
+                                atoms[((ks % 2) * 2, (ks % 2) * 2 + t % 2)],
+                                acc[j][t],
+                                af,
+                                w_cur[t],
+                                acc[j][t],
+                                scale_a=sa,
+                                scale_b=ws[t // 2],
+                            )
+                    if const_expr(ks + 1 < KS):
+                        store_a(a_regs, 1 - slot)
+                        w_cur = w_nxt
+                        if const_expr(ks % 2 == 1):
+                            ws = ws_nxt
+                            as_ = as_nxt
+                    gpu.barrier()
 
             # Epilogue: weight, bf16, transpose through LDS.
             for j in range_constexpr(MT):
@@ -290,8 +322,9 @@ def _build_stage2(
                         )
             gpu.barrier()
 
-            pair = tid % fx.Int32(128)
-            prow = tid // fx.Int32(128)
+            # 16 B (8 channels) per thread: 32 threads per row, 8 rows per pass.
+            seg = tid % fx.Int32(32)
+            prow = tid // fx.Int32(32)
             stids = cm.global_ptr(arg_stids, T.i32)
             out_view = fx.Tensor(
                 fx.make_view(
@@ -301,41 +334,48 @@ def _build_stage2(
             )
             out_buf = fx.rocdl.make_buffer_tensor(out_view, max_size=True)
             atomic = fx.make_copy_atom(fx.rocdl.BufferAtomicPkAdd(BFloat16), BFloat16)
-            for p in range_constexpr(BM // 2):
-                r = prow + fx.Int32(2 * p)
+            for p in range_constexpr(BM // 8):
+                r = prow + fx.Int32(8 * p)
                 packed = stids[m_row + r]
                 tok = packed & fx.Int32(0xFFFFFF)
                 slot_id = packed.shrui(fx.Int32(24))
-                pk = Vec(
+                v8 = Vec(
                     lds_vec_load(
                         lds_base,
-                        r * fx.Int32(c_stride) + pair * fx.Int32(4),
-                        Vec.make_type(2, BFloat16),
-                        BFloat16,
-                        align=4,
+                        r * fx.Int32(c_stride) + seg * fx.Int32(16),
+                        Vec.make_type(4, fx.Int32),
+                        fx.Int32,
+                        align=16,
                     )
                 )
-                col = nblk * fx.Int32(BN) + pair * fx.Int32(2)
+                col = nblk * fx.Int32(BN) + seg * fx.Int32(8)
                 if tok < i32_tokens:
                     if const_expr(reduce):
                         cm.global_vec_store(
-                            pk.bitcast(fx.Int32)[0],
+                            v8,
                             arg_out,
                             (
                                 fx.Int64(tok * fx.Int32(topk) + slot_id) * fx.Int64(D)
                                 + fx.Int64(col)
                             )
                             * fx.Int64(2),
-                            1,
+                            4,
                         )
                     else:
-                        frag = fx.make_rmem_tensor(2, BFloat16)
-                        frag.store(pk)
-                        fx.copy(
-                            atomic,
-                            frag,
-                            out_buf[None, tok * fx.Int32(D) + col],
-                        )
+                        for h in range_constexpr(4):
+                            frag = fx.make_rmem_tensor(2, BFloat16)
+                            frag.store(
+                                fx.Vector.from_elements([v8[h]], fx.Int32).bitcast(
+                                    BFloat16
+                                )
+                            )
+                            fx.copy(
+                                atomic,
+                                frag,
+                                out_buf[
+                                    None, tok * fx.Int32(D) + col + fx.Int32(2 * h)
+                                ],
+                            )
 
     @flyc.jit
     def launch_mx_stage2(
@@ -373,3 +413,62 @@ def _build_stage2(
 @functools.lru_cache(maxsize=256)
 def compile_stage2(**kw):
     return _build_stage2(**kw)
+
+
+def _build_reduce(*, model_dim, topk):
+    """out[t] = bf16(sum over slots of rows[t * topk + k]) in fp32, 8 columns per thread."""
+    D = int(model_dim)
+    TK = int(topk)
+    assert D % 8 == 0
+    CPT = D // 8
+
+    @flyc.kernel
+    def mx_route_reduce(arg_out: fx.Int64, arg_rows: fx.Int64, i32_tokens: fx.Int32):
+        gid = fx.block_idx.x * fx.Int32(256) + fx.thread_idx.x
+        t = gid // fx.Int32(CPT)
+        c = gid - t * fx.Int32(CPT)
+        if t < i32_tokens:
+            acc = [fx.Float32(0.0) for _ in range(8)]
+            for k in range_constexpr(TK):
+                v = cm.global_vec_load(
+                    arg_rows,
+                    (
+                        fx.Int64(t * fx.Int32(TK) + fx.Int32(k)) * fx.Int64(D)
+                        + fx.Int64(c * fx.Int32(8))
+                    )
+                    * fx.Int64(2),
+                    4,
+                )
+                b = v.bitcast(BFloat16)
+                for i in range_constexpr(8):
+                    acc[i] = acc[i] + fx.Float32(b[i])
+            pk = Vec.from_elements(acc, fx.Float32).to(BFloat16).bitcast(fx.Int32)
+            cm.global_vec_store(
+                pk,
+                arg_out,
+                (fx.Int64(t) * fx.Int64(D) + fx.Int64(c * fx.Int32(8))) * fx.Int64(2),
+                4,
+            )
+
+    @flyc.jit
+    def launch_mx_route_reduce(
+        arg_out: fx.Int64,
+        arg_rows: fx.Int64,
+        i32_tokens: fx.Int32,
+        i32_blocks: fx.Int32,
+        stream: fx.Stream,
+    ):
+        mx_route_reduce(arg_out, arg_rows, i32_tokens).launch(
+            grid=(fx.Int64(i32_blocks), 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    return launch_mx_route_reduce
+
+
+@functools.lru_cache(maxsize=64)
+def compile_reduce(*, model_dim, topk):
+    return _build_reduce(model_dim=model_dim, topk=topk)
+
+
+def reduce_blocks(tokens, model_dim):
+    return (tokens * (model_dim // 8) + 255) // 256
