@@ -4,8 +4,8 @@
 """Inline helpers for direct-mode kernels (``routing = "direct"``): no tile
 map, the kernel groups its own routes and zero-fills its own output.
 
-``group_routes`` puts up to 64 routes (M * topk <= DIRECT_MAX_ROUTES) in
-aiter's sort order, in LDS: by expert, then by route index, with the sort's
+``group_routes`` puts up to 256 routes (M * topk <= DIRECT_MAX_ROUTES, one
+per thread of a 256-thread workgroup) in aiter's sort order, in LDS: by expert, then by route index, with the sort's
 rules (-1 and out-of-range ids dropped, experts outside ``expert_mask``
 dropped and the rest renumbered to local ids, tokens at or past
 ``num_local_tokens`` dropped, a repeated expert within a token kept at its
@@ -16,8 +16,7 @@ type (16-byte stores; rows must be a multiple of 16 bytes).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr import gpu, range_constexpr
 
 from .sort import (
     BLOCK,
@@ -33,15 +32,29 @@ from .sort import (
     _zero_fill,
 )
 
-DIRECT_MAX_ROUTES = WAVE
+DIRECT_MAX_ROUTES = BLOCK
+WAVES = BLOCK // WAVE
+
+
+def offsets(num_experts):
+    """Word offsets (order, weight, group_expert, group_start, meta, mask,
+    count, start, scan) in the ``group_routes`` LDS block."""
+    e_cap = -(-num_experts // BLOCK) * BLOCK
+    o_order = 0
+    o_w = o_order + BLOCK
+    o_ge = o_w + BLOCK
+    o_gs = o_ge + BLOCK
+    o_meta = o_gs + BLOCK + 1
+    o_mask = o_meta + 2
+    o_cnt = o_mask + e_cap
+    o_start = o_cnt + e_cap
+    o_scan = o_start + e_cap
+    return o_order, o_w, o_ge, o_gs, o_meta, o_mask, o_cnt, o_start, o_scan
 
 
 def lds_words(num_experts):
-    """Int32 LDS words ``group_routes`` needs: order, weight (as bits),
-    group_expert, group_start (+1), meta (2), and with EP the mask and local
-    tables and the scan scratch."""
-    e_cap = -(-num_experts // BLOCK) * BLOCK
-    return 4 * WAVE + 3 + 2 * e_cap + 2 * (BLOCK // WAVE) + 1
+    """Int32 LDS words ``group_routes`` needs (about 7 KB at E = 256)."""
+    return offsets(num_experts)[-1] + 2 * WAVES + 1
 
 
 @flyc.jit
@@ -57,9 +70,9 @@ def group_routes(
     has_mask,
     has_local,
 ):
-    """Group the routes; every thread of the workgroup calls it (ballots in
-    wave 0, the EP table over all threads). ``lds`` is an int32 LDS pointer of
-    ``lds_words(num_experts)`` words. Afterwards (a barrier is included):
+    """Group up to 256 routes (one per thread of a 256-thread workgroup);
+    every thread calls it. ``lds`` is an int32 LDS pointer of
+    ``lds_words(num_experts)`` words. Afterwards (barrier included):
 
         order[r]        = token | slot << 24, r < n_valid, in sort order
         weight[r]       = that route's weight (fp32 bits)
@@ -69,96 +82,91 @@ def group_routes(
 
     at word offsets ``offsets()``. Tensors: ``ids`` int32 and ``weights`` fp32
     [M, topk], ``mask`` int32 [E] (when ``has_mask``), ``ltok`` int32 [1]
-    (when ``has_local``)."""
-    o_order, o_w, o_ge, o_gs, o_meta, o_mask, o_local, o_scan = offsets(num_experts)
+    (when ``has_local``). Ranks within an expert follow route order: wave w
+    adds its per-expert counts in phase w."""
+    o_order, o_w, o_ge, o_gs, o_meta, o_mask, o_cnt, o_start, o_scan = offsets(
+        num_experts
+    )
     E = num_experts
     e_cap = -(-E // BLOCK) * BLOCK
+    ept = e_cap // BLOCK
     key_bits = max(1, (E - 1).bit_length())
     tid = gpu.thread_idx.x
+    wave = tid // fx.Int32(WAVE)
     c0, c1 = fx.Int32(0), fx.Int32(1)
     tokens = m_cap
     if has_local:
         t = _ld(_it(ltok), c0)
         tokens = (t < m_cap).select(t, m_cap)
     n = tokens * fx.Int32(topk)
-    mask_lds = lds + fx.Int64(o_mask)
-    local = lds + fx.Int64(o_local)
+    maskl = lds + fx.Int64(o_mask)
+    cnt = lds + fx.Int64(o_cnt)
+    start = lds + fx.Int64(o_start)
+    scan = lds + fx.Int64(o_scan)
     if has_mask:
-        _load_mask(mask_lds, _it(mask), tid, E, e_cap)
+        # maskl[e] = local id + 1 for experts in the mask, else 0
+        _load_mask(maskl, _it(mask), tid, E, e_cap)
         gpu.barrier()
-        ept = e_cap // BLOCK
         on = [
-            (_lds(mask_lds, tid * fx.Int32(ept) + fx.Int32(k)) != c0).select(c1, c0)
+            (_lds(maskl, tid * fx.Int32(ept) + fx.Int32(k)) != c0).select(c1, c0)
             for k in range_constexpr(ept)
         ]
         acc = c0
         for v in on:
             acc = acc + v
-        acc, _, _ = _block_excl_scan2(lds + fx.Int64(o_scan), tid, acc, c0)
+        acc, _, _ = _block_excl_scan2(scan, tid, acc, c0)
         for k in range_constexpr(ept):
-            _lds_st(local, acc, tid * fx.Int32(ept) + fx.Int32(k))
+            loc = (on[k] != c0).select(acc + c1, c0)
+            _lds_st(maskl, loc, tid * fx.Int32(ept) + fx.Int32(k))
             acc = acc + on[k]
-        gpu.barrier()
-    e, inb, w, _ = _load_route(_it(ids), _it(weights), tid, n, True)
-    e, valid, below, _ = _check(
-        e, inb, mask_lds, E, has_mask, fx.Int32(-1), tid, topk, key_bits
+    for k in range_constexpr(ept):
+        _lds_st(cnt, c0, tid * fx.Int32(ept) + fx.Int32(k))
+    gpu.barrier()
+    e, inb, w, halo = _load_route(
+        _it(ids), _it(weights), tid, n, True, topk, halo_end=n
     )
-    # lanes with a smaller expert, from the expert-id bits, MSB first
-    vmask = fx.Uint64(rocdl.ballot(T.i64, valid))
-    eq = fx.Uint64(0xFFFFFFFFFFFFFFFF)
-    less = fx.Uint64(0)
-    for b in range_constexpr(key_bits - 1, -1, -1):
-        bit = ((e >> fx.Int32(b)) & c1) != c0
-        votes = fx.Uint64(rocdl.ballot(T.i64, bit))
-        less = bit.select(less | (eq & ~votes), less)
-        eq = eq & bit.select(votes, ~votes)
-    less = less & vmask
-    n_less = fx.Int32(fx.math.ctpop(fx.Uint32(less))) + fx.Int32(
-        fx.math.ctpop(fx.Uint32(less >> fx.Uint64(32)))
+    if topk == 1:
+        halo = fx.Int32(-1)
+    e, valid, below, count = _check(
+        e, inb, maskl, E, has_mask, halo, tid, topk, key_bits
     )
-    rank = n_less + below
     first = valid & (below == c0)
-    fmask = fx.Uint64(rocdl.ballot(T.i64, first))
-    fl = fmask & less
-    grp = fx.Int32(fx.math.ctpop(fx.Uint32(fl))) + fx.Int32(
-        fx.math.ctpop(fx.Uint32(fl >> fx.Uint64(32)))
-    )
-    n_valid = fx.Int32(fx.math.ctpop(fx.Uint32(vmask))) + fx.Int32(
-        fx.math.ctpop(fx.Uint32(vmask >> fx.Uint64(32)))
-    )
-    n_groups = fx.Int32(fx.math.ctpop(fx.Uint32(fmask))) + fx.Int32(
-        fx.math.ctpop(fx.Uint32(fmask >> fx.Uint64(32)))
-    )
-    in_wave0 = tid < fx.Int32(WAVE)
-    if valid & in_wave0:
+    rank_in = c0
+    for wv in range_constexpr(WAVES):
+        mine = wave == fx.Int32(wv)
+        base = _lds(cnt, e)
+        rank_in = mine.select(base + below, rank_in)
+        if mine & first:
+            _lds_st(cnt, base + count, e)
+        gpu.barrier()
+    # experts -> start, and the group list, from one block scan
+    cs = [_lds(cnt, tid * fx.Int32(ept) + fx.Int32(k)) for k in range_constexpr(ept)]
+    a, b = c0, c0
+    for c in cs:
+        a = a + c
+        b = b + (c > c0).select(c1, c0)
+    acc, gacc, _ = _block_excl_scan2(scan, tid, a, b)
+    for k in range_constexpr(ept):
+        ex = tid * fx.Int32(ept) + fx.Int32(k)
+        _lds_st(start, acc, ex)
+        if cs[k] > c0:
+            loc = (_lds(maskl, ex) - c1) if has_mask else ex
+            _lds_st(lds + fx.Int64(o_ge), loc, gacc)
+            _lds_st(lds + fx.Int64(o_gs), acc, gacc)
+        acc = acc + cs[k]
+        gacc = gacc + (cs[k] > c0).select(c1, c0)
+    if tid == fx.Int32(BLOCK - 1):
+        _lds_st(lds + fx.Int64(o_gs), acc, gacc)
+        _lds_st(lds + fx.Int64(o_meta), acc, c0)
+        _lds_st(lds + fx.Int64(o_meta), gacc, c1)
+    gpu.barrier()
+    if valid:
+        rank = _lds(start, e) + rank_in
         tok = tid // fx.Int32(topk)
         slot = tid - tok * fx.Int32(topk)
         _lds_st(lds + fx.Int64(o_order), tok | (slot << fx.Int32(24)), rank)
         _lds_st(lds + fx.Int64(o_w), w.bitcast(fx.Int32), rank)
-    if first & in_wave0:
-        ex = _lds(local, e) if has_mask else e
-        _lds_st(lds + fx.Int64(o_ge), ex, grp)
-        _lds_st(lds + fx.Int64(o_gs), rank, grp)
-    if tid == c0:
-        _lds_st(lds + fx.Int64(o_gs), n_valid, n_groups)
-        _lds_st(lds + fx.Int64(o_meta), n_valid, c0)
-        _lds_st(lds + fx.Int64(o_meta), n_groups, c1)
     gpu.barrier()
-
-
-def offsets(num_experts):
-    """Word offsets (order, weight, group_expert, group_start, meta, mask,
-    local, scan) in the ``group_routes`` LDS block."""
-    e_cap = -(-num_experts // BLOCK) * BLOCK
-    o_order = 0
-    o_w = o_order + WAVE
-    o_ge = o_w + WAVE
-    o_gs = o_ge + WAVE
-    o_meta = o_gs + WAVE + 1
-    o_mask = o_meta + 2
-    o_local = o_mask + e_cap
-    o_scan = o_local + e_cap
-    return o_order, o_w, o_ge, o_gs, o_meta, o_mask, o_local, o_scan
 
 
 def zero_rows(out, first, stride, tokens, m_cap, row_v4):

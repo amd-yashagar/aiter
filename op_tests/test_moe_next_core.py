@@ -599,6 +599,200 @@ def time_sorts(token, E, topk, mask, model_dim, tile_m=32):
 
 
 @functools.cache
+def _inline_quant_probe(mode, cols, fp8_max):
+    """A direct-kernel prologue: every workgroup quantizes all M rows with
+    the inline block of ``mode`` (``none``: no quant, the kernel alone)."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.kernels.moe_next.core import quant as cq
+
+    @fx.struct
+    class Lds:
+        red: fx.Array[fx.Float32, 8, 16]
+
+    def _iter(t):
+        return fx.get_iter(fx.rocdl.make_buffer_tensor(t, max_size=True))
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def inline_kernel(x: fx.Tensor, q: fx.Tensor, s: fx.Tensor, m: fx.Int32):
+        lds = fx.SharedAllocator().allocate(Lds).peek()
+        xi, qi, si = _iter(x), _iter(q), _iter(s)
+        if mode == "per_token_fp8":
+            for r in range(fx.Int32(0), m, fx.Int32(1)):
+                cq.quant_token_block(
+                    xi, qi, si, lds.red.ptr, fx.Int32(r), m, cols, fp8_max
+                )
+        elif mode == "per_1x128_fp8":
+            groups = m * fx.Int32(cols // 128)
+            for b in range(
+                fx.Int32(0), (groups + fx.Int32(15)) // fx.Int32(16), fx.Int32(1)
+            ):
+                cq.quant_1x128_block(xi, qi, si, fx.Int32(b), groups, fp8_max)
+        elif mode in cq.MX_MODES:
+            units = m * fx.Int32(cq.mx_scale_cols(cols))
+            for b in range(
+                fx.Int32(0), (units + fx.Int32(255)) // fx.Int32(256), fx.Int32(1)
+            ):
+                cq.quant_mx_block(xi, qi, si, fx.Int32(b), m, cols, *cq.MX_MODES[mode])
+
+    @flyc.jit
+    def launch(
+        x: fx.Tensor,
+        q: fx.Tensor,
+        s: fx.Tensor,
+        m: fx.Int32,
+        grid: fx.Int32,
+        stream: fx.Stream = None,
+    ):
+        inline_kernel(x, q, s, m).launch(
+            grid=(grid, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+def _bound_launch(fn, *args):
+    """A call of a compiled launcher on the stream current when it runs."""
+    from aiter.ops.flydsl.moe_next.core.tile_map import _launch
+
+    dev = torch.cuda.current_device()
+
+    def run():
+        _launch(
+            fn, *args, torch.cuda.current_stream(), device=torch.device("cuda", dev)
+        )
+
+    return run
+
+
+def _in_order(*calls):
+    def run():
+        for call in calls:
+            call()
+
+    return run
+
+
+def time_inline_quant(m=8, cols=7168, wgs=(1, 2, 4, 8, 16, 32)):
+    """us per call (graph of 20): a direct kernel of ``wgs`` column-block
+    workgroups that each quantize all M rows inline, against the same kernel
+    without quant plus one separate quant launch (core's standalone launch,
+    and aiter's own quant op)."""
+    from aiter.ops.flydsl.kernels.moe_next.core.quant import (
+        blocks,
+        build_standalone,
+        mx_scale_cols,
+    )
+
+    modes = ["per_token_fp8", "per_1x128_fp8"]
+    if get_gfx_runtime() == "gfx950":
+        modes += ["mx_fp4_round_up", "mx_fp8_round_up"]
+    fp8_max = float(torch.finfo(dtypes.fp8).max)
+    x = torch.randn((m, cols), dtype=dtypes.bf16)
+    none = _inline_quant_probe("none", cols, fp8_max)
+    q8 = torch.empty((m, cols), dtype=torch.uint8)
+    rows = []
+    for mode in modes:
+        if mode.startswith("mx_"):
+            q = torch.empty(
+                (m, cols // 2 if "fp4" in mode else cols), dtype=torch.uint8
+            )
+            s = torch.empty((m, mx_scale_cols(cols)), dtype=torch.int8)
+            ref = functools.partial(
+                aiter.get_hip_quant(QuantType.per_1x32),
+                quant_dtype=dtypes.fp4x2 if "fp4" in mode else dtypes.fp8,
+                scale_type=dtypes.fp8_e8m0,
+            )
+        else:
+            q = q8
+            s = torch.empty(
+                (m, 1 if mode == "per_token_fp8" else cols // 128), dtype=torch.float32
+            )
+            ref = functools.partial(
+                aiter.get_hip_quant(QUANT_TYPES[mode]), quant_dtype=dtypes.fp8
+            )
+        qi, lt = q.view(torch.int32), torch.empty(1, dtype=torch.int32)
+        inline = _inline_quant_probe(mode, cols, fp8_max)
+        alone = build_standalone(mode, cols, fp8_max, False)
+        grid = blocks(mode, m, cols)
+        for c in wgs:
+            kernel = _bound_launch(none, x, qi, s, m, c)
+            t_none = _graph_us(kernel)
+            t_in = _graph_us(_bound_launch(inline, x, qi, s, m, c))
+            t_core = _graph_us(
+                _in_order(
+                    _bound_launch(alone, x, qi, s, lt, m, grid),
+                    kernel,
+                )
+            )
+            t_aiter = _graph_us(_in_order(functools.partial(ref, x), kernel))
+            rows.append(
+                {
+                    "mode": mode,
+                    "M": m,
+                    "K": cols,
+                    "workgroups": c,
+                    "kernel alone us": round(t_none, 2),
+                    "inline us": round(t_in, 2),
+                    "core launch + kernel us": round(t_core, 2),
+                    "aiter quant + kernel us": round(t_aiter, 2),
+                }
+            )
+    return rows
+
+
+QUANT_TIMED = ("per_token_fp8", "per_1x128_fp8", "per_tensor_fp8", "static")
+
+
+def time_sort_quant(token, E, topk, mask, model_dim, tile_m=32):
+    """us per call (20 per graph): the sort with activation quant fused
+    against Opus's sort plus aiter's quant op, both zero-filling an
+    [M, model_dim] bf16 output; per_tensor_fp8 is dynamic, static is
+    per_tensor_fp8 with a given scale."""
+    ti, tw, em = routing(token, E, topk, mask=mask)
+    buf = torch.empty((token, model_dim), dtype=dtypes.bf16)
+    x = torch.randn((token, model_dim), dtype=dtypes.bf16)
+    scale = torch.tensor([0.02], dtype=torch.float32)
+    bf16 = dtypes.bf16
+    rows = []
+    for mode in QUANT_TIMED:
+        qmode = "per_tensor_fp8" if mode == "static" else mode
+        qscale = scale if mode == "static" else None
+        qtype = QUANT_TYPES[qmode]
+
+        def fused(qmode=qmode, qscale=qscale):
+            route_to_tiles(
+                ti,
+                tw,
+                num_experts=E,
+                tile_m=tile_m,
+                expert_mask=em,
+                zero_output=buf,
+                quant_input=x,
+                quant_mode=qmode,
+                quant_scale=qscale,
+            )
+
+        def separate(qtype=qtype, qscale=qscale):
+            _moe_sorting_impl(
+                ti, tw, E, model_dim, bf16, tile_m, em, None, 0, True, output=buf
+            )
+            aiter.get_hip_quant(qtype)(x, scale=qscale, quant_dtype=dtypes.fp8)
+
+        f, sep = _graph_us(fused), _graph_us(separate)
+        rows.append(
+            {
+                "mode": mode,
+                "fused_us": round(f, 2),
+                "opus_plus_quant_us": round(sep, 2),
+                "ratio": round(f / sep, 3),
+            }
+        )
+    return rows
+
+
+@functools.cache
 def _direct_probe(E, topk, has_mask, has_local):
     """A one-workgroup kernel running group_routes and zero_rows, dumping the
     LDS block."""
@@ -677,13 +871,17 @@ def _direct_expected(tm, topk):
 
 def test_direct_grouping():
     """direct.group_routes against the core sort (and Opus where no expert
-    repeats within a token) for M * topk up to 64, with EP masks, -1 ids,
-    num_local_tokens and repeats; zero_rows on bf16 and fp32 outputs."""
+    repeats within a token) for M * topk up to 256 (64, 65, 128 and 256
+    included), with EP masks, -1 ids, num_local_tokens and repeats; zero_rows
+    on bf16 and fp32 outputs."""
     from aiter.ops.flydsl.kernels.moe_next.core.direct import offsets
 
     rows_out = []
     shapes = [(1, 256, 8), (8, 256, 8), (4, 128, 6), (16, 64, 4), (64, 32, 1)]
     shapes += [(7, 385, 9), (3, 513, 5), (2, 16, 2)]
+    # 64, 65, 128 and 256 routes, and decode shapes past one wave
+    shapes += [(13, 128, 5), (65, 64, 1), (8, 512, 11), (16, 512, 11)]
+    shapes += [(8, 896, 16), (16, 256, 8), (32, 256, 8), (128, 64, 2)]
     for token, E, topk in shapes:
         for case in ("random", "mixed", "dup", "pad", "all_empty", "onehot"):
             for mask in (False, True):
@@ -722,10 +920,11 @@ def test_direct_grouping():
                     )
                     kw = {"num_experts": E, "tile_m": 32, "num_local_tokens": nl}
                     kw["expert_mask"] = em
-                    refs = [route_to_tiles(ti, tw, **kw)]
-                    if case != "dup":
-                        refs.append(reference_tile_map(ti, tw, **kw))
-                    for ref in refs:
+                    # Opus collapses a repeated expert racily (bugs found, 2)
+                    refs = [("core sort", route_to_tiles(ti, tw, **kw))]
+                    if case not in ("dup", "pad"):
+                        refs.append(("opus", reference_tile_map(ti, tw, **kw)))
+                    for ref_name, ref in refs:
                         want = _direct_expected(ref, topk)
                         names = ("order", "weight", "group expert", "group start")
                         bad = [
@@ -735,7 +934,7 @@ def test_direct_grouping():
                         ]
                         assert not bad, (
                             f"direct M={token} E={E} topk={topk} {case} "
-                            f"mask={mask} local={local}: {bad}"
+                            f"mask={mask} local={local} vs {ref_name}: {bad}"
                         )
                     rows_out.append(
                         {
@@ -912,10 +1111,27 @@ def main():
     )
     parser.add_argument("--time", action="store_true", help="time the --tier rows")
     parser.add_argument("--block", type=int, default=32)
+    parser.add_argument(
+        "--quant-time",
+        action="store_true",
+        help="time fused sort+quant against Opus sort + aiter quant per --tier row",
+    )
+    parser.add_argument("--out", help="CSV for the --quant-time rows")
+    parser.add_argument(
+        "--inline-quant-time",
+        action="store_true",
+        help="time inline quant in a direct kernel against a separate launch, then exit",
+    )
     args = parser.parse_args()
     gfx = get_gfx_runtime()
     if gfx not in SUPPORTED_GFX:
         aiter.logger.info("skipped: %s not in %s", gfx, SUPPORTED_GFX)
+        return
+    if args.inline_quant_time:
+        aiter.logger.info(
+            "inline quant in a direct kernel:\n%s",
+            pd.DataFrame(time_inline_quant()).to_markdown(index=False),
+        )
         return
     rows = []
     names = ("token", "E", "topk", "tile_m", "case", "mask", "local")
@@ -935,7 +1151,7 @@ def main():
     )
     direct = pd.DataFrame(test_direct_grouping())
     aiter.logger.info(
-        "direct-mode grouping: %d cases exact (M x topk up to 64; EP, -1 ids, "
+        "direct-mode grouping: %d cases exact (M x topk up to 256; EP, -1 ids, "
         "num_local_tokens, repeats)",
         len(direct),
     )
@@ -948,7 +1164,7 @@ def main():
     checks = test_graph_capture() + test_intermediate() + test_mfma_native()
     aiter.logger.info("checks:\n%s", pd.DataFrame(checks).to_markdown(index=False))
     if args.tier:
-        rows = []
+        rows, qrows = [], []
         with open(args.tier) as f:
             tier = list(csv.DictReader(f))
         for r in tier:
@@ -968,8 +1184,13 @@ def main():
             )
             if args.time:
                 row.update(time_sorts(token, E, topk, mask, md, args.block))
+            if args.quant_time:
+                for q in time_sort_quant(token, E, topk, mask, md, args.block):
+                    qrows.append({**row, **q})
             rows.append(row)
         aiter.logger.info("tier rows:\n%s", pd.DataFrame(rows).to_markdown(index=False))
+        if qrows and args.out:
+            pd.DataFrame(qrows).to_csv(args.out, index=False)
 
 
 if __name__ == "__main__":
