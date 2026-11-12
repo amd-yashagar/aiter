@@ -297,19 +297,24 @@ def _build_stage1(
                 for t in range_constexpr(4):
                     acc[j][t].store(zero4)
 
-            a_regs = load_a_tile(0)
-            w_cur = load_w(0)
-            a_sc = load_a_scales(0)
-            store_a_tile(a_regs, 0)
+            # Software pipeline: token tile kt+2 and weights kt+2 are issued while
+            # tile kt computes; tile kt+1's registers go to LDS at the end of kt.
+            a_pend = {0: load_a_tile(0)}
+            if const_expr(KT > 1):
+                a_pend[1] = load_a_tile(1)
+            w_pend = {i: load_w(i) for i in range(min(2, KT))}
+            s_pend = {0: load_a_scales(0)}
+            store_a_tile(a_pend.pop(0), 0)
             gpu.barrier()
             for kt in range_constexpr(KT):
                 slot = kt % 2
-                if const_expr(kt + 1 < KT):
-                    a_regs = load_a_tile(kt + 1)
-                    w_nxt = load_w(kt + 1)
-                if const_expr(kt % 2 == 1 and kt + 1 < KT):
-                    a_sc_nxt = load_a_scales(kt + 1)
-                frags, wsc = w_cur
+                if const_expr(kt + 2 < KT):
+                    a_pend[kt + 2] = load_a_tile(kt + 2)
+                    w_pend[kt + 2] = load_w(kt + 2)
+                    if const_expr(kt % 2 == 0):
+                        s_pend[(kt + 2) // 2] = load_a_scales(kt + 2)
+                frags, wsc = w_pend.pop(kt)
+                a_sc = s_pend[kt // 2]
                 for ks in range_constexpr(2):
                     oa = (2 * kt + ks) % 4
                     for j in range_constexpr(MT):
@@ -326,10 +331,7 @@ def _build_stage1(
                                 scale_b=wsc[q],
                             )
                 if const_expr(kt + 1 < KT):
-                    store_a_tile(a_regs, 1 - slot)
-                    w_cur = w_nxt
-                    if const_expr(kt % 2 == 1):
-                        a_sc = a_sc_nxt
+                    store_a_tile(a_pend.pop(kt + 1), 1 - slot)
                 gpu.barrier()
 
             # Epilogue 1: bias + activation in registers, f32 results to LDS.
