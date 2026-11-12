@@ -209,30 +209,41 @@ def compile_down(
                         return outs
 
                     def flush(SV=SV):
-                        segs = 2 * NBD
+                        if const_expr(ROWS):
+                            segs = 2 * NBD  # 16-byte segments per row
+                        else:
+                            segs = 8 * NBD  # dwords per row: one atomic per lane
                         total = SV * 16 * segs
                         for i in range_constexpr(-(-total // 64)):
                             idx = lane + i * 64
                             row = idx // segs
                             seg = idx % segs
                             row_c = (idx < total).select(row, fx.Int32(0))
-                            v = lds_load_x4(o_lds, o_base + row_c * TR_DW + seg * 4)
                             sid = fx.Int32(ids[r0 + row_c]).bitcast(fx.Uint32)
                             tok = fx.Int32(sid & 0xFFFFFF)
                             slot = fx.Int32(sid >> 24)
-                            ch0 = nb0 * 16 + seg * 8
-                            if (idx < total) & (row_c < real):
-                                if const_expr(ROWS):
+                            ok = (idx < total) & (row_c < real)
+                            if const_expr(ROWS):
+                                v = lds_load_x4(o_lds, o_base + row_c * TR_DW + seg * 4)
+                                ch0 = nb0 * 16 + seg * 8
+                                if ok:
                                     buffer_ops.buffer_store(
                                         v,
                                         o_rs,
                                         ((tok * TOPK + slot) * N + ch0) * 2,
                                         offset_is_bytes=True,
                                     )
-                                else:
+                            else:
+                                v = fx.recast_iter(fx.Int32, o_lds)[
+                                    o_base + row_c * TR_DW + seg
+                                ]
+                                ch0 = nb0 * 16 + seg * 2
+                                if ok:
                                     fxh.atomic_add_bf16(
                                         out_bf16 + (fx.Int64(tok) * N + ch0),
-                                        v.bitcast(fx.BFloat16),
+                                        Vec.from_elements([v], fx.Int32).bitcast(
+                                            fx.BFloat16
+                                        ),
                                     )
 
                     tiles_out = []
