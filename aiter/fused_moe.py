@@ -5538,6 +5538,21 @@ def get_2stage_cfgs(
             ]
         )
     ):
+        if activation == ActivationType.Situv2:
+            # gen_instances.py has no Situv2 activation, so this path would
+            # only fail later in the JIT build of the CK module.
+            raise NotImplementedError(
+                f"ActivationType.Situv2 has no CK 2-stage kernel (token={token}, "
+                f"model_dim={model_dim}, inter_dim={inter_dim}, expert={expert}, "
+                f"topk={topk}, dtype={dtype}, q_dtype_a={q_dtype_a}, "
+                f"q_dtype_w={q_dtype_w}, gate_mode={gate_mode.name}, "
+                f"is_shuffled={is_shuffled}). Situv2 runs on FlyDSL: with "
+                "bf16 activations and separated preshuffled weights (the "
+                "default), or with fp8/fp4 activations "
+                "(AITER_SITUV2_A8W4=1 / AITER_SITUV2_A4W4=1) when the weights "
+                "and shape meet the FlyDSL layout rules (fp8 activations need "
+                "gate_mode=INTERLEAVE weights)."
+            )
         if kernelName2 and kernelName2.startswith("flydsl_"):
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
