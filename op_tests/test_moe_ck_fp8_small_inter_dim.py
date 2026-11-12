@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Regression: CK fp8 2-stage MoE stage2 with inter_dim <= 192 (KPerBlock = 64)
-must match the dequantized reference.
+"""Regression: CK fp8 2-stage MoE with inter_dim <= 192 (KPerBlock = 64) or not a
+multiple of 128 (320, 448) must match the dequantized reference.
+
+For inter_dim 320 and 448 the heuristic picked 128-wide N tiles (stage 1) and
+128-wide K tiles (stage 2) that do not divide the problem, and CK refused it
+("device_gemm ... does not support this GEMM problem").
 
 The 256-thread KPerBlock = 64 fp8 instances used AK1 = BK1 = 8, which does not
 match the 16-byte-per-lane preshuffled B layout, so stage2 returned garbage
@@ -35,6 +39,11 @@ MODEL_DIM, E, TOPK = 1024, 8, 2
         (aiter.QuantType.per_Tensor, 192, 512, 128),
         (aiter.QuantType.per_Tensor, 192, 1024, 256),
         (aiter.QuantType.per_Token, 128, 8, None),
+        (aiter.QuantType.per_Tensor, 320, 8, None),
+        (aiter.QuantType.per_Tensor, 320, 256, 64),
+        (aiter.QuantType.per_Tensor, 320, 512, 128),
+        (aiter.QuantType.per_Tensor, 320, 1024, 256),
+        (aiter.QuantType.per_Tensor, 448, 512, 128),
     ],
 )
 def test_ck_fp8_stage2_small_inter_dim(quant_type, inter_dim, token, block_size_M):
