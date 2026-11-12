@@ -1938,6 +1938,23 @@ def _fused_moe_impl(
             "FlyDSL fallback cannot accept this invocation."
         )
 
+    # Only the MXFP4 stages that take bias1/bias2 apply them. Every other path
+    # dropped the bias and returned the no-bias result.
+    _bias_paths = not metadata.run_1stage and _needs_swiglu_bias_support(
+        dtype, quant_type
+    )
+    for _name, _bias, _applied in (
+        ("bias1", bias1, _bias_paths and metadata.has_bias),
+        ("bias2", bias2, _bias_paths and metadata.stage2_has_bias),
+    ):
+        if _bias is not None and not _applied:
+            raise NotImplementedError(
+                f"{_name} is not applied by this MoE path (quant_type={quant_type}, "
+                f"activation={activation}, q_dtype_a={q_dtype_a}, q_dtype_w={q_dtype_w}, "
+                f"dtype={dtype}, 1-stage={bool(metadata.run_1stage)}); the call would "
+                "return the result without the bias."
+            )
+
     if (
         _enforce_metadata_block_size
         and block_size_M is not None
