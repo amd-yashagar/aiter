@@ -122,12 +122,29 @@ def compile_down(*, N, K, TOPK, S_MAX, NBD=4, WAVES=4, PWD=2, ROWS=True, W_CACHE
                         slots.append(fx.Int32(sid >> 24))
                         facs.append(rws[r])
                         oks.append(s * 16 + c < real)
+                    scs = [
+                        Vec(
+                            buffer_ops.buffer_load(
+                                s_rs, e * N + (nb0 + b) * 16 + q * 4, vec_width=4
+                            )
+                        )
+                        for b in range_constexpr(NBD)
+                    ]
                     w_sets = []
                     for p in range_constexpr(PWD):
                         w_sets += load_w(fx.Int32(p))
                     gpu.barrier()
 
-                    def block(b, wv, SV=SV, toks=toks, slots=slots, facs=facs, oks=oks):
+                    def block(
+                        b,
+                        wv,
+                        SV=SV,
+                        toks=toks,
+                        slots=slots,
+                        facs=facs,
+                        oks=oks,
+                        scs=scs,
+                    ):
                         acc = [Vec.filled(4, 0.0, fx.Float32)] * SV
                         for st in range_constexpr(KSTEPS):
                             bw = []
@@ -144,7 +161,7 @@ def compile_down(*, N, K, TOPK, S_MAX, NBD=4, WAVES=4, PWD=2, ROWS=True, W_CACHE
                                 for s in range_constexpr(SV):
                                     acc[s] = mfma(wb, bf16_pair(bw[s], j), acc[s])
                         ch = (nb0 + b) * 16 + q * 4
-                        sc = Vec(buffer_ops.buffer_load(s_rs, e * N + ch, vec_width=4))
+                        sc = scs[b]
                         for s in range_constexpr(SV):
                             y = [
                                 acc[s][i] * sc[i] * facs[s] for i in range_constexpr(4)
@@ -165,15 +182,10 @@ def compile_down(*, N, K, TOPK, S_MAX, NBD=4, WAVES=4, PWD=2, ROWS=True, W_CACHE
                                         out_bf16 + (fx.Int64(toks[s]) * N + ch), yb
                                     )
 
-                    init = w_sets
-                    results = init
-                    for iv, state in range(0, NBD, 1, init=init):
-                        w_c = [Vec(v) for v in state]
-                        b = fx.Int32(iv)
-                        w_n = load_w(b + PWD)
-                        block(b, w_c[:KSTEPS])
-                        results = yield w_c[KSTEPS:] + w_n
-                    _ = results
+                    for b in range_constexpr(NBD):
+                        if const_expr(b + PWD < NBD):
+                            w_sets += load_w(fx.Int32(b + PWD))
+                        block(b, w_sets[b * KSTEPS : (b + 1) * KSTEPS])
 
     @flyc.jit
     def launch(
