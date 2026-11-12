@@ -29,6 +29,9 @@ from flydsl.expr.typing import Vector as Vec
 
 from . import helpers as fxh
 
+# keep fp32 folds as VOP2: v_pk_fma_f32 does not issue under an MFMA (lag-scale-fold-behind-mfma)
+_NO_PACKED_F32 = {"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]}
+
 COMBINES = ("atomic_bf16", "atomic_f32", "rows_f32")
 _BUF_COPY = {
     32: fx.rocdl.BufferCopy32b,
@@ -460,6 +463,7 @@ def _build_stage2(
             arg_num_valid_ids,
             i32_tokens,
             i32_rows,
+            value_attrs=_NO_PACKED_F32,
         ).launch(
             grid=(N // BN, fx.Int64(i32_tiles), 1), block=(256, 1, 1), stream=stream
         )
