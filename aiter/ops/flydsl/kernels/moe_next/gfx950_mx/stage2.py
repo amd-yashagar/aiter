@@ -3,15 +3,17 @@
 
 """gfx950 MX MoE stage 2: down GEMM, route weight and combine.
 
-One workgroup (4 waves) owns a sorted tile of BM rows and BN = 256 output channels
-(64 per wave). The intermediate is stage 1's output: contiguous sorted rows staged in
-LDS one 128-K step ahead, scales in the mfma_native order. W2 is MFMA operand B
-straight from aiter's preshuffled layout, its e8m0 scales as e8m0_shuffle.
+One workgroup (4 waves) owns a sorted tile of BM rows and NBW blocks of 256 output
+channels (64 per wave per block). The intermediate tile (stage 1's output: contiguous
+sorted rows, scales in the mfma_native order) is staged in LDS once and reused for
+every channel block; W2 streams straight to VGPRs from aiter's preshuffled layout,
+one block ahead. W2 is MFMA operand A (channels on M) and the intermediate operand
+B, so each lane ends with four consecutive channels of one route row.
 
-Epilogue: route weight in fp32 (unless doweight_stage1), bf16, then pk-bf16 buffer
-atomics into out[token] (zeroed by the sort), skipping padding rows; or with
-reduce=True a plain store of each route row into out[token * topk + slot] for a
-separate reduce.
+Epilogue: route weight in fp32 (unless doweight_stage1), bf16, then either 8-byte
+stores of each route row into out[token * topk + slot] (reduce=True, for a separate
+fp32 reduce) or pk-bf16 buffer atomics into out[token] (zeroed by the sort).
+Padding rows are skipped.
 """
 
 import functools
@@ -28,6 +30,16 @@ from . import common as cm
 from .stage1 import _scale_atoms
 
 
+def blocks_per_wg(model_dim, m_tiles, cu_num=256):
+    """Channel blocks one workgroup loops over: the largest of 7, 4, 2, 1 that
+    divides model_dim / 256 and still leaves two workgroups per CU."""
+    nb = model_dim // 256
+    for c in (7, 4, 2, 1):
+        if nb % c == 0 and (nb // c) * m_tiles >= 2 * cu_num:
+            return c
+    return 1
+
+
 def _build_stage2(
     *,
     model_dim,
@@ -39,12 +51,14 @@ def _build_stage2(
     doweight_stage1,
     reduce,
     topk,
+    blocks=1,
 ):
     D = int(model_dim)
     INTER = int(inter_dim)
     BM = int(tile_m)
     BN = 256
-    assert D % BN == 0, f"model_dim={D} must be a multiple of {BN}"
+    NBW = int(blocks)
+    assert D % (BN * NBW) == 0, f"model_dim={D} must be a multiple of {BN * NBW}"
     assert INTER % 128 == 0, f"inter_dim={INTER} must be a multiple of 128"
     assert BM in (16, 32, 64, 128)
     KS = INTER // 128
@@ -63,11 +77,13 @@ def _build_stage2(
     A_NDW = 8 if a_f8 else 4
     GP8 = cm.pad_up(INTER // 32, 8)
     a_lds_bytes = BM * TRB
-    c_stride = BN * 2 + 16
-    c_bytes = BM * c_stride
-    # Whole-K preload (every A step in LDS, every W step in VGPRs) when it fits.
-    PRE = KS <= 8 and KS * a_lds_bytes <= 96 * 1024
-    lds_bytes = max((KS if PRE else 2) * a_lds_bytes, c_bytes)
+    # The whole intermediate tile stays in LDS when it fits; else a 2-slot K ring
+    # (then one channel block per workgroup).
+    PRE = KS * a_lds_bytes <= 96 * 1024
+    assert PRE or NBW == 1, "channel-block persistence needs the whole K in LDS"
+    lds_bytes = (KS if PRE else 2) * a_lds_bytes
+    # Prefetch the next block's W2 while this one computes, when registers allow.
+    W_AHEAD = 4 * KS * W_NDW <= 64
 
     @fx.struct
     class SharedStorage:
@@ -89,7 +105,7 @@ def _build_stage2(
         tid = fx.Int32(gpu.thread_id("x"))
         lane = tid % fx.Int32(64)
         wave = fx.Int32(rocdl.readfirstlane(T.i32, cm._raw(tid // fx.Int32(64))))
-        nblk = fx.Int32(gpu.block_id("x"))
+        ngrp = fx.Int32(gpu.block_id("x"))
         mblk = fx.Int32(gpu.block_id("y"))
         m_row = mblk * fx.Int32(BM)
         nvalid = cm.global_ptr(arg_nvalid, T.i32)[0]
@@ -160,22 +176,18 @@ def _build_stage2(
                 f.store(lo)
                 return f
 
-            p0 = nblk * fx.Int32(BN // 16) + wave * fx.Int32(4)
-            w_base = [
-                fx.Int64(e * fx.Int32(D // 16) + p0 + fx.Int32(t))
-                * fx.Int64(W_TILE_BYTES)
-                for t in range_constexpr(4)
-            ]
-            w_pairs = [
-                e * fx.Int32(D // 32) + p0 // fx.Int32(2) + fx.Int32(q)
-                for q in range_constexpr(2)
-            ]
+            def w_tile0(b):
+                return (ngrp * fx.Int32(NBW) + fx.Int32(b)) * fx.Int32(
+                    BN // 16
+                ) + wave * fx.Int32(4)
 
-            def load_w(ks):
+            def load_w(b, ks):
+                p0 = w_tile0(b)
                 frags = []
                 for t in range_constexpr(4):
                     off = (
-                        w_base[t]
+                        fx.Int64(e * fx.Int32(D // 16) + p0 + fx.Int32(t))
+                        * fx.Int64(W_TILE_BYTES)
                         + fx.Int64(ks * W_KSTEP)
                         + fx.Int64(lane * fx.Int32(16))
                     )
@@ -190,11 +202,15 @@ def _build_stage2(
                     frags.append(f)
                 return frags
 
-            def load_w_scales(kp):
+            def load_w_scales(b, kp):
+                p0 = w_tile0(b)
                 return [
                     cm.global_vec_load(
                         arg_ws,
-                        fx.Int64(w_pairs[q]) * fx.Int64(GP8 * 32)
+                        fx.Int64(
+                            e * fx.Int32(D // 32) + p0 // fx.Int32(2) + fx.Int32(q)
+                        )
+                        * fx.Int64(GP8 * 32)
                         + fx.Int64(kp * 256)
                         + fx.Int64(lane * fx.Int32(4)),
                         1,
@@ -202,130 +218,47 @@ def _build_stage2(
                     for q in range_constexpr(2)
                 ]
 
+            def load_block(b):
+                return (
+                    [load_w(b, ks) for ks in range(KS)],
+                    [load_w_scales(b, kp) for kp in range((KS + 1) // 2)],
+                )
+
+            # Intermediate scales: one dword per 16-row tile and K pair, its row
+            # parity shifted down so the MFMA opsel stays static.
             def load_a_scales(kp):
                 out = []
                 for j in range_constexpr(MT):
                     r0 = m_row + fx.Int32(j * 16)
+                    v = cm.global_vec_load(
+                        arg_as,
+                        fx.Int64(r0 // fx.Int32(32)) * fx.Int64(GP8 * 32)
+                        + fx.Int64(kp * 256)
+                        + fx.Int64(lane * fx.Int32(4)),
+                        1,
+                    )
                     out.append(
-                        cm.global_vec_load(
-                            arg_as,
-                            fx.Int64(r0 // fx.Int32(32)) * fx.Int64(GP8 * 32)
-                            + fx.Int64(kp * 256)
-                            + fx.Int64(lane * fx.Int32(4)),
-                            1,
-                        )
+                        v.shrui(((r0 // fx.Int32(16)) & fx.Int32(1)) * fx.Int32(8))
                     )
                 return out
 
-            a_half = [
-                ((m_row + fx.Int32(j * 16)) // fx.Int32(16)) & fx.Int32(1)
-                for j in range_constexpr(MT)
-            ]
+            # Route rows of this lane (one per token tile): token, slot, weight.
+            stids = cm.global_ptr(arg_stids, T.i32)
+            swp = cm.global_ptr(arg_sw, T.f32)
+            row_tok, row_slot, row_w = [], [], []
+            for j in range_constexpr(MT):
+                packed = stids[m_row + fx.Int32(j * 16) + lane16]
+                row_tok.append(packed & fx.Int32(0xFFFFFF))
+                row_slot.append(packed.shrui(fx.Int32(24)))
+                if const_expr(not doweight_stage1):
+                    row_w.append(swp[m_row + fx.Int32(j * 16) + lane16])
 
-            atoms = _scale_atoms(a_dtype, w_dtype)
+            atoms = _scale_atoms(w_dtype, a_dtype)
             zero4 = fx.full(4, 0.0, fx.Float32)
             acc = [
                 [fx.make_rmem_tensor(4, fx.Float32) for _ in range_constexpr(4)]
                 for _ in range_constexpr(MT)
             ]
-            for j in range_constexpr(MT):
-                for t in range_constexpr(4):
-                    acc[j][t].store(zero4)
-
-            if const_expr(PRE):
-                a_all = [load_a(ks) for ks in range(KS)]
-                w_all = [load_w(ks) for ks in range(KS)]
-                ws_all = [load_w_scales(kp) for kp in range((KS + 1) // 2)]
-                as_all = [load_a_scales(kp) for kp in range((KS + 1) // 2)]
-                for ks in range_constexpr(KS):
-                    store_a(a_all[ks], ks)
-                gpu.barrier()
-                for ks in range_constexpr(KS):
-                    slot = ks
-                    w_cur = w_all[ks]
-                    ws = ws_all[ks // 2]
-                    as_ = as_all[ks // 2]
-                    for j in range_constexpr(MT):
-                        af = read_a(slot, j)
-                        # Scale bytes are [k step parity][16-row tile parity]; the A tile
-                        # parity is shifted down so opsel stays static.
-                        sa = as_[j].shrui(a_half[j] * fx.Int32(8))
-                        for t in range_constexpr(4):
-                            fx.gemm(
-                                atoms[((ks % 2) * 2, (ks % 2) * 2 + t % 2)],
-                                acc[j][t],
-                                af,
-                                w_cur[t],
-                                acc[j][t],
-                                scale_a=sa,
-                                scale_b=ws[t // 2],
-                            )
-                gpu.barrier()
-            else:
-                a_regs = load_a(0)
-                w_cur = load_w(0)
-                ws = load_w_scales(0)
-                as_ = load_a_scales(0)
-                store_a(a_regs, 0)
-                gpu.barrier()
-                for ks in range_constexpr(KS):
-                    slot = ks % 2
-                    if const_expr(ks + 1 < KS):
-                        a_regs = load_a(ks + 1)
-                        w_nxt = load_w(ks + 1)
-                    if const_expr(ks % 2 == 1 and ks + 1 < KS):
-                        ws_nxt = load_w_scales((ks + 1) // 2)
-                        as_nxt = load_a_scales((ks + 1) // 2)
-                    for j in range_constexpr(MT):
-                        af = read_a(slot, j)
-                        # Scale bytes are [k step parity][16-row tile parity]; the A tile
-                        # parity is shifted down so opsel stays static.
-                        sa = as_[j].shrui(a_half[j] * fx.Int32(8))
-                        for t in range_constexpr(4):
-                            fx.gemm(
-                                atoms[((ks % 2) * 2, (ks % 2) * 2 + t % 2)],
-                                acc[j][t],
-                                af,
-                                w_cur[t],
-                                acc[j][t],
-                                scale_a=sa,
-                                scale_b=ws[t // 2],
-                            )
-                    if const_expr(ks + 1 < KS):
-                        store_a(a_regs, 1 - slot)
-                        w_cur = w_nxt
-                        if const_expr(ks % 2 == 1):
-                            ws = ws_nxt
-                            as_ = as_nxt
-                    gpu.barrier()
-
-            # Epilogue: weight, bf16, transpose through LDS.
-            for j in range_constexpr(MT):
-                rows = [
-                    fx.Int32(j * 16) + lgrp * fx.Int32(4) + fx.Int32(i)
-                    for i in range_constexpr(4)
-                ]
-                if const_expr(not doweight_stage1):
-                    swp = cm.global_ptr(arg_sw, T.f32)
-                    wts = [swp[m_row + r] for r in rows]
-                for t in range_constexpr(4):
-                    v = Vec(acc[j][t].load())
-                    col = wave * fx.Int32(64) + fx.Int32(t * 16) + lane16
-                    for i in range_constexpr(4):
-                        x = v[i]
-                        if const_expr(not doweight_stage1):
-                            x = x * wts[i]
-                        off = rows[i] * fx.Int32(c_stride) + col * fx.Int32(2)
-                        fx.ptr_store(
-                            x.to(BFloat16),
-                            lds_typed_ptr(lds_base, T.bf16, align=2, byte_offset=off),
-                        )
-            gpu.barrier()
-
-            # 16 B (8 channels) per thread: 32 threads per row, 8 rows per pass.
-            seg = tid % fx.Int32(32)
-            prow = tid // fx.Int32(32)
-            stids = cm.global_ptr(arg_stids, T.i32)
             out_view = fx.Tensor(
                 fx.make_view(
                     cm.global_ptr(arg_out, T.bf16, 4),
@@ -334,48 +267,110 @@ def _build_stage2(
             )
             out_buf = fx.rocdl.make_buffer_tensor(out_view, max_size=True)
             atomic = fx.make_copy_atom(fx.rocdl.BufferAtomicPkAdd(BFloat16), BFloat16)
-            for p in range_constexpr(BM // 8):
-                r = prow + fx.Int32(8 * p)
-                packed = stids[m_row + r]
-                tok = packed & fx.Int32(0xFFFFFF)
-                slot_id = packed.shrui(fx.Int32(24))
-                v8 = Vec(
-                    lds_vec_load(
-                        lds_base,
-                        r * fx.Int32(c_stride) + seg * fx.Int32(16),
-                        Vec.make_type(4, fx.Int32),
-                        fx.Int32,
-                        align=16,
-                    )
-                )
-                col = nblk * fx.Int32(BN) + seg * fx.Int32(8)
+
+            def mfma_step(slot, ks, wf, ws, as_):
+                for j in range_constexpr(MT):
+                    bf = read_a(slot, j)
+                    for t in range_constexpr(4):
+                        fx.gemm(
+                            atoms[((ks % 2) * 2 + t % 2, (ks % 2) * 2)],
+                            acc[j][t],
+                            wf[t],
+                            bf,
+                            acc[j][t],
+                            scale_a=ws[t // 2],
+                            scale_b=as_[j],
+                        )
+
+            @flyc.jit
+            def store_if_valid(tok, slot_id, ch, pk):
                 if tok < i32_tokens:
                     if const_expr(reduce):
                         cm.global_vec_store(
-                            v8,
+                            pk,
                             arg_out,
                             (
                                 fx.Int64(tok * fx.Int32(topk) + slot_id) * fx.Int64(D)
-                                + fx.Int64(col)
+                                + fx.Int64(ch)
                             )
                             * fx.Int64(2),
-                            4,
+                            2,
                         )
                     else:
-                        for h in range_constexpr(4):
+                        for h in range_constexpr(2):
                             frag = fx.make_rmem_tensor(2, BFloat16)
                             frag.store(
-                                fx.Vector.from_elements([v8[h]], fx.Int32).bitcast(
-                                    BFloat16
-                                )
+                                Vec.from_elements([pk[h]], fx.Int32).bitcast(BFloat16)
                             )
                             fx.copy(
                                 atomic,
                                 frag,
-                                out_buf[
-                                    None, tok * fx.Int32(D) + col + fx.Int32(2 * h)
-                                ],
+                                out_buf[None, tok * fx.Int32(D) + ch + fx.Int32(2 * h)],
                             )
+
+            def epilogue(b):
+                ch0 = w_tile0(b) * fx.Int32(16) + lgrp * fx.Int32(4)
+                for j in range_constexpr(MT):
+                    for t in range_constexpr(4):
+                        v = Vec(acc[j][t].load())
+                        vals = [v[i] for i in range(4)]
+                        if const_expr(not doweight_stage1):
+                            vals = [x * row_w[j] for x in vals]
+                        pk = Vec.from_elements(vals, fx.Float32).to(BFloat16)
+                        store_if_valid(
+                            row_tok[j],
+                            row_slot[j],
+                            ch0 + fx.Int32(t * 16),
+                            pk.bitcast(fx.Int32),
+                        )
+
+            if const_expr(PRE):
+                a_all = [load_a(ks) for ks in range(KS)]
+                as_all = [load_a_scales(kp) for kp in range((KS + 1) // 2)]
+                cur = load_block(0)
+                for ks in range_constexpr(KS):
+                    store_a(a_all[ks], ks)
+                gpu.barrier()
+                for b in range_constexpr(NBW):
+                    nxt = None
+                    if const_expr(W_AHEAD and b + 1 < NBW):
+                        nxt = load_block(b + 1)
+                    for j in range_constexpr(MT):
+                        for t in range_constexpr(4):
+                            acc[j][t].store(zero4)
+                    wfs, wss = cur
+                    for ks in range_constexpr(KS):
+                        mfma_step(ks, ks, wfs[ks], wss[ks // 2], as_all[ks // 2])
+                    epilogue(b)
+                    if const_expr(b + 1 < NBW):
+                        cur = nxt if const_expr(W_AHEAD) else load_block(b + 1)
+            else:
+                for j in range_constexpr(MT):
+                    for t in range_constexpr(4):
+                        acc[j][t].store(zero4)
+                a_regs = load_a(0)
+                w_cur = load_w(0, 0)
+                ws = load_w_scales(0, 0)
+                as_ = load_a_scales(0)
+                store_a(a_regs, 0)
+                gpu.barrier()
+                for ks in range_constexpr(KS):
+                    slot = ks % 2
+                    if const_expr(ks + 1 < KS):
+                        a_regs = load_a(ks + 1)
+                        w_nxt = load_w(0, ks + 1)
+                    if const_expr(ks % 2 == 1 and ks + 1 < KS):
+                        ws_nxt = load_w_scales(0, (ks + 1) // 2)
+                        as_nxt = load_a_scales((ks + 1) // 2)
+                    mfma_step(slot, ks, w_cur, ws, as_)
+                    if const_expr(ks + 1 < KS):
+                        store_a(a_regs, 1 - slot)
+                        w_cur = w_nxt
+                        if const_expr(ks % 2 == 1):
+                            ws = ws_nxt
+                            as_ = as_nxt
+                    gpu.barrier()
+                epilogue(0)
 
     @flyc.jit
     def launch_mx_stage2(
@@ -404,7 +399,9 @@ def _build_stage2(
             arg_nvalid,
             i32_tokens,
         ).launch(
-            grid=(D // BN, fx.Int64(i32_m_blocks), 1), block=(256, 1, 1), stream=stream
+            grid=(D // (BN * NBW), fx.Int64(i32_m_blocks), 1),
+            block=(256, 1, 1),
+            stream=stream,
         )
 
     return launch_mx_stage2

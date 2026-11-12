@@ -11,6 +11,7 @@ as e8m0_shuffle / shuffle_scale_a16w4; gate/up separated or 16-row interleaved
 (gate_mode). The activation dtype is the one fused_moe itself resolves.
 """
 
+import os
 from typing import ClassVar
 
 import torch
@@ -52,11 +53,12 @@ def activation_dtype(spec, weights, w1, m, hidden_dtype, has_a1_scale):
 
 
 def parse_config(config):
-    """'bm128_tn64_la4' -> {"bm": 128, "tn": 64, "la": 4}; empty means defaults."""
+    """'bm128_tn64_la4_nb7' -> {"bm": 128, "tn": 64, "la": 4, "nb": 7}; empty
+    means defaults."""
     out = {}
     for tok in (config or "").split("_"):
         key = tok.rstrip("0123456789")
-        if key in ("bm", "tn", "la") and tok[len(key) :]:
+        if key in ("bm", "tn", "la", "nb", "ra") and tok[len(key) :]:
             out[key] = int(tok[len(key) :])
     return out
 
@@ -139,6 +141,7 @@ class _MxGfx950(MoeKernel):
         )
         from aiter.ops.flydsl.kernels.moe_next.gfx950_mx.stage1 import compile_stage1
         from aiter.ops.flydsl.kernels.moe_next.gfx950_mx.stage2 import (
+            blocks_per_wg,
             compile_reduce,
             compile_stage2,
         )
@@ -148,7 +151,13 @@ class _MxGfx950(MoeKernel):
         cfg = parse_config(config)
         bm = cfg.get("bm") or tile_m_for(m, topk, spec.experts, self.prefill)
         tn = cfg.get("tn") or (128 if self.prefill else 64)
-        la = cfg.get("la") or (2 if self.prefill else 4)
+        la = cfg.get("la") or (
+            (3 if self.prefill else 4) if spec.w_dtype != dtypes.fp8 else 2
+        )
+        routes = m * topk
+        per_expert = -(-routes // spec.experts)
+        live = min(spec.experts, routes) * -(-per_expert // bm)
+        nb = cfg.get("nb") or blocks_per_wg(spec.model_dim, live)
         reduce = self.epilogue == "reduce"
         beta = weights.kwarg("beta", 1.0)
         lbeta = weights.kwarg("linear_beta", 1.0)
@@ -170,6 +179,7 @@ class _MxGfx950(MoeKernel):
             round_bf16=False,
             tile_n=tn,
             ahead=la,
+            read_ahead=cfg.get("ra", 1),
         )
         s2 = compile_stage2(
             model_dim=spec.model_dim,
@@ -181,6 +191,7 @@ class _MxGfx950(MoeKernel):
             doweight_stage1=False,
             reduce=reduce,
             topk=topk,
+            blocks=nb,
         )
         r = compile_reduce(model_dim=spec.model_dim, topk=topk) if reduce else None
         return bm, a, q, s1, s2, r
@@ -207,6 +218,7 @@ class _MxGfx950(MoeKernel):
     def __call__(self, call: MoeCall) -> torch.Tensor:
         import flydsl.expr as fx
 
+        from aiter.fused_moe import moe_sorting
         from aiter.ops.flydsl.kernels.moe_next.gfx950_mx import common as cm
         from aiter.ops.flydsl.kernels.moe_next.gfx950_mx.quant import (
             token_quant_blocks,
@@ -224,22 +236,35 @@ class _MxGfx950(MoeKernel):
         )
         dev = x.device
         out = call.output
-        if out is None:
-            out = torch.empty((M, D), dtype=torch.bfloat16, device=dev)
-        tm = route_to_tiles(
-            call.topk_ids,
-            call.topk_weight,
-            num_experts=E,
-            tile_m=bm,
-            zero_output=None if r is not None else out,
-        )
-        sids, sw, se, nv = (
-            tm.sorted_token_ids,
-            tm.sorted_weights,
-            tm.sorted_expert_ids,
-            tm.num_valid_ids,
-        )
-        rows, mblocks = tm.rows, tm.max_tiles
+        if os.environ.get("AITER_MOE_MX_SORT", "opus") == "core":
+            if out is None:
+                out = torch.empty((M, D), dtype=torch.bfloat16, device=dev)
+            tm = route_to_tiles(
+                call.topk_ids,
+                call.topk_weight,
+                num_experts=E,
+                tile_m=bm,
+                zero_output=None if r is not None else out,
+            )
+            sids, sw, se, nv = (
+                tm.sorted_token_ids,
+                tm.sorted_weights,
+                tm.sorted_expert_ids,
+                tm.num_valid_ids,
+            )
+        else:
+            # aiter's Opus sort: faster than core's at every measured M today
+            # (DSV4-Pro M=4096: 27 vs 39 us; M=8: 7.4 vs 12.6 us).
+            sids, sw, se, nv, out = moe_sorting(
+                call.topk_ids,
+                call.topk_weight,
+                E,
+                D,
+                torch.bfloat16,
+                block_size=bm,
+                output=out,
+            )
+        rows, mblocks = sids.numel(), se.numel()
         stream = fx.Stream(torch.cuda.current_stream(dev))
         aq = torch.empty(
             (M, D // 2 if a == "fp4" else D), dtype=torch.uint8, device=dev
