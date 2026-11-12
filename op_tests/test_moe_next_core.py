@@ -6,6 +6,7 @@ Opus, with its zero-fill), graph capture, timing, and the intermediate layout.""
 
 import argparse
 import csv
+import functools
 
 import pandas as pd
 import torch
@@ -597,6 +598,159 @@ def time_sorts(token, E, topk, mask, model_dim, tile_m=32):
     return ret
 
 
+@functools.cache
+def _direct_probe(E, topk, has_mask, has_local):
+    """A one-workgroup kernel running group_routes and zero_rows, dumping the
+    LDS block."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.kernels.moe_next.core.direct import (
+        group_routes,
+        lds_words,
+        zero_rows,
+    )
+
+    words = -(-lds_words(E) // 256) * 256
+
+    @fx.struct
+    class Lds:
+        w: fx.Array[fx.Int32, words, 16]
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def probe(
+        ids: fx.Tensor,
+        weights: fx.Tensor,
+        mask: fx.Tensor,
+        ltok: fx.Tensor,
+        dump: fx.Tensor,
+        zout: fx.Tensor,
+        m_cap: fx.Int32,
+        row_v4: fx.Int32,
+    ):
+        lds = fx.SharedAllocator().allocate(Lds).peek()
+        group_routes(
+            lds.w.ptr, ids, weights, mask, ltok, m_cap, E, topk, has_mask, has_local
+        )
+        tid = fx.gpu.thread_idx.x
+        it = fx.get_iter(fx.rocdl.make_buffer_tensor(dump, max_size=True))
+        for k in fx.range_constexpr(0, words, 256):
+            idx = fx.Int32(k) + tid
+            fx.ptr_store(fx.ptr_load(lds.w.ptr + fx.Int64(idx)), it + fx.Int64(idx))
+        tokens = m_cap
+        if has_local:
+            lt = fx.get_iter(fx.rocdl.make_buffer_tensor(ltok, max_size=True))
+            tokens = fx.ptr_load(lt)
+        zero_rows(zout, tid, fx.Int32(256), tokens, m_cap, row_v4)
+
+    @flyc.jit
+    def launch(
+        ids: fx.Tensor,
+        weights: fx.Tensor,
+        mask: fx.Tensor,
+        ltok: fx.Tensor,
+        dump: fx.Tensor,
+        zout: fx.Tensor,
+        m_cap: fx.Int32,
+        row_v4: fx.Int32,
+        stream: fx.Stream = None,
+    ):
+        probe(ids, weights, mask, ltok, dump, zout, m_cap, row_v4).launch(
+            grid=(1, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    return launch, words
+
+
+def _direct_expected(tm, topk):
+    """(order, weight bits, group experts, group starts) from a tile map."""
+    nv = int(tm.num_valid_ids[0])
+    sid = tm.sorted_token_ids[:nv].cpu()
+    sw = tm.sorted_weights[:nv].cpu().view(torch.int32)
+    eid = tm.sorted_expert_ids.cpu()[torch.arange(nv, device="cpu") // tm.tile_m]
+    real = (sid >> 24) < topk
+    order, wts, ex = sid[real], sw[real], eid[real]
+    starts = [i for i in range(len(ex)) if i == 0 or ex[i] != ex[i - 1]]
+    starts_t = torch.tensor(starts + [len(ex)], dtype=torch.int32, device="cpu")
+    return order, wts, ex[starts], starts_t
+
+
+def test_direct_grouping():
+    """direct.group_routes against the core sort (and Opus where no expert
+    repeats within a token) for M * topk up to 64, with EP masks, -1 ids,
+    num_local_tokens and repeats; zero_rows on bf16 and fp32 outputs."""
+    from aiter.ops.flydsl.kernels.moe_next.core.direct import offsets
+
+    rows_out = []
+    shapes = [(1, 256, 8), (8, 256, 8), (4, 128, 6), (16, 64, 4), (64, 32, 1)]
+    shapes += [(7, 385, 9), (3, 513, 5), (2, 16, 2)]
+    for token, E, topk in shapes:
+        for case in ("random", "mixed", "dup", "pad", "all_empty", "onehot"):
+            for mask in (False, True):
+                for local in (None, max(0, token - 2)):
+                    ti, tw, em = routing(token, E, topk, case, mask)
+                    nl = (
+                        None
+                        if local is None
+                        else torch.tensor([local], dtype=torch.int32)
+                    )
+                    launch, words = _direct_probe(E, topk, mask, local is not None)
+                    dump = torch.empty(words, dtype=torch.int32)
+                    for dt in (dtypes.bf16, torch.float32):
+                        zout = torch.full((token, 72), 7.0, dtype=dt)
+                        row_v4 = zout.nbytes // token // 16
+                        launch(
+                            ti,
+                            tw,
+                            em if mask else ti,
+                            nl if nl is not None else ti,
+                            dump,
+                            zout.view(torch.int32),
+                            token,
+                            row_v4,
+                        )
+                        rows = token if local is None else local
+                        assert (zout[:rows] == 0).all() and (zout[rows:] == 7).all()
+                    o_order, o_w, o_ge, o_gs, o_meta = offsets(E)[:5]
+                    d = dump.cpu()
+                    n_valid, n_groups = int(d[o_meta]), int(d[o_meta + 1])
+                    got = (
+                        d[o_order : o_order + n_valid],
+                        d[o_w : o_w + n_valid],
+                        d[o_ge : o_ge + n_groups],
+                        d[o_gs : o_gs + n_groups + 1],
+                    )
+                    kw = {"num_experts": E, "tile_m": 32, "num_local_tokens": nl}
+                    kw["expert_mask"] = em
+                    refs = [route_to_tiles(ti, tw, **kw)]
+                    if case != "dup":
+                        refs.append(reference_tile_map(ti, tw, **kw))
+                    for ref in refs:
+                        want = _direct_expected(ref, topk)
+                        names = ("order", "weight", "group expert", "group start")
+                        bad = [
+                            n
+                            for n, a, b in zip(names, got, want)
+                            if not torch.equal(a, b)
+                        ]
+                        assert not bad, (
+                            f"direct M={token} E={E} topk={topk} {case} "
+                            f"mask={mask} local={local}: {bad}"
+                        )
+                    rows_out.append(
+                        {
+                            "token": token,
+                            "E": E,
+                            "topk": topk,
+                            "case": case,
+                            "mask": mask,
+                            "local": local,
+                            "exact": True,
+                        }
+                    )
+    return rows_out
+
+
 def _offsets_on_device(rows, groups, gp8):
     """scale_offset_mfma evaluated by a kernel for every (row, group)."""
     import flydsl.compiler as flyc
@@ -778,6 +932,12 @@ def main():
     aiter.logger.info(
         "dynamic per-tensor:\n%s",
         pd.DataFrame(test_dynamic_tensor()).to_markdown(index=False),
+    )
+    direct = pd.DataFrame(test_direct_grouping())
+    aiter.logger.info(
+        "direct-mode grouping: %d cases exact (M x topk up to 64; EP, -1 ids, "
+        "num_local_tokens, repeats)",
+        len(direct),
     )
     aiter.logger.info(
         "MX addressing:\n%s", pd.DataFrame(test_mx_index()).to_markdown(index=False)
