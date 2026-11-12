@@ -55,6 +55,7 @@ class _Tile:
     nbd: int
     waves: int
     pwd: int
+    coalesce: bool
 
 
 def _tile(config, gpu, model_dim, inter_dim):
@@ -74,7 +75,10 @@ def _tile(config, gpu, model_dim, inter_dim):
     pw, pa = int(cfg.get("gateup_pw", 2)), int(cfg.get("gateup_pa", 2))
     w_cache = int(cfg.get("w_cache", 2))
     pwd = int(cfg.get("down_pw", 2))
-    return _Tile(int(cfg.get("tile_m", 64)), gw, ch, pw, pa, w_cache, nbd, waves, pwd)
+    coalesce = bool(cfg.get("down_coalesce", True))
+    return _Tile(
+        int(cfg.get("tile_m", 64)), gw, ch, pw, pa, w_cache, nbd, waves, pwd, coalesce
+    )
 
 
 @functools.cache
@@ -98,7 +102,7 @@ def _gateup(N, K, s_max, waves, ch, pw, pa, w_cache, act, swiglu_limit):
 
 
 @functools.cache
-def _down(N, K, topk, s_max, nbd, waves, pwd, rows, w_cache):
+def _down(N, K, topk, s_max, nbd, waves, pwd, rows, w_cache, coalesce):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token_mid.down import (
         compile_down,
     )
@@ -113,6 +117,7 @@ def _down(N, K, topk, s_max, nbd, waves, pwd, rows, w_cache):
         PWD=pwd,
         ROWS=rows,
         W_CACHE=w_cache,
+        COALESCE=coalesce,
     )
 
 
@@ -206,7 +211,18 @@ class Gfx942Fp8TokenMid(MoeKernel):
             types = (fx.BFloat16, fx.Uint8, fx.BFloat16) + (fx.Int32,) * 3
             types += (fx.Float32,)
             gu(*[flyc.from_c_void_p(x, 0) for x in types], m, 1, fx.Stream(None))
-            dn = _down(D, I, topk, s_max, t.nbd, t.waves, t.pwd, self.rows, t.w_cache)
+            dn = _down(
+                D,
+                I,
+                topk,
+                s_max,
+                t.nbd,
+                t.waves,
+                t.pwd,
+                self.rows,
+                t.w_cache,
+                t.coalesce,
+            )
             types = (fx.BFloat16, fx.Uint8, fx.BFloat16, fx.Int32, fx.Float32)
             types += (fx.Int32, fx.Int32, fx.Float32)
             dn(*[flyc.from_c_void_p(x, 0) for x in types], m, 1, fx.Stream(None))
@@ -260,7 +276,18 @@ class Gfx942Fp8TokenMid(MoeKernel):
         if self.rows:
             dst = torch.empty((M * topk, D), dtype=torch.bfloat16, device=dev)
         _launch(
-            _down(D, I, topk, s_max, t.nbd, t.waves, t.pwd, self.rows, t.w_cache),
+            _down(
+                D,
+                I,
+                topk,
+                s_max,
+                t.nbd,
+                t.waves,
+                t.pwd,
+                self.rows,
+                t.w_cache,
+                t.coalesce,
+            ),
             inter,
             call.w2,
             dst,

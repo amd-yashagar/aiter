@@ -37,5 +37,16 @@
     "tile_m": 32,
     "down_nbd": 8,
     "gateup_waves": 8
+  },
+  "m32gw8nc": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_waves": 8,
+    "down_coalesce": false
+  },
+  "m32nbd2nc": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "down_coalesce": false
   }
 }

@@ -31,6 +31,7 @@ from .common import (
     bf16x4_words,
     fp8_dword_to_bf16x4,
     lds_load_x4,
+    lds_store_x2,
     lds_store_x4,
     load_s1,
     load_x4,
@@ -39,10 +40,24 @@ from .common import (
 )
 
 
-def compile_down(*, N, K, TOPK, S_MAX, NBD=4, WAVES=4, PWD=2, ROWS=True, W_CACHE=0):
+def compile_down(
+    *,
+    N,
+    K,
+    TOPK,
+    S_MAX,
+    NBD=4,
+    WAVES=4,
+    PWD=2,
+    ROWS=True,
+    W_CACHE=0,
+    COALESCE=True,
+):
     """N = model_dim, K = inter_dim. Each wave walks NBD channel blocks with W2
     prefetched PWD blocks ahead; the tile's intermediate rows are staged once
-    per workgroup in LDS."""
+    per workgroup in LDS. COALESCE transposes each wave's NBD x 16 output
+    channels through LDS so every lane writes (or adds) 16 contiguous bytes of
+    one row."""
     assert K % 64 == 0 and N % (16 * NBD * WAVES) == 0
     KSTEPS = K // 64
     NTHR = 64 * WAVES
@@ -50,6 +65,10 @@ def compile_down(*, N, K, TOPK, S_MAX, NBD=4, WAVES=4, PWD=2, ROWS=True, W_CACHE
     SEGS = K // 8  # 16-byte segments per row
     LDS_DW = S_MAX * 16 * ROW_DW
     OOB = 0x7FFFFFF0
+    TR_DW = NBD * 8 + 4  # transpose row stride in dwords
+    TR_WAVE = S_MAX * 16 * TR_DW
+    # The transpose reuses the intermediate tile's LDS once every wave is done.
+    LDS_DW = max(LDS_DW, WAVES * TR_WAVE) if COALESCE else LDS_DW
 
     @fx.struct
     class SharedStorage:
@@ -78,6 +97,8 @@ def compile_down(*, N, K, TOPK, S_MAX, NBD=4, WAVES=4, PWD=2, ROWS=True, W_CACHE
         if t < nlive:
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
             a_lds = lds.a.ptr
+            o_lds = a_lds
+            o_base = wave * TR_WAVE
             e = load_s1(p_live, t * 3)
             r0 = load_s1(p_live, t * 3 + 1)
             real = load_s1(p_live, t * 3 + 2)
@@ -146,6 +167,7 @@ def compile_down(*, N, K, TOPK, S_MAX, NBD=4, WAVES=4, PWD=2, ROWS=True, W_CACHE
                         scs=scs,
                     ):
                         acc = [Vec.filled(4, 0.0, fx.Float32)] * SV
+                        outs = []
                         for st in range_constexpr(KSTEPS):
                             bw = []
                             for s in range_constexpr(SV):
@@ -166,26 +188,70 @@ def compile_down(*, N, K, TOPK, S_MAX, NBD=4, WAVES=4, PWD=2, ROWS=True, W_CACHE
                             y = [
                                 acc[s][i] * sc[i] * facs[s] for i in range_constexpr(4)
                             ]
-                            if oks[s]:
+                            if const_expr(COALESCE):
+                                outs.append(bf16x4_words(y))
+                            else:
+                                if oks[s]:
+                                    if const_expr(ROWS):
+                                        buffer_ops.buffer_store(
+                                            bf16x4_words(y),
+                                            o_rs,
+                                            ((toks[s] * TOPK + slots[s]) * N + ch) * 2,
+                                            offset_is_bytes=True,
+                                        )
+                                    else:
+                                        yb = fxh._f32_to_bf16(
+                                            Vec.from_elements(y, fx.Float32)
+                                        )
+                                        fxh.atomic_add_bf16(
+                                            out_bf16 + (fx.Int64(toks[s]) * N + ch), yb
+                                        )
+                        return outs
+
+                    def flush(SV=SV):
+                        segs = 2 * NBD
+                        total = SV * 16 * segs
+                        for i in range_constexpr(-(-total // 64)):
+                            idx = lane + i * 64
+                            row = idx // segs
+                            seg = idx % segs
+                            row_c = (idx < total).select(row, fx.Int32(0))
+                            v = lds_load_x4(o_lds, o_base + row_c * TR_DW + seg * 4)
+                            sid = fx.Int32(ids[r0 + row_c]).bitcast(fx.Uint32)
+                            tok = fx.Int32(sid & 0xFFFFFF)
+                            slot = fx.Int32(sid >> 24)
+                            ch0 = nb0 * 16 + seg * 8
+                            if (idx < total) & (row_c < real):
                                 if const_expr(ROWS):
                                     buffer_ops.buffer_store(
-                                        bf16x4_words(y),
+                                        v,
                                         o_rs,
-                                        ((toks[s] * TOPK + slots[s]) * N + ch) * 2,
+                                        ((tok * TOPK + slot) * N + ch0) * 2,
                                         offset_is_bytes=True,
                                     )
                                 else:
-                                    yb = fxh._f32_to_bf16(
-                                        Vec.from_elements(y, fx.Float32)
-                                    )
                                     fxh.atomic_add_bf16(
-                                        out_bf16 + (fx.Int64(toks[s]) * N + ch), yb
+                                        out_bf16 + (fx.Int64(tok) * N + ch0),
+                                        v.bitcast(fx.BFloat16),
                                     )
 
+                    tiles_out = []
                     for b in range_constexpr(NBD):
                         if const_expr(b + PWD < NBD):
                             w_sets += load_w(fx.Int32(b + PWD))
-                        block(b, w_sets[b * KSTEPS : (b + 1) * KSTEPS])
+                        tiles_out.append(
+                            block(b, w_sets[b * KSTEPS : (b + 1) * KSTEPS])
+                        )
+                    if const_expr(COALESCE):
+                        gpu.barrier()
+                        for b in range_constexpr(NBD):
+                            for s in range_constexpr(SV):
+                                lds_store_x2(
+                                    o_lds,
+                                    o_base + (s * 16 + c) * TR_DW + b * 8 + q * 2,
+                                    tiles_out[b][s],
+                                )
+                        flush()
 
     @flyc.jit
     def launch(
