@@ -57,7 +57,8 @@ def parse_config(config):
     out = {}
     for tok in (config or "").split("_"):
         key = tok.rstrip("0123456789")
-        if key in ("bm", "tn", "la", "nb", "ra", "nt", "ar") and tok[len(key) :]:
+        keys = ("bm", "tn", "la", "nb", "ra", "nt", "ar", "dm", "iq")
+        if key in keys and tok[len(key) :]:
             out[key] = int(tok[len(key) :])
     return out
 
@@ -149,7 +150,7 @@ class _MxGfx950(MoeKernel):
         w = _DT[spec.w_dtype]
         cfg = parse_config(config)
         bm = cfg.get("bm") or tile_m_for(m, topk, spec.experts, self.prefill)
-        tn = cfg.get("tn") or (128 if self.prefill else 64)
+        tn = cfg.get("tn") or 128
         la = cfg.get("la") or (
             (3 if self.prefill else 4) if spec.w_dtype != dtypes.fp8 else 2
         )
@@ -158,6 +159,14 @@ class _MxGfx950(MoeKernel):
         live = min(spec.experts, routes) * -(-per_expert // bm)
         nb = cfg.get("nb") or blocks_per_wg(spec.model_dim, live)
         reduce = self.epilogue == "reduce"
+        a_bytes = spec.model_dim if a == "fp8" else spec.model_dim // 2
+        direct = (
+            not self.prefill
+            and bool(cfg.get("dm", 0 if spec.w_dtype == dtypes.fp8 else 1))
+            and bm == 16
+            and m * topk <= 256
+            and (not cfg.get("iq", 0) or 16 * a_bytes <= 112 * 1024)
+        )
         beta = weights.kwarg("beta", 1.0)
         lbeta = weights.kwarg("linear_beta", 1.0)
         q = compile_token_quant(model_dim=spec.model_dim, a_dtype=a)
@@ -180,7 +189,10 @@ class _MxGfx950(MoeKernel):
             ahead=la,
             read_ahead=cfg.get("ra", 1),
             nt=bool(cfg.get("nt", 1)),
-            a_resident=bool(cfg.get("ar", 1)),
+            a_resident=bool(cfg.get("ar", 0 if not self.prefill else 1)),
+            direct_topk=topk if direct else 0,
+            experts_total=spec.experts,
+            inline_quant=bool(cfg.get("iq", 0)),
         )
         s2 = compile_stage2(
             model_dim=spec.model_dim,
@@ -192,11 +204,12 @@ class _MxGfx950(MoeKernel):
             doweight_stage1=False,
             reduce=reduce,
             topk=topk,
-            blocks=nb,
+            blocks=1 if direct else nb,
             nt=bool(cfg.get("nt", 1)),
+            direct=direct,
         )
         r = compile_reduce(model_dim=spec.model_dim, topk=topk) if reduce else None
-        return bm, a, q, s1, s2, r
+        return bm, a, q, s1, s2, r, (direct, bool(cfg.get("iq", 0)))
 
     def warmup(self, weights, m, topk, config):
         import flydsl.expr as fx
@@ -208,11 +221,13 @@ class _MxGfx950(MoeKernel):
         a_dtype = activation_dtype(spec, weights, w1, m, torch.bfloat16, False)
         if a_dtype not in _DT:
             return
-        _bm, _a, q, s1, s2, r = self._kernels(spec, weights, m, topk, a_dtype, config)
+        _bm, _a, q, s1, s2, r, _direct = self._kernels(
+            spec, weights, m, topk, a_dtype, config
+        )
         st = fx.Stream(None)
         with compile_only():
             _run_compiled(q, 0, 0, 0, 1, spec.model_dim * 2, 1, st)
-            _run_compiled(s1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, st)
+            _run_compiled(s1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, st)
             _run_compiled(s2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, st)
             if r is not None:
                 _run_compiled(r, 0, 0, 1, 1, st)
@@ -233,12 +248,19 @@ class _MxGfx950(MoeKernel):
         x = call.hidden_states
         M, D, I, E = call.m, spec.model_dim, spec.inter_dim, spec.experts
         a_dtype = activation_dtype(spec, weights, call.w1, M, x.dtype, False)
-        bm, a, q, s1, s2, r = self._kernels(
+        bm, a, q, s1, s2, r, direct = self._kernels(
             spec, weights, M, call.topk, a_dtype, call.config
         )
+        if direct[0]:
+            return self._direct_call(call, spec, M, D, I, a, q, s1, s2, direct[1])
         dev = x.device
         out = call.output
-        if os.environ.get("AITER_MOE_MX_SORT", "opus") == "core":
+        # Core's sort is faster at decode, Opus at large M (smci355, core be32165cd:
+        # M=8 13.4 vs 16.4 us; DSV4-Pro M=4096 34.2 vs 30.7; Kimi-K3 63.7 vs 31.4).
+        sort = os.environ.get("AITER_MOE_MX_SORT") or (
+            "opus" if self.prefill else "core"
+        )
+        if sort == "core":
             if out is None:
                 out = torch.empty((M, D), dtype=torch.bfloat16, device=dev)
             tm = route_to_tiles(
@@ -255,8 +277,6 @@ class _MxGfx950(MoeKernel):
                 tm.num_valid_ids,
             )
         else:
-            # aiter's Opus sort: faster than core's at every measured M today
-            # (DSV4-Pro M=4096: 27 vs 39 us; M=8: 7.4 vs 12.6 us).
             sids, sw, se, nv, out = moe_sorting(
                 call.topk_ids,
                 call.topk_weight,
@@ -302,6 +322,11 @@ class _MxGfx950(MoeKernel):
             0,
             M,
             mblocks,
+            0,
+            0,
+            0,
+            0,
+            0,
             stream,
         )
         dst = out
@@ -328,6 +353,94 @@ class _MxGfx950(MoeKernel):
             )
         return out
 
+
+def _direct_call(self, call, spec, M, D, I, a, q, s1, s2, inline):
+    """Decode without a sort: stage 1 groups routes per expert itself, quantizes the
+    token rows inline and zeroes the output; stage 2 reads its route rows."""
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.kernels.moe_next.gfx950_mx import common as cm
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+    x = call.hidden_states
+    dev = x.device
+    R = M * call.topk
+    rows = R * 16
+    out = call.output
+    if out is None:
+        out = torch.empty((M, D), dtype=torch.bfloat16, device=dev)
+    sid = torch.empty(rows, dtype=torch.int32, device=dev)
+    sw = torch.empty(rows, dtype=torch.float32, device=dev)
+    eid = torch.empty(R, dtype=torch.int32, device=dev)
+    inter = torch.empty(
+        (rows, I // 2 if a == "fp4" else I), dtype=torch.uint8, device=dev
+    )
+    inter_s = torch.empty(
+        (cm.inter_scale_bytes(rows, I),), dtype=torch.uint8, device=dev
+    )
+    ids = call.topk_ids.contiguous()
+    tw = call.topk_weight.contiguous()
+    stream = fx.Stream(torch.cuda.current_stream(dev))
+    aq = asc = None
+    if not inline:
+        from aiter.ops.flydsl.kernels.moe_next.gfx950_mx.quant import (
+            token_quant_blocks,
+        )
+
+        aq = torch.empty(
+            (M, D // 2 if a == "fp4" else D), dtype=torch.uint8, device=dev
+        )
+        asc = torch.empty((M, cm.token_scale_cols(D)), dtype=torch.uint8, device=dev)
+        _run_compiled(
+            q,
+            aq.data_ptr(),
+            asc.data_ptr(),
+            x.data_ptr(),
+            M,
+            x.stride(0) * x.element_size(),
+            token_quant_blocks(M, D),
+            stream,
+        )
+    _run_compiled(
+        s1,
+        inter.data_ptr(),
+        inter_s.data_ptr(),
+        aq.data_ptr() if aq is not None else 0,
+        asc.data_ptr() if asc is not None else 0,
+        call.w1.data_ptr(),
+        call.w1_scale.data_ptr(),
+        sid.data_ptr(),
+        eid.data_ptr(),
+        sw.data_ptr(),
+        0,
+        M,
+        R,
+        ids.data_ptr(),
+        tw.data_ptr(),
+        x.data_ptr(),
+        out.data_ptr(),
+        x.stride(0) * x.element_size(),
+        stream,
+    )
+    _run_compiled(
+        s2,
+        out.data_ptr(),
+        inter.data_ptr(),
+        inter_s.data_ptr(),
+        call.w2.data_ptr(),
+        call.w2_scale.data_ptr(),
+        sid.data_ptr(),
+        eid.data_ptr(),
+        sw.data_ptr(),
+        0,
+        M,
+        R,
+        stream,
+    )
+    return out
+
+
+_MxGfx950._direct_call = _direct_call
 
 _ACT_TERM = {"fp4": "mx_fp4", "fp8": "mx_fp8"}
 _FAMILIES = {
