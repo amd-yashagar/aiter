@@ -800,6 +800,9 @@ def _emit_summary(
 
 
 def main(argv=None):
+    from . import prebuild
+
+    prebuild.forbid_builds()
     ap = argparse.ArgumentParser()
     ap.add_argument("--group", required=True)
     ap.add_argument("--out", required=True)

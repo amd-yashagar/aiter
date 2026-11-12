@@ -89,6 +89,26 @@ def cmd_cases(a):
     return 1 if problems else 0
 
 
+def _guard_builds(a, runner):
+    """A leased run must never compile: refuse when modules are missing (gpuq), warn
+    otherwise, and make workers fail a candidate instead of building."""
+    from . import prebuild
+
+    cases = runner.select_cases(a.cases.split(","), a.filter)
+    bad = prebuild.known_failed()
+    miss = [m for m in prebuild.missing(prebuild.plan(cases)) if m not in bad]
+    if a.launcher == "gpuq" and not a.allow_build:
+        prebuild.require_prebuilt(cases)
+        os.environ[prebuild.NO_BUILD_ENV] = "1"
+    if not miss:
+        return
+    print(
+        f"WARNING: {len(miss)} JIT modules are not built; this run will compile them "
+        f"on its GPU: {miss[:5]}{' ...' if len(miss) > 5 else ''}",
+        flush=True,
+    )
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="moe_bench", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -143,10 +163,38 @@ def main(argv=None):
     p.add_argument("--out", help="result CSV (dispatch mode)")
     p.add_argument(
         "--mode",
-        choices=("dispatch", "bar", "new"),
+        choices=("dispatch", "bar", "new", "prebuild"),
         default="dispatch",
         help="dispatch: fused_moe as dispatched; bar: best of every existing candidate; "
-        "new: the new entry point (MOE_BENCH_NEW_ENTRY)",
+        "new: the new entry point (MOE_BENCH_NEW_ENTRY); prebuild: JIT-build the modules "
+        "the cases need on the CPU (no GPU lease), then exit",
+    )
+    p.add_argument(
+        "--prebuild-only",
+        action="store_true",
+        help="build the modules the cases need (as --mode prebuild) and exit",
+    )
+    p.add_argument(
+        "--prebuild-jobs",
+        type=int,
+        help="modules built at once (default cores/16; each gets MAX_JOBS=cores/jobs)",
+    )
+    p.add_argument(
+        "--prebuild-retry",
+        action="store_true",
+        help="try again modules a previous prebuild could not build",
+    )
+    p.add_argument(
+        "--prebuild-cores",
+        type=int,
+        help="cores the prebuild may use (default: all); lower it on a node that is "
+        "measuring at the same time",
+    )
+    p.add_argument(
+        "--allow-build",
+        action="store_true",
+        help="let the run compile missing modules (the default under --launcher gpuq "
+        "is to refuse: a leased run must only measure)",
     )
     p.add_argument(
         "--out-dir", help="bar/new modes: baseline folder for bar-<tier>.csv etc."
@@ -269,6 +317,18 @@ def main(argv=None):
         from . import runner as _runner
 
         _runner.wait_for_disk(tempfile.gettempdir(), a.min_free_gb)
+        if a.mode == "prebuild" or a.prebuild_only:
+            from . import prebuild
+
+            res = prebuild.run_prebuild(
+                _runner.select_cases(a.cases.split(","), a.filter),
+                jobs=a.prebuild_jobs,
+                min_free_gb=a.min_free_gb,
+                cores=a.prebuild_cores,
+                retry_failed=a.prebuild_retry,
+            )
+            return 1 if res["failed"] else 0
+        _guard_builds(a, _runner)
         if a.launcher == "gpuq" and not a.inner:
             from . import batch
 
