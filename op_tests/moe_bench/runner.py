@@ -123,6 +123,10 @@ def make_shim(tmpdir):
     return shim
 
 
+def needs_shim(tree):
+    return not os.path.isdir(os.path.join(tree, "op_tests", "moe_bench"))
+
+
 def worker_env(tree, tmpdir, extra=None, extra_path=None):
     env = dict(os.environ)
     paths = [tree] + ([extra_path] if extra_path else [])
@@ -492,16 +496,19 @@ def run_first(cases, tree, tmpdir, launcher, results, meta, variants):
                 json.dump({"cases": [c.row], "modes": ["first"], "first": v}, f)
             out = gpath + ".out"
             extra = {"FLYDSL_RUNTIME_ENABLE_CACHE": "0"} if v == "empty" else {}
+            shimmed = needs_shim(tree)
             cmd = [
                 sys.executable,
                 "-m",
-                "op_tests.moe_bench.worker",
+                "moe_bench_shim.worker" if shimmed else "op_tests.moe_bench.worker",
                 "--group",
                 gpath,
                 "--out",
                 out,
             ]
-            env = worker_env(tree, tmpdir, extra)
+            env = worker_env(
+                tree, tmpdir, extra, extra_path=make_shim(tmpdir) if shimmed else None
+            )
             gpus = []
             if launcher == "gpuq":
                 cmd = ["gpuq", "--num-gpus=1", *cmd]
@@ -599,6 +606,11 @@ def cmd_run(args):
         GroupJob(k, cs, modes_req, tree, tmpdir, args.launcher, res, meta, opts)
         for k, cs in groups
     ]
+    if needs_shim(tree):
+        shim = make_shim(tmpdir)
+        for j in jobs:
+            j.pkg = "moe_bench_shim"
+            j.extra_path = shim
     n_cases = sum(len(cs) for _, cs in groups)
     print(
         f"{n_cases} cases in {len(jobs)} weight groups, modes {modes_req}", flush=True
