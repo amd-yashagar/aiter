@@ -3,7 +3,7 @@
   "configs": {
     "d16": {
       "tile_m": 16,
-      "tile_n2": 128,
+      "tile_n2": 64,
       "splits": "auto"
     },
     "d32": {

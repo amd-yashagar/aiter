@@ -125,6 +125,8 @@ def _build_stage2(
             None, None, 0, None
         ]
         buf_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_t)
+        # W2 is read once per (expert, column block): non-temporal (kb: nt-stores)
+        b_cp_atom_nt = fx.make_copy_atom(fx.rocdl.BufferCopy128b(2), elem_t)
         g2r_tv_layout = fx.make_layout(
             ((_thrs_k, _thrs_m), (1, _val_per_thr)),
             ((_thrs_m * _val_per_thr, 1), (1, _thrs_m)),
@@ -206,22 +208,68 @@ def _build_stage2(
         ]
         pos_rows = [pos_frag[0, n] * fx.Int32(KB) for n in range_constexpr(n_reps)]
 
+        # Short K (KB <= 4 at decode, I = 256 -> KB = 2): issue every K tile's scales,
+        # A rows and W2 tile up front in separate register sets, so the tiles' memory
+        # latencies overlap instead of running back to back.
+        _pre = KB <= 4
+        nbuf = KB if _pre else 1
+        a_cps = [a_cp_frag] + [
+            fx.make_fragment_like(a_mem_thr[None, None, None, 0]) for _ in range(nbuf - 1)
+        ]
+        a_cp_rets = [
+            fx.make_tiled_copy(uni_cp_atom, g2r_tv_layout, fx.make_tile(_thrs_m, TILE_K))
+            .get_slice(tid)
+            .retile(f)
+            for f in a_cps
+        ]
+        b_frags = [b_frag] + [
+            tiled_mma.make_fragment_A(b_tile[None, None, 0]) for _ in range(nbuf - 1)
+        ]
+        b_rets = [b_g2r.retile(f) for f in b_frags]
+        _a_loads = fx.size(fx.get_shape(a_cp_frag)).to_py_value() // _val_per_thr
+        _tile_loads = _a_loads + _b_loads_per_tile
+        rot2 = (blk_n + gpu.block_idx.y) % fx.Int32(KB)
+
+        def _kb2(iv):
+            r = fx.Int32(iv) + rot2
+            return (r < fx.Int32(KB)).select(r, r - fx.Int32(KB))
+
+        if const_expr(_pre):
+            scl = []
+            for iv in range_constexpr(KB):
+                kb = _kb2(iv)
+                sa = [a_scale_t[pos_rows[n] + kb] for n in range_constexpr(n_reps)]
+                sb = [w_scale_t[sw_base[m] + kb] for m in range_constexpr(m_reps)]
+                scl.append((sa, sb))
+            for iv in range_constexpr(KB):
+                kb = _kb2(iv)
+                a_idx.copy(buf_cp_atom_r, kb, a_cps[iv])
+                fx.copy(b_cp_atom_nt, b_g2r_s[None, None, None, kb], b_rets[iv])
+            rocdl.sched_barrier(0)
+
         for iv in range_constexpr(KB):
-            kb = fx.Int32(iv)
-            a_idx.copy(buf_cp_atom_r, kb, a_cp_frag)
-            fx.copy(buf_cp_atom_r, b_g2r_s[None, None, None, kb], b_ret)
-            sa = [a_scale_t[pos_rows[n] + kb] for n in range_constexpr(n_reps)]
-            sb = [w_scale_t[sw_base[m] + kb] for m in range_constexpr(m_reps)]
-            rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile))
+            kb = _kb2(iv)
+            bi = iv if _pre else 0
+            if const_expr(_pre):
+                sa, sb = scl[iv]
+                rocdl.s_waitcnt(
+                    fxh.encode_waitcnt(vmcnt=_b_loads_per_tile + (KB - 1 - iv) * _tile_loads)
+                )
+            else:
+                a_idx.copy(buf_cp_atom_r, kb, a_cp_frag)
+                fx.copy(b_cp_atom_nt, b_g2r_s[None, None, None, kb], b_ret)
+                sa = [a_scale_t[pos_rows[n] + kb] for n in range_constexpr(n_reps)]
+                sb = [w_scale_t[sw_base[m] + kb] for m in range_constexpr(m_reps)]
+                rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile))
             gpu.barrier()
-            fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w)
+            fx.copy(uni_cp_atom, a_cp_rets[bi], a_lds_w)
             gpu.barrier()
             for ki in range_constexpr(k_iters):
                 fx.copy(
                     uni_cp_atom, a_lds_r[None, None, ki], a_frag_retile[None, None, ki]
                 )
             p_frag.fill(0)
-            fx.gemm(mma_atom, p_frag, b_frag, a_frag, p_frag)
+            fx.gemm(mma_atom, p_frag, b_frags[bi], a_frag, p_frag)
             for n in range_constexpr(n_reps):
                 for m in range_constexpr(m_reps):
                     f = sa[n] * sb[m]
