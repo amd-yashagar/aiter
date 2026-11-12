@@ -89,5 +89,24 @@ def test_g1u0_fp8_per_tensor_is_refused(token):
         )
 
 
+@pytest.mark.parametrize("token", [16, 200, 4096])
+def test_g1u0_int8_per_token_is_refused(token):
+    """fmoe_int8_g1u0 needs smooth-quant scales that fused_moe cannot pass."""
+    x, w1, w2, topk_weights, topk_ids = _inputs(token, dtypes.bf16)
+    w1_q, w1_scale = aiter.pertoken_quant(w1, quant_dtype=dtypes.i8)
+    w2_q, w2_scale = aiter.pertoken_quant(w2, quant_dtype=dtypes.i8)
+    with pytest.raises(NotImplementedError, match="g1u0"):
+        fused_moe(
+            x,
+            shuffle_weight(w1_q, layout=(16, 16)),
+            shuffle_weight(w2_q, layout=(16, 16)),
+            topk_weights,
+            topk_ids,
+            quant_type=QuantType.per_Token,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
