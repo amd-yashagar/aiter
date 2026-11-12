@@ -5,7 +5,8 @@
 Claim files live in /tmp/gm123-gpu-claims/gpu<N> (override with MOE_BENCH_CLAIM_DIR),
 one per GPU, N being the HIP index. They tell other agents on the node which GPU is
 taken. A GPU counts as idle when amd-smi shows at most 5% utilization over three
-samples, under 2 GB of VRAM in use and no process holding VRAM, and no live claim
+samples, under 1 GB of VRAM in use (amd-smi lists one process on every GPU inside a
+container, so processes are ignored), and no live claim
 file exists for it. amd-smi indexes are mapped to HIP indexes by PCI bus id.
 
     python -m op_tests.moe_bench.gpu_claim --list
@@ -26,7 +27,7 @@ import sys
 import time
 
 CLAIM_DIR = os.environ.get("MOE_BENCH_CLAIM_DIR", "/tmp/gm123-gpu-claims")
-MAX_VRAM_GB = 2.0
+MAX_VRAM_GB = 1.0
 MAX_UTIL_PCT = 5
 WORKER = os.environ.get("MOE_BENCH_WORKER", "meta-harness")
 
@@ -154,7 +155,7 @@ def idle_gpus():
         busy = (
             s["util"] > MAX_UTIL_PCT
             or s["vram_gb"] > MAX_VRAM_GB
-            or s["procs"]
+            or (s["procs"] and s["vram_gb"] > 0.6)
             or (i in claims and claims[i]["alive"])
         )
         if not busy:
