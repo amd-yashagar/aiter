@@ -1,5 +1,7 @@
 {
-  "default": {"block_m": 128, "block_n": 128},
-  "prefill-bm64": {"block_m": 64, "block_n": 128},
-  "prefill-bm128": {"block_m": 128, "block_n": 128}
+  "default": {"block_m": 128, "block_n": 128, "down_n_split": 2, "down_block_m": 64},
+  "prefill-bm128-d64-s1": {"block_m": 128, "block_n": 128, "down_n_split": 1, "down_block_m": 64},
+  "prefill-bm128-d64-s2": {"block_m": 128, "block_n": 128, "down_n_split": 2, "down_block_m": 64},
+  "prefill-bm128-d32-s1": {"block_m": 128, "block_n": 128, "down_n_split": 1, "down_block_m": 32},
+  "prefill-bm128-d32-s2": {"block_m": 128, "block_n": 128, "down_n_split": 2, "down_block_m": 32}
 }

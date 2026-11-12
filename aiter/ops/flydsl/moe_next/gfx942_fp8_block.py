@@ -40,7 +40,15 @@ def _tile(config, gpu, inter_dim):
     # Down keeps the tile's whole intermediate row block in LDS.
     while block_m > 32 and block_m * inter_dim > _LDS_BYTES:
         block_m //= 2
-    return block_m, int(cfg.get("block_n", 128))
+    down_m = min(block_m, int(cfg.get("down_block_m", block_m)))
+    while down_m > 16 and down_m * inter_dim > 16384:
+        down_m //= 2
+    return (
+        block_m,
+        int(cfg.get("block_n", 128)),
+        int(cfg.get("down_n_split", 1)),
+        down_m,
+    )
 
 
 @functools.cache
@@ -55,10 +63,14 @@ def _gateup(N, K, topk, block_m, block_n, act):
 
 
 @functools.cache
-def _down(N, K, topk, block_m):
+def _down(N, K, topk, block_m, n_split, down_m):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_block.down import compile_down
 
-    return compile_down(N=N, K=K, TOPK=topk, BLOCK_M=block_m)
+    while n_split > 1 and (N // 64) % (2 * n_split):
+        n_split //= 2
+    return compile_down(
+        N=N, K=K, TOPK=topk, BLOCK_M=down_m, N_SPLIT=n_split, SORT_BLOCK_M=block_m
+    )
 
 
 @functools.cache
@@ -138,7 +150,7 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
             spec.experts,
             call.topk,
         )
-        block_m, block_n = _tile(call.config, self._gpu(w), I)
+        block_m, block_n, n_split, down_m = _tile(call.config, self._gpu(w), I)
         act = _ACTS[spec.act]
         topk_ids = call.topk_ids.to(torch.int32)
         topk_weight = call.topk_weight.to(torch.float32)
@@ -175,7 +187,7 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
         aq, as_ = quant(inter.view(M * topk, I), quant_dtype=dtypes.fp8)
         rows = torch.empty((tasks * block_m, D), dtype=torch.bfloat16, device=x.device)
         _launch(
-            _down(D, I, topk, block_m),
+            _down(D, I, topk, block_m, n_split, down_m),
             aq,
             w.w2,
             rows,
