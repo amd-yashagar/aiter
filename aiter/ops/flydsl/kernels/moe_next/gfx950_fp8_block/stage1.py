@@ -37,9 +37,10 @@ from . import helpers as fxh
 CHANNELS = 128  # intermediate channels per workgroup = one quant group
 
 
-def _build_stage1(*, model_dim, inter_dim, experts, tile_m, act, doweight_stage1):
+def _build_stage1(
+    *, model_dim, inter_dim, experts, tile_m, act, doweight_stage1, wide_k
+):
     elem_t = fx.Float8E4M3FN
-    MFMA_K = 32
     K = int(model_dim)
     KB = K // 128
     N_e = 2 * int(inter_dim)
@@ -78,7 +79,7 @@ def _build_stage1(*, model_dim, inter_dim, experts, tile_m, act, doweight_stage1
         blk_n, arg_p_input, arg_p_weight, lds, M, a_scale_t, w_scale_t, expert_id
     ):
         tid = gpu.thread_idx.x
-        mma_atom, tiled_mma = fxh.make_1x4_tiled_mma(elem_t)
+        mma_atom, tiled_mma = fxh.make_1x4_tiled_mma(elem_t, wide_k)
 
         a_tensor = fx.rocdl.make_buffer_tensor(
             arg_p_input, max_size=False, num_records_bytes=fx.Int64(M) * fx.Int64(K)
@@ -191,7 +192,7 @@ def _build_stage1(*, model_dim, inter_dim, experts, tile_m, act, doweight_stage1
         m_reps = fxh.reps(c_gate, 1)
         n_reps = fxh.reps(c_gate, 2)
 
-        k_iters = TILE_K // (2 * MFMA_K)
+        k_iters = fxh.reps(a_lds_r_bufs[0], 2)
         num_tiles = KB
         # w1_scale [E, 2I/128, KB]: gate block blk_n, up block IB + blk_n.
         sw_gate_base = (expert_id * fx.Int32(2 * IB) + blk_n) * fx.Int32(KB)
@@ -251,25 +252,26 @@ def _build_stage1(*, model_dim, inter_dim, experts, tile_m, act, doweight_stage1
                     )
 
         _load_gmem(0, 0)
-        scales_cur = _scales(0)
         rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile))
         _write_a_lds(0)
         gpu.barrier()
         _read_a_lds(0)
-        for kt in range_constexpr(num_tiles):
-            cur = kt % 2
-            if kt + 1 < num_tiles:
-                nxt = (kt + 1) % 2
-                _load_gmem(kt + 1, nxt)
-                scales_nxt = _scales(kt + 1)
+        # Rolled K loop, two tiles per trip so the ping-pong buffers stay static. The
+        # prefetch past the last tile is clamped to it (loaded and ignored), so every
+        # trip issues the same loads and waits on the same vmcnt.
+        last = fx.Int32(num_tiles - 1)
+        for kt2 in range(0, num_tiles, 2):
+            for u in range_constexpr(2):
+                kt = fx.Int32(kt2) + fx.Int32(u)
+                sa, sg, su = _scales(kt)
+                kn = kt + fx.Int32(1)
+                kn = (kn < fx.Int32(num_tiles)).select(kn, last)
+                _load_gmem(kn, 1 - u)
                 rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile))
-                _write_a_lds(nxt)
-                _mfma_fold(cur, *scales_cur)
+                _write_a_lds(1 - u)
+                _mfma_fold(u, sa, sg, su)
                 gpu.barrier()
-                _read_a_lds(nxt)
-                scales_cur = scales_nxt
-            else:
-                _mfma_fold(cur, *scales_cur)
+                _read_a_lds(1 - u)
         return c_gate, c_up
 
     _gemm = ASTRewriter.transform(_gemm)
@@ -515,7 +517,14 @@ def _build_stage1(*, model_dim, inter_dim, experts, tile_m, act, doweight_stage1
 
 @functools.lru_cache(maxsize=256)
 def compile_stage1(
-    *, model_dim, inter_dim, experts, tile_m, act="silu", doweight_stage1=False
+    *,
+    model_dim,
+    inter_dim,
+    experts,
+    tile_m,
+    act="silu",
+    doweight_stage1=False,
+    wide_k=True,
 ):
     return _build_stage1(
         model_dim=model_dim,
@@ -524,4 +533,5 @@ def compile_stage1(
         tile_m=tile_m,
         act=act,
         doweight_stage1=doweight_stage1,
+        wide_k=wide_k,
     )

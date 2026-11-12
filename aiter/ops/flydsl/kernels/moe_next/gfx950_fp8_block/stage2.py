@@ -43,10 +43,18 @@ _UNI_COPY = {
 
 
 def _build_stage2(
-    *, model_dim, inter_dim, experts, topk, tile_m, tile_n, doweight_stage1, combine
+    *,
+    model_dim,
+    inter_dim,
+    experts,
+    topk,
+    tile_m,
+    tile_n,
+    doweight_stage1,
+    combine,
+    wide_k,
 ):
     elem_t = fx.Float8E4M3FN
-    MFMA_K = 32
     K = int(inter_dim)
     KB = K // 128
     N = int(model_dim)
@@ -101,7 +109,7 @@ def _build_stage2(
         row0,
     ):
         tid = gpu.thread_idx.x
-        mma_atom, tiled_mma = fxh.make_1x4_tiled_mma(elem_t)
+        mma_atom, tiled_mma = fxh.make_1x4_tiled_mma(elem_t, wide_k)
         a_tensor = fx.rocdl.make_buffer_tensor(
             arg_p_input, max_size=False, num_records_bytes=fx.Int64(rows) * fx.Int64(K)
         )
@@ -183,7 +191,7 @@ def _build_stage2(
         c_frag.fill(0)
         m_reps = fxh.reps(c_frag, 1)
         n_reps = fxh.reps(c_frag, 2)
-        k_iters = TILE_K // (2 * MFMA_K)
+        k_iters = fxh.reps(a_lds_r, 2)
         # w2_scale [E, N/128, KB]; m rep m covers channels blk_n*BN + m*64 + [0, 64)
         sw_base = [
             (
@@ -384,7 +392,7 @@ def _build_stage2(
             )
             c_out_frag = _weight_and_cast(c_frag, tw_frag)
 
-            _, _tiled_mma = fxh.make_1x4_tiled_mma(elem_t)
+            _, _tiled_mma = fxh.make_1x4_tiled_mma(elem_t, wide_k)
             cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy64b(), out_elem)
             cshuf_atom_r = fx.make_copy_atom(_UNI_COPY[_epi_bits](), out_elem)
             cshuf_ptr = fx.recast_iter(out_elem, lds.gemm.region.ptr)
@@ -470,6 +478,7 @@ def compile_stage2(
     tile_n=128,
     doweight_stage1=False,
     combine="atomic_bf16",
+    wide_k=True,
 ):
     return _build_stage2(
         model_dim=model_dim,
@@ -480,4 +489,5 @@ def compile_stage2(
         tile_n=tile_n,
         doweight_stage1=doweight_stage1,
         combine=combine,
+        wide_k=wide_k,
     )
