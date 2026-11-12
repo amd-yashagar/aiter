@@ -167,6 +167,10 @@ class _Fp8BlockGfx950(MoeKernel):
                 act=_ACTS[spec.act],
             )
         else:
+            if cfg["tile_m"] == 16:
+                from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage1_decode import (
+                    compile_stage1,
+                )
             s1 = compile_stage1(
                 model_dim=spec.model_dim,
                 inter_dim=spec.inter_dim,

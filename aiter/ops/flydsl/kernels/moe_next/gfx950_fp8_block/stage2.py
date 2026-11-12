@@ -76,6 +76,9 @@ def _build_stage2(
         BN in (64, 128, 256) and N % BN == 0
     ), f"tile_n={BN} must divide model_dim={N}"
     assert BM in (16, 32, 64, 128), f"tile_m={BM}"
+    # The decode climb's changes (rotated K start, non-temporal W2, every K tile issued up front) were
+    # measured at tile_m 16 only; larger tiles keep the plain K loop.
+    DECODE = BM == 16
     a_lds_bytes = max(BM, 256 // (TILE_K // 16)) * TILE_K  # the A copy covers 32 rows
     cshuf_bytes = BM * BN * out_bytes
     region_bytes = max(2 * a_lds_bytes, cshuf_bytes)
@@ -126,7 +129,7 @@ def _build_stage2(
         ]
         buf_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_t)
         # W2 is read once per (expert, column block): non-temporal (kb: nt-stores)
-        b_cp_atom_nt = fx.make_copy_atom(fx.rocdl.BufferCopy128b(2), elem_t)
+        b_cp_atom_nt = fx.make_copy_atom(fx.rocdl.BufferCopy128b(2 if DECODE else 0), elem_t)
         g2r_tv_layout = fx.make_layout(
             ((_thrs_k, _thrs_m), (1, _val_per_thr)),
             ((_thrs_m * _val_per_thr, 1), (1, _thrs_m)),
@@ -211,7 +214,7 @@ def _build_stage2(
         # Short K (KB <= 4 at decode, I = 256 -> KB = 2): issue every K tile's scales,
         # A rows and W2 tile up front in separate register sets, so the tiles' memory
         # latencies overlap instead of running back to back.
-        _pre = KB <= 4
+        _pre = DECODE and KB <= 4
         nbuf = KB if _pre else 1
         a_cps = [a_cp_frag] + [
             fx.make_fragment_like(a_mem_thr[None, None, None, 0]) for _ in range(nbuf - 1)
@@ -228,7 +231,7 @@ def _build_stage2(
         b_rets = [b_g2r.retile(f) for f in b_frags]
         _a_loads = fx.size(fx.get_shape(a_cp_frag)).to_py_value() // _val_per_thr
         _tile_loads = _a_loads + _b_loads_per_tile
-        rot2 = (blk_n + gpu.block_idx.y) % fx.Int32(KB)
+        rot2 = (blk_n + gpu.block_idx.y) % fx.Int32(KB) if DECODE else fx.Int32(0)
 
         def _kb2(iv):
             r = fx.Int32(iv) + rot2
