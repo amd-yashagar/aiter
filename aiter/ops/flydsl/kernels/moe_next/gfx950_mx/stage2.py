@@ -62,9 +62,13 @@ def _build_stage2(
     BN = 256
     NBW = int(blocks)
     assert D % (BN * NBW) == 0, f"model_dim={D} must be a multiple of {BN * NBW}"
-    assert INTER % 128 == 0, f"inter_dim={INTER} must be a multiple of 128"
+    assert INTER % 32 == 0, f"inter_dim={INTER} must be a multiple of 32"
     assert BM in (16, 32, 64, 128)
-    KS = INTER // 128
+    KS = -(-INTER // 128)
+    # A last K step past inter_dim: zero A chunks there, keep W loads in bounds and
+    # give the padding groups unit scales (0 x anything finite = 0).
+    RAGGED = INTER % 128 != 0
+    G_I = INTER // 32
     MT = BM // 16
     a_f8 = a_dtype == "fp8"
     w_f8 = w_dtype == "fp8"
@@ -139,16 +143,24 @@ def _build_stage2(
             ]
 
             def load_a(ks):
-                return [
-                    cm.global_vec_load(
-                        arg_a,
-                        fx.Int64(m_row + r) * fx.Int64(A_ROW)
-                        + fx.Int64(ks * TRB)
-                        + fx.Int64(a_chunk * fx.Int32(16)),
-                        4,
+                ccols = 16 if a_f8 else 32
+                live = fx.Int32(ks * 128) + a_chunk * fx.Int32(ccols) < fx.Int32(INTER)
+                # Chunks past inter_dim read the row start and are zeroed.
+                coff = live.select(
+                    fx.Int32(ks * TRB) + a_chunk * fx.Int32(16), fx.Int32(0)
+                )
+                regs = []
+                for r in stage_rows:
+                    v = cm.global_vec_load(
+                        arg_a, fx.Int64(m_row + r) * fx.Int64(A_ROW) + fx.Int64(coff), 4
                     )
-                    for r in stage_rows
-                ]
+                    if const_expr(RAGGED and (ks + 1) * 128 > INTER):
+                        z = fx.Int32(0)
+                        v = Vec.from_elements(
+                            [live.select(v[i], z) for i in range(4)], fx.Int32
+                        )
+                    regs.append(v)
+                return regs
 
             def store_a(regs, slot):
                 for p in range_constexpr(a_passes):
@@ -201,10 +213,21 @@ def _build_stage2(
                         W_TILE_BYTES // 4
                     )
                     ldw = lane * fx.Int32(4) + fx.Int32(ks * W_KSTEP // 4)
+                    ldw2 = ldw + fx.Int32(256)
+                    if const_expr(RAGGED and (ks + 1) * 128 > INTER):
+                        # 16 B blocks past the row end read block 0 of this tile.
+                        bcols = 16 if w_f8 else 32
+                        blk = fx.Int32(ks * (8 if w_f8 else 4)) + lgrp
+                        ldw = (blk * fx.Int32(bcols) < fx.Int32(INTER)).select(
+                            ldw, lane16 * fx.Int32(4)
+                        )
+                        ldw2 = (
+                            (blk + fx.Int32(4)) * fx.Int32(bcols) < fx.Int32(INTER)
+                        ).select(ldw2, lane16 * fx.Int32(4))
                     v = cm.buffer_load16(arg_w, base, ldw, nt)
                     if const_expr(w_f8):
                         v = v.shuffle(
-                            cm.buffer_load16(arg_w, base, ldw + fx.Int32(256), nt),
+                            cm.buffer_load16(arg_w, base, ldw2, nt),
                             list(range(8)),
                         )
                     f = fx.make_rmem_tensor(W_NDW, fx.Int32)
@@ -247,6 +270,13 @@ def _build_stage2(
                         + fx.Int64(lane * fx.Int32(4)),
                         1,
                     )
+                    if const_expr(RAGGED and 4 * (2 * kp + 1) + 3 >= G_I):
+                        lo = fx.Int32(4 * 2 * kp) + lgrp < fx.Int32(G_I)
+                        hi = fx.Int32(4 * (2 * kp + 1)) + lgrp < fx.Int32(G_I)
+                        keep = lo.select(fx.Int32(0xFFFF), fx.Int32(0)) | hi.select(
+                            fx.Int32(-65536), fx.Int32(0)
+                        )
+                        v = (v & keep) | (fx.Int32(0x7F7F7F7F) & ~keep)
                     out.append(
                         v.shrui(((r0 // fx.Int32(16)) & fx.Int32(1)) * fx.Int32(8))
                     )
