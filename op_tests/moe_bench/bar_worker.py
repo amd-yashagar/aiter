@@ -154,6 +154,7 @@ class Measurer:
             key, {"total": 0, "ok": 0, "fail": 0, "compile": 0, "error": 0}
         )
         t["total"] += 1
+        t["unnamed"] = t.get("unnamed", 0) + bool(res.get("unnamed"))
         t[res.get("outcome") or ("ok" if res.get("ok") else "error")] = (
             t.get(res.get("outcome") or ("ok" if res.get("ok") else "error"), 0) + 1
         )
@@ -199,6 +200,9 @@ class Measurer:
             reason = cand.verify(route) if hasattr(cand, "verify") else None
             if reason:
                 res["outcome"] = "discarded"
+                # a route that resolved to some other real kernel is aiter declining the
+                # candidate (not applicable here); an unnamed impl is a harness defect
+                res["unnamed"] = "'<lambda>'" in reason
                 self._emit(base, modes, status="router-discarded", detail=reason)
                 return res
             if self.acc_refs is None:
@@ -679,10 +683,10 @@ def _accounting(enum_counts, stats, enum_errors, kind):
         reasons.append("generator errors: " + "; ".join(enum_errors)[:300])
     for k, t in acct.items():
         total = t.get("total", 0)
-        if t.get("enumerated", 0) > 0 and total > 0 and t.get("discarded", 0) == total:
+        if t.get("unnamed", 0) > 0 and t.get("ok", 0) == 0:
             reasons.append(
-                f"{k}: all {total} tried candidates router-discarded "
-                "(the router never ran what the harness forced)"
+                f"{k}: {t['unnamed']} candidates resolved to an unnamed impl "
+                "('<lambda>'), the router check cannot tell what ran"
             )
         if (
             t.get("enumerated", 0) > 0

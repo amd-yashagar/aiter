@@ -129,13 +129,16 @@ def test_source_discarded_everywhere_is_flagged(tmp_path):
 
     enum = {"fused_moe:*": 3, "fused_moe:flydsl-graph": 2, "fused_moe:asm": 1}
     stats = {
-        "fused_moe:flydsl-graph": {"total": 2, "ok": 0, "discarded": 2},
+        "fused_moe:flydsl-graph": {"total": 2, "ok": 0, "discarded": 2, "unnamed": 2},
         "fused_moe:asm": {"total": 1, "ok": 1, "discarded": 0},
     }
     acct, why = _accounting(enum, stats, [], "bar")
-    assert "fused_moe:flydsl-graph: all 2 tried candidates router-discarded" in why
+    assert "fused_moe:flydsl-graph: 2 candidates resolved to an unnamed impl" in why
     assert "asm" not in why
     assert acct["fused_moe:flydsl-graph"]["enumerated"] == 2
+    # aiter declining a candidate (a real other kernel resolved) is not a harness defect
+    declined = {"fused_moe:flydsl-graph": {"total": 2, "ok": 0, "discarded": 2}}
+    assert _accounting(enum, declined, [], "bar")[1] == ""
 
     import csv
     import json

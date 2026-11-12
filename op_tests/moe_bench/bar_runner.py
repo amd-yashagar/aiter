@@ -365,7 +365,9 @@ def mark_router_discards(bar_csv, candidates_csv, reason):
         for r in csv.DictReader(f):
             be = routes.backend_of((r.get("kernels") or "").split(" ")[0]) or "?"
             t = bad.setdefault((r["case_id"], be), [0, 0])
-            t[0] += r.get("status") == "router-discarded"
+            t[0] += r.get("status") == "router-discarded" and "'<lambda>'" in (
+                r.get("detail") or ""
+            )
             t[1] += r.get("status") == "ok"
     hit = {c for (c, _), (d, ok) in bad.items() if d and not ok}
     with open(bar_csv, newline="") as f:
