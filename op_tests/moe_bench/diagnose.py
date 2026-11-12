@@ -23,8 +23,8 @@ import torch
 def interleave_position(S):
     """Interleaved row of each separated row of w1: tiles of 16 gate rows then 16 up."""
     i = S.I
-    pos = torch.empty(2 * i, dtype=torch.long)
-    r = torch.arange(i)
+    pos = torch.empty(2 * i, dtype=torch.long, device="cpu")
+    r = torch.arange(i, device="cpu")
     pos[:i] = (r // 16) * 32 + (r % 16)
     pos[i:] = (r // 16) * 32 + 16 + (r % 16)
     return pos
