@@ -113,7 +113,7 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
     numerics: ClassVar[dict] = {
         "act_quant": "per_1x128_fp8",
         "inter": "fp32_direct",
-        "combine": "bf16_rows_fp32_reduce",
+        "combine": "bf16_rows_fp32_sum",
     }
 
     def supports(self, spec, m, topk, call=None):
