@@ -1948,11 +1948,14 @@ def _fused_moe_impl(
         ("bias2", bias2, _bias_paths and metadata.stage2_has_bias),
     ):
         if _bias is not None and not _applied:
-            raise NotImplementedError(
-                f"{_name} is not applied by this MoE path (quant_type={quant_type}, "
-                f"activation={activation}, q_dtype_a={q_dtype_a}, q_dtype_w={q_dtype_w}, "
-                f"dtype={dtype}, 1-stage={bool(metadata.run_1stage)}); the call would "
-                "return the result without the bias."
+            _warn_bias_not_applied(
+                _name,
+                quant_type,
+                activation,
+                q_dtype_a,
+                q_dtype_w,
+                dtype,
+                bool(metadata.run_1stage),
             )
 
     if (
@@ -4047,6 +4050,18 @@ def _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled):
             "both w1 and w2; unshuffled per_Tensor and per_Token "
             "weights are unsupported"
         )
+
+
+@functools.cache
+def _warn_bias_not_applied(
+    name, quant_type, activation, q_dtype_a, q_dtype_w, dtype, one_stage
+):
+    """Warn once per path: a bias was passed and the chosen path drops it."""
+    logger.warning(
+        f"[fused_moe] {name} is not applied by this MoE path (quant_type={quant_type}, "
+        f"activation={activation}, q_dtype_a={q_dtype_a}, q_dtype_w={q_dtype_w}, "
+        f"dtype={dtype}, 1-stage={one_stage}); the result is computed without the bias."
+    )
 
 
 def _swiglu_limit_is_active(swiglu_limit) -> bool:

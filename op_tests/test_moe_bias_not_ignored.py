@@ -4,14 +4,15 @@
 
 Only the MXFP4 (per_1x32, bf16/fp16 output) stages take the expert bias. Every other path
 (a16w16, fp8 per-tensor, per-token and blockscale, int8, mxfp8) dropped it: the call returned
-the result without the bias, bit for bit, even for a bias 100x the signal. fused_moe now raises
-``NotImplementedError`` for them.
+the result without the bias, bit for bit, even for a bias 100x the signal. This variant warns
+once per path and argument; ``fix-moe-bias-ignored-raise`` raises instead.
 """
 
 import pytest
 import torch
 
 import aiter
+import aiter.fused_moe as fused_moe_module
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe, fused_topk
 from aiter.jit.utils.chip_info import get_gfx
@@ -110,30 +111,32 @@ def _call(family, token, bias):
     )
 
 
+@pytest.fixture
+def warnings(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        fused_moe_module.logger, "warning", lambda msg, *a, **k: seen.append(msg)
+    )
+    fused_moe_module._warn_bias_not_applied.cache_clear()
+    return seen
+
+
 @pytest.mark.parametrize("token", [16, 512])
 @pytest.mark.parametrize("family", list(FAMILIES))
-def test_bias_is_refused_where_it_is_not_applied(family, token):
-    with pytest.raises(NotImplementedError, match="bias"):
-        _call(family, token, True)
+def test_a_bias_the_path_drops_is_warned_about_once(family, token, warnings):
+    out = _call(family, token, True)
+    _call(family, token, True)
+    dropped = [w for w in warnings if "is not applied by this MoE path" in w]
+    # one warning per argument (bias1, bias2) and path, not one per call
+    assert len(dropped) == 2
+    assert any("bias1" in w for w in dropped) and any("bias2" in w for w in dropped)
+    assert torch.isfinite(out.float()).all()
 
 
 @pytest.mark.parametrize("family", list(FAMILIES))
-def test_bias_only_stage1_or_stage2_is_refused_too(family):
-    x, w1, w2, tw, ti = _inputs(16)
-    spec = FAMILIES[family](x, w1, w2)
-    for name in ("bias1", "bias2"):
-        kw = {name: torch.ones(E, 2 * I if name == "bias1" else D, device="cuda")}
-        with pytest.raises(NotImplementedError, match=name):
-            fused_moe(
-                x,
-                spec["w1"],
-                spec["w2"],
-                tw,
-                ti,
-                activation=ActivationType.Silu,
-                **kw,
-                **spec["kwargs"],
-            )
+def test_calls_without_a_bias_do_not_warn(family, warnings):
+    _call(family, 16, False)
+    assert not [w for w in warnings if "is not applied" in w]
 
 
 @pytest.mark.parametrize("token", [16, 512])
