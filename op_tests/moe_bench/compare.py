@@ -276,7 +276,12 @@ def bar_view(rows, bar_rows, new_rows, weights):
                 "gap": gap if gap is not None else "",
                 "roofline_eff": roof / new_us if (roof and new_us) else "",
                 "band": band_v,
-                "won_mode": bool(gap is not None and gap < -band_v),
+                "new_kernel_id": (n.get("new_kernel_id") or "") if n else "",
+                "won_mode": bool(
+                    gap is not None
+                    and gap < -band_v
+                    and not (n and n.get("new_kernel_id") == "aiter")
+                ),
                 "weight": model_weight(b["model"], weights),
             }
         )
@@ -420,8 +425,11 @@ def cmd_merge(args):
     runs = [load(p) for p in args.runs]
     by = collections.defaultdict(list)
     for run in runs:
-        for r in run:
-            by[(r["case_id"], r["mode"])].append(r)
+        last = {}
+        for r in run:  # a resumed run may hold a case twice: keep its latest row
+            last[(r["case_id"], r["mode"])] = r
+        for k, r in last.items():
+            by[k].append(r)
     cols = runner.RESULT_COLS + ["spread", "noise_band", "repeats"]
     with open(args.out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")

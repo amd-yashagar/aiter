@@ -162,6 +162,10 @@ def main(argv=None):
         "--new-entry", help="new mode: pkg.module (prepare/forward) or pkg.module:fn"
     )
     p.add_argument(
+        "--new-routes",
+        help="new mode: route table path or kernel id for prepare(routes=...), test only",
+    )
+    p.add_argument(
         "--source-module", action="append", help="module that registers sources"
     )
     p.add_argument("--resume", action="store_true")

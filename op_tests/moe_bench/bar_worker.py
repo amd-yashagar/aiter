@@ -132,6 +132,7 @@ class Measurer:
                     timing_mode=timer.mode,
                     **st,
                     **corr,
+                    new_kernel_id=getattr(cand, "kernel_id", ""),
                     kernel1=route.get("kernel1", ""),
                     kernel2=route.get("kernel2", ""),
                     route_key=route.get("route_key", ""),
@@ -429,7 +430,10 @@ def _emit_summary(fh, c, S, mode, results, ident, skipped, kind, main_failure=No
         if ok:
             r = next(iter(ok.values()))
             row.update(
-                new_us=r["by_mode"][mode]["median_us"], new_id=r["cand"].id, status="ok"
+                new_us=r["by_mode"][mode]["median_us"],
+                new_id=r["cand"].id,
+                new_kernel_id=getattr(r["cand"], "kernel_id", ""),
+                status="ok",
             )
         else:
             row.update(status="no-correct-candidate")

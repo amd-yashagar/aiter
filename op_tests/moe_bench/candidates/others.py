@@ -9,6 +9,7 @@ for it. Multi-GPU paths are skipped by definition.
 """
 
 import importlib
+import inspect
 import os
 
 from . import Candidate, Source, register
@@ -62,20 +63,52 @@ class MultiGpu(_Skipped):
     reason = "skipped: multi-GPU paths (MegaMoE, comm-fused MoE) are out of scope"
 
 
+PREPARE_KWARGS = (
+    "w1_scale",
+    "w2_scale",
+    "quant_type",
+    "activation",
+    "doweight_stage1",
+    "bias1",
+    "bias2",
+    "gate_mode",
+    "swiglu_limit",
+    "beta",
+    "linear_beta",
+    "hidden_pad",
+    "intermediate_pad",
+)
+
+
+def split_kwargs(kwargs):
+    """fused_moe kwargs -> (model-constant prepare kwargs, per-call kwargs).
+
+    The split follows docs/aiter-moe-api.md (core-api-contract.md until it is
+    published): weight-level and model-constant arguments go to prepare.
+    """
+    prep = {k: v for k, v in kwargs.items() if k in PREPARE_KWARGS}
+    call = {k: v for k, v in kwargs.items() if k not in PREPARE_KWARGS}
+    return prep, call
+
+
 class NewCandidate(Candidate):
     """The new entry point, timed over the same region as every other candidate.
 
-    ``MOE_BENCH_NEW_ENTRY=pkg.module`` names a module with
+    ``MOE_BENCH_NEW_ENTRY=pkg.module`` names a module with the core API:
 
-        prepare(w1, w2, w1_scale, w2_scale, *, ref_weights, meta) -> handle
-        forward(handle, hidden_states, topk_weight, topk_ids, **kwargs) -> output
+        weights = prepare(w1, w2, *, w1_scale, w2_scale, quant_type, activation, dtype,
+                          doweight_stage1, bias1, bias2, gate_mode, swiglu_limit, ...,
+                          num_global_experts=None, routes=None)
+        out = forward(hidden_states, weights, topk_weight, topk_ids, *, expert_mask,
+                      num_local_tokens, output, ...)
+        explain(weights, M) -> {"route": kernel_id | "aiter", ...}
 
-    ``prepare`` runs once per weight group, untimed. ``forward`` is the timed call:
-    ``kwargs`` are fused_moe's keyword arguments for the case (activation, quant_type,
-    expert_mask, bias, swiglu_limit, output, ...). ``ref_weights`` are the unshuffled
-    quantized weights and scales the reference uses. ``pkg.module:fn`` instead names a
-    function with fused_moe's own signature. ``forward`` may raise NotImplementedError
-    for cases it does not cover (recorded as unsupported).
+    ``prepare`` runs once per weight group, untimed, on the same aiter-layout tensors
+    ``fused_moe`` gets in dispatch mode. ``MOE_BENCH_NEW_ROUTES`` (``--new-routes``)
+    is passed as ``prepare(routes=...)``: a route table path or a kernel id. A case
+    served by route ``aiter`` is reported with new_kernel_id ``aiter`` and never counts
+    as won. A module whose ``prepare`` takes ``ref_weights`` uses the earlier provisional
+    interface, and ``pkg.module:fn`` a function with fused_moe's own signature.
     """
 
     source = "new"
@@ -85,30 +118,50 @@ class NewCandidate(Candidate):
         kid = getattr(mod, "kernel_id", None) or getattr(fn or mod, "__name__", "new")
         super().__init__(f"new|{kid}", str(kid))
         self.mod, self.fn = mod, fn
+        self.kernel_id = ""
+        self.provisional = (
+            fn is None and "ref_weights" in inspect.signature(mod.prepare).parameters
+        )
 
     def prepare(self, ctx):
-        if self.fn is not None or "new" in ctx.group_cache:
+        if self.fn is not None:
             return
         S = ctx.S
-        meta = {
-            "model_dim": S.D,
-            "inter_dim": S.I,
-            "experts": S.E_local,
-            "topk": S.topk,
-            "dtype": S.dtype,
-            "quant_type": S.qtype,
-            "activation": S.act,
-            "g1u1": S.g1u1,
-            "gate_mode": S.gate_mode,
-        }
-        ctx.group_cache["new"] = self.mod.prepare(
-            ctx.aw["w1"],
-            ctx.aw["w2"],
-            ctx.aw.get("w1_scale"),
-            ctx.aw.get("w2_scale"),
-            ref_weights=ctx.ref_weights,
-            meta=meta,
-        )
+        if self.provisional:
+            if "new" not in ctx.group_cache:
+                meta = {
+                    "model_dim": S.D,
+                    "inter_dim": S.I,
+                    "experts": S.E_local,
+                    "topk": S.topk,
+                    "dtype": S.dtype,
+                    "quant_type": S.qtype,
+                    "activation": S.act,
+                    "g1u1": S.g1u1,
+                    "gate_mode": S.gate_mode,
+                }
+                ctx.group_cache["new"] = self.mod.prepare(
+                    ctx.aw["w1"],
+                    ctx.aw["w2"],
+                    ctx.aw.get("w1_scale"),
+                    ctx.aw.get("w2_scale"),
+                    ref_weights=ctx.ref_weights,
+                    meta=meta,
+                )
+            return
+        if "new" not in ctx.group_cache:
+            prep, _ = split_kwargs(ctx.kwargs)
+            kw = dict(prep, dtype=S.dtype)
+            if S.is_ep:
+                kw["num_global_experts"] = S.E
+            routes = os.environ.get("MOE_BENCH_NEW_ROUTES")
+            if routes:
+                kw["routes"] = routes
+            ctx.group_cache["new"] = self.mod.prepare(ctx.aw["w1"], ctx.aw["w2"], **kw)
+        explain = getattr(self.mod, "explain", None)
+        if explain is not None:
+            self.kernel_id = str(explain(ctx.group_cache["new"], S.M).get("route", ""))
+            self.kernels = self.kernel_id
 
     def call(self, ctx):
         kw = dict(ctx.kwargs)
@@ -127,10 +180,19 @@ class NewCandidate(Candidate):
 
             return run
         handle = ctx.group_cache["new"]
+        if self.provisional:
+
+            def run():
+                return self.mod.forward(
+                    handle, ctx.hidden_static, ctx.tw, ctx.ti, output=ctx.outbuf, **kw
+                )
+
+            return run
+        _, call_kw = split_kwargs(kw)
 
         def run():
             return self.mod.forward(
-                handle, ctx.hidden_static, ctx.tw, ctx.ti, output=ctx.outbuf, **kw
+                ctx.hidden_static, handle, ctx.tw, ctx.ti, output=ctx.outbuf, **call_kw
             )
 
         return run

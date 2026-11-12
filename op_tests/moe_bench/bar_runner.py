@@ -58,6 +58,7 @@ BAR_COLS = (
         "main_failure",
         "new_us",
         "new_id",
+        "new_kernel_id",
         "roofline_us",
         "roofline_staged_us",
         "roofline_serial_us",
@@ -96,6 +97,7 @@ CAND_COLS = [
     "route_key",
     "kernel1",
     "kernel2",
+    "new_kernel_id",
     "node",
     "gpu",
     "aiter_sha",
@@ -272,6 +274,8 @@ def cmd_bar(args):
     )
     if args.new_entry:
         os.environ["MOE_BENCH_NEW_ENTRY"] = args.new_entry
+    if getattr(args, "new_routes", None):
+        os.environ["MOE_BENCH_NEW_ROUTES"] = args.new_routes
     tier = args.tier_name or tier_name(args.cases)
     cases = runner.select_cases(args.cases.split(","), args.filter)
     if getattr(args, "ids", None):
