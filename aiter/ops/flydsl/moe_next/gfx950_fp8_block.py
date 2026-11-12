@@ -55,7 +55,7 @@ class _Fp8BlockGfx950(MoeKernel):
     archs = ("gfx950",)
     routing = "tiles"
     epilogue = "atomic"
-    handles_kwargs = ()
+    handles_kwargs = frozenset()
 
     def supports(self, spec, m, topk, call=None):
         if spec.quant != QuantType.per_1x128:
