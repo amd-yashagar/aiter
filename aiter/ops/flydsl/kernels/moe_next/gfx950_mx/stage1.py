@@ -67,6 +67,8 @@ def _build_stage1(
     tile_n=128,
     ahead=2,
     read_ahead=1,
+    nt=False,
+    a_resident=True,
 ):
     K = int(model_dim)
     INTER = int(inter_dim)
@@ -106,7 +108,10 @@ def _build_stage1(
     a_lds_bytes = BM * TILE_RB
     acc_stride = BNH * 4 + 16
     acc_bytes = BM * acc_stride
-    lds_bytes = max(2 * a_lds_bytes, acc_bytes)
+    # Small tiles keep every K tile of the token rows in LDS: one barrier, then the
+    # loop streams weights only, so nothing forces their loads to drain early.
+    A_RESIDENT = a_resident and KT * a_lds_bytes <= 112 * 1024
+    lds_bytes = max((KT if A_RESIDENT else 2) * a_lds_bytes, acc_bytes)
     limit = float("inf") if swiglu_limit is None else float(swiglu_limit)
 
     @fx.struct
@@ -239,7 +244,7 @@ def _build_stage1(
                 phys_tile(ct0 + fx.Int32(t % (NT // 2)), t // (NT // 2))
                 for t in range(NT)
             ]
-            w_base = [fx.Int64(e_tile0 + t) * fx.Int64(W_TILE_BYTES) for t in tiles]
+            w_base_dw = [(e_tile0 + t) * fx.Int32(W_TILE_BYTES // 4) for t in tiles]
             if const_expr(STATIC_HALF):
                 # One dword per 32-row pair; the tile's half is a static opsel.
                 if const_expr(interleave):
@@ -262,17 +267,15 @@ def _build_stage1(
                 for t in range_constexpr(NT):
                     per_ks = []
                     for ks in range_constexpr(2):
-                        off = (
-                            w_base[t]
-                            + fx.Int64((2 * kt + ks) * W_KSTEP)
-                            + fx.Int64(lane * fx.Int32(16))
+                        ldw = lane * fx.Int32(4) + fx.Int32(
+                            (2 * kt + ks) * W_KSTEP // 4
                         )
+                        v = cm.buffer_load16(arg_w, w_base_dw[t], ldw, nt)
                         if const_expr(w_f8):
-                            lo = cm.global_vec_load(arg_w, off, 4)
-                            hi = cm.global_vec_load(arg_w, off + fx.Int64(1024), 4)
-                            v = lo.shuffle(hi, list(range(8)))
-                        else:
-                            v = cm.global_vec_load(arg_w, off, 4)
+                            hi = cm.buffer_load16(
+                                arg_w, w_base_dw[t], ldw + fx.Int32(256), nt
+                            )
+                            v = v.shuffle(hi, list(range(8)))
                         f = fx.make_rmem_tensor(W_NDW, fx.Int32)
                         f.store(v)
                         per_ks.append(f)
@@ -314,15 +317,21 @@ def _build_stage1(
 
             # Software pipeline: weights are issued LA tiles ahead, token tiles ALA;
             # tile kt+1's registers go to LDS at the end of tile kt.
-            a_pend = {i: load_a_tile(i) for i in range(min(ALA, KT))}
+            if const_expr(A_RESIDENT):
+                for i in range_constexpr(KT):
+                    store_a_tile(load_a_tile(i), i)
+                a_pend = {}
+            else:
+                a_pend = {i: load_a_tile(i) for i in range(min(ALA, KT))}
             w_pend = {i: load_w(i) for i in range(min(LA, KT))}
             s_pend = {p: load_a_scales(2 * p) for p in range((min(LA, KT) + 1) // 2)}
-            store_a_tile(a_pend.pop(0), 0)
+            if const_expr(not A_RESIDENT):
+                store_a_tile(a_pend.pop(0), 0)
             gpu.barrier()
             for kt in range_constexpr(KT):
-                slot = kt % 2
+                slot = kt if A_RESIDENT else kt % 2
                 nk = kt + LA
-                if const_expr(kt + ALA < KT):
+                if const_expr(not A_RESIDENT and kt + ALA < KT):
                     a_pend[kt + ALA] = load_a_tile(kt + ALA)
                 if const_expr(nk < KT):
                     w_pend[nk] = load_w(nk)
@@ -354,8 +363,11 @@ def _build_stage1(
                             scale_a=a_sc[j],
                             scale_b=wsc[pair_of[t]],
                         )
-                if const_expr(kt + 1 < KT):
-                    store_a_tile(a_pend.pop(kt + 1), 1 - slot)
+                if const_expr(not A_RESIDENT):
+                    if const_expr(kt + 1 < KT):
+                        store_a_tile(a_pend.pop(kt + 1), 1 - slot)
+                    gpu.barrier()
+            if const_expr(A_RESIDENT):
                 gpu.barrier()
 
             # Epilogue 1: bias + activation in registers, f32 results to LDS.

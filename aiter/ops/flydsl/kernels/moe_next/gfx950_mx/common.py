@@ -144,3 +144,17 @@ def quant_f32_fp8(vals, qscale):
         )
         out.append(fx.Vector(v).bitcast(fx.Int32)[0])
     return out
+
+
+def buffer_load16(addr_i64, base_dw, lane_dw, nt=False):
+    """16 bytes per lane by buffer load: wave-uniform dword base folded into the
+    descriptor, per-lane dword offset; nt sets the streaming cache policy."""
+    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import flat_buffer_view
+
+    view = flat_buffer_view(
+        addr_i64, _raw(base_dw), T.i32, align=16, elem_bytes=4, fold=True
+    )
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(2 if nt else 0), 32)
+    frag = fx.make_rmem_tensor(4, fx.Int32)
+    fx.copy(atom, view[lane_dw, None], frag)
+    return fx.Vector(frag.load())
