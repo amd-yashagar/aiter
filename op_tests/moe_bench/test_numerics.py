@@ -531,3 +531,64 @@ def test_whole_graph_on_a_bf16_case_has_no_quant_in_either_sub_path():
     for route in _whole_graph_routes().values():
         n = accuracy.numerics_from_route(S, route)
         assert n["act_quant"] == "none" and n["inter"] == "bf16"
+
+
+def test_in_kernel_paths_are_scored_against_the_scale_rule_they_match():
+    S = _mx()
+    in_kernel = {
+        "act_quant": "mx_fp4_round_up",
+        "inter": "fp32_direct",
+        "inter_quant": "mx_fp4_in_kernel",
+        "combine": "bf16_atomic (inferred)",
+        "out_dtype": "bf16",
+    }
+    assert accuracy.has_in_kernel(in_kernel)
+    v = accuracy.in_kernel_variants(S, in_kernel)
+    assert set(v) == {"round_up", "even"}
+    # the activation went through the quant call: only the intermediate's rule varies
+    assert v["even"]["act_quant"] == "mx_fp4_round_up"
+    assert v["even"]["inter_quant"] == "mx_fp4_even"
+    assert not accuracy.has_in_kernel(v["even"])
+    # a 1-stage kernel quantizes both in-kernel: both rules vary together
+    one = dict(in_kernel, act_quant="mx_fp4_in_kernel")
+    v1 = accuracy.in_kernel_variants(S, one)
+    assert v1["even"]["act_quant"] == "mx_fp4_even"
+    assert v1["round_up"]["inter_quant"] == "mx_fp4_round_up"
+
+
+def test_match_rule_picks_the_closer_reference_and_applies_the_strict_rule():
+    def seed(up, even):
+        return {
+            "seed": 0,
+            "rep": 0,
+            "path_round_up_rel_l2": up,
+            "path_even_rel_l2": even,
+            "path_round_up_allclose": 0.2 if up > 0.01 else 0.0,
+            "path_even_allclose": 0.2 if even > 0.01 else 0.0,
+            "path_round_up_logits_diff": up * up / 2,
+            "path_even_logits_diff": even * even / 2,
+            "exact_rel_l2": 0.5,
+            "exact_logits_diff": 0.12,
+        }
+
+    for matches, small, big in (("even", 1e-3, 0.27), ("round_up", 1e-3, 0.27)):
+        per = [seed(big, small) if matches == "even" else seed(small, big)] * 3
+        res = {
+            "per_seed": per,
+            "nan_inf": 0,
+            "sentinel_ok": True,
+            **accuracy.aggregate(per),
+        }
+        assert accuracy.match_rule(res, ("round_up", "even")) == matches
+        assert accuracy.rule(res) is True
+    # neither rule matches: both references are far, aiter's rule fails the path
+    per = [seed(0.3, 0.25)] * 3
+    res = {
+        "per_seed": per,
+        "nan_inf": 0,
+        "sentinel_ok": True,
+        **accuracy.aggregate(per),
+    }
+    accuracy.match_rule(res, ("round_up", "even"))
+    assert accuracy.rule(res) is False
+    assert accuracy.match_rule({"mean": {}, "per_seed": []}, ("even",)) is None

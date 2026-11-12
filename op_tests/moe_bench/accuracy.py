@@ -453,6 +453,39 @@ def whole_graph_is_prefill(route):
         raise NumericsError(f"whole-graph route {k1!r} carries no config: {e}") from e
 
 
+def in_kernel_variants(S, n):
+    """The numerics to try for a path that quantizes MX in-kernel: {rule: numerics}.
+
+    The scale rule of a 1-stage ASM kernel, or of the MXMOE g1 epilogue's intermediate,
+    is not named by the route, so ref_path is built under each rule (both quantizations
+    for a path that quantizes its activations in-kernel, the intermediate alone where the
+    activations go through the quant call) and the kernel is scored against the one it
+    matches. Neither matching means its rule is a third one: reported, not guessed.
+    """
+    fam = quant_name(S)
+    out = {}
+    for rule in ("round_up", "even"):
+        v = dict(n)
+        if n["act_quant"].endswith("_in_kernel"):
+            v["act_quant"] = f"{fam}_{rule}"
+        if n["inter_quant"].endswith("_in_kernel"):
+            v["inter_quant"] = f"{fam}_{rule}"
+            if n["inter"] != "bf16":
+                v["inter"] = (
+                    f"bf16_then_{fam}_{rule}"
+                    if n["inter"].startswith("bf16_then_")
+                    else n["inter"]
+                )
+        out[rule] = v
+    return out
+
+
+def has_in_kernel(n):
+    return n["act_quant"].endswith("_in_kernel") or n["inter_quant"].endswith(
+        "_in_kernel"
+    )
+
+
 def mx_rule_of_route(fam):
     """The scale rule of the quant call fused_moe makes for an MX 2-stage path.
 
@@ -820,6 +853,26 @@ def rule(res, flat_mxfp4=False):
         if flat_mxfp4 and m["path_logits_diff"] >= FLAT_MXFP4_LOGITS_LIMIT:
             return False
     return True
+
+
+def match_rule(res, rules):
+    """Pick the scale rule whose ref_path the kernel matches best (smallest mean
+    rel_l2) and make its metrics the ``path_*`` ones, so aiter's strict rule is applied
+    against it. Returns the rule, or None when no variant was scored."""
+    scored = {
+        r: res["mean"][f"path_{r}_rel_l2"]
+        for r in rules
+        if f"path_{r}_rel_l2" in res["mean"]
+    }
+    if not scored:
+        return None
+    best = min(scored, key=scored.get)
+    for m in res["per_seed"]:
+        for k in (*METRICS, "logits_diff"):
+            if f"path_{best}_{k}" in m:
+                m[f"path_{k}"] = m[f"path_{best}_{k}"]
+    res.update(aggregate(res["per_seed"]))
+    return best
 
 
 def flat_columns(res, prefix=""):

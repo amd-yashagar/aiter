@@ -216,11 +216,18 @@ class Measurer:
                 )
                 return res
             num = accuracy.numerics_of(ctx.S, cand, route, ctx)
+            variants = (
+                accuracy.in_kernel_variants(ctx.S, num)
+                if accuracy.has_in_kernel(num)
+                else None
+            )
             nkey = accuracy.numerics_key(num)
             base["numerics"] = nkey
             res["numerics"] = nkey
             try:
-                refs = self.refs_for(num)
+                refs = (
+                    self.refs_for_variants(variants) if variants else self.refs_for(num)
+                )
             except NotImplementedError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -256,6 +263,20 @@ class Measurer:
                 and ctx.S.qtype.name == "per_1x32"
                 and ctx.S.wq == dtypes.fp4x2,
             )
+            if variants:
+                rule = accuracy.match_rule(acc, tuple(variants))
+                if rule:
+                    nkey = (
+                        accuracy.numerics_key(variants[rule]) + ";rule_source=matched"
+                    )
+                    base["numerics"] = res["numerics"] = nkey
+                    acc["matched_rule"] = rule
+                    acc["pass"] = accuracy.rule(
+                        acc,
+                        flat_mxfp4=bool(route.get("flat"))
+                        and ctx.S.qtype.name == "per_1x32"
+                        and ctx.S.wq == dtypes.fp4x2,
+                    )
             res["acc"] = acc
             cols = accuracy.flat_columns(acc)
             if acc["pass"] is None:
@@ -356,6 +377,16 @@ class Measurer:
                 del hs
             self._path_cache[key] = by_seed
         return self._path_cache[key]
+
+    def refs_for_variants(self, variants):
+        """{seed: {"exact", "path_<rule>"...}}: one ref_path per candidate scale rule."""
+        out = {}
+        for rule, n in variants.items():
+            for seed, d in self.refs_for(n).items():
+                slot = out.setdefault(seed, {"exact": d["exact"]})
+                if "path" in d:
+                    slot[f"path_{rule}"] = d["path"]
+        return out
 
     def _emit(self, base, modes, **kw):
         for m in modes:
