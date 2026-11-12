@@ -67,10 +67,12 @@ def fp8_dword_to_bf16x4(word):
     return Vec.from_elements([d0, d1], fx.Int32).bitcast(fx.Int16)
 
 
-def lds_ptr16(base, dword_off):
-    """A 16-byte-aligned int32 pointer ``dword_off`` dwords past an LDS array."""
+def lds_ptr16(base, dword_off, align=16):
+    """An ``align``-byte-aligned int32 pointer ``dword_off`` dwords past an LDS array."""
     p = fx.recast_iter(fx.Int32, base) + dword_off
-    return fx.recast_iter(fx.PointerType.get(fx.Int32.ir_type, p.address_space, 16), p)
+    return fx.recast_iter(
+        fx.PointerType.get(fx.Int32.ir_type, p.address_space, align), p
+    )
 
 
 def lds_load_x4(base, dword_off):
@@ -79,6 +81,10 @@ def lds_load_x4(base, dword_off):
 
 def lds_store_x4(base, dword_off, value):
     fx.generic_store(lds_ptr16(base, dword_off), value)
+
+
+def lds_store_x2(base, dword_off, value):
+    fx.generic_store(lds_ptr16(base, dword_off, 8), value)
 
 
 def bf16_pair(words, j):
