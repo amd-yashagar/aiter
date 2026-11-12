@@ -29,12 +29,17 @@ SCALE_BLOCK = 128
 TILE_K = 128
 
 
-def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu", OUT_FP8=False):
+def compile_gateup(
+    *, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu", OUT_FP8=False, A_BF16=False
+):
     """N = 2 * inter_dim (gate rows then up rows), K = model_dim.
 
     OUT_FP8 writes the intermediate as aiter's per_1x128 quant of the bf16 result
     would ([M * TOPK, I] fp8 plus [M * TOPK, I / 128] fp32 scales), computed in the
     epilogue; it needs BLOCK_N = 256 so a workgroup owns one 128-column group.
+    A_BF16 reads bf16 hidden states and applies aiter's per_1x128 activation quant
+    to each K tile while loading it (the scale goes to LDS for the fold), so no
+    separate quant kernel and no activation-scale tensor are needed.
     """
     assert activation in ("silu", "gelu")
     assert BLOCK_N in (128, 256), "each wave owns BLOCK_N // 8 gate and up channels"
@@ -57,6 +62,8 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu", OUT_FP8=F
     class GemmBuffers:
         a_ping: fx.Array[weight_dtype, a_lds_size, 16]
         a_pong: fx.Array[weight_dtype, a_lds_size, 16]
+        sa_ping: fx.Array[fx.Float32, BLOCK_M, 16]
+        sa_pong: fx.Array[fx.Float32, BLOCK_M, 16]
 
     @fx.union
     class SharedStorage:
@@ -165,6 +172,31 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu", OUT_FP8=F
         )
         a_mem_thr = a_mem_cp_g2r.get_slice(tid).partition_S(a_tile)
         a_cp_frag = fx.make_fragment_like(a_mem_thr[None, None, None, 0])
+        if const_expr(A_BF16):
+            a_bf_view = fx.make_view(
+                fx.recast_iter(fx.BFloat16, fx.get_iter(arg_p_input)),
+                fx.get_layout(arg_p_input),
+            )
+            a_bf_tensor = fx.rocdl.make_buffer_tensor(a_bf_view, max_size=False)
+            bf_cp_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+            a_bf_g2r = fx.make_tiled_copy(
+                bf_cp_atom, g2r_tv_layout, fx.make_tile(_thrs_m, TILE_K)
+            )
+            a_bf_idx = TensorWithIndex(
+                a_bf_tensor, TILE_M, TILE_K, a_index_frag, a_bf_g2r, tid
+            )
+            a_bf_tile = fx.flat_divide(
+                fx.rocdl.make_buffer_tensor(
+                    fx.make_view(
+                        fx.get_iter(a_bf_view), fx.make_layout((TILE_M, K), (K, 1))
+                    ),
+                    max_size=False,
+                ),
+                fx.make_tile(TILE_M, TILE_K),
+            )[None, None, 0, None]
+            a_bf_frag = fx.make_fragment_like(
+                a_bf_g2r.get_slice(tid).partition_S(a_bf_tile)[None, None, None, 0]
+            )
 
         # All indices must be captured before a_ping reuses sorted_lds.
         gpu.barrier()
@@ -175,6 +207,10 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu", OUT_FP8=F
         )
         a_ping = fx.make_view(lds.gemm.a_ping.ptr, a_lds_layout)
         a_pong = fx.make_view(lds.gemm.a_pong.ptr, a_lds_layout)
+        sa_lds = [
+            fx.make_view(lds.gemm.sa_ping.ptr, fx.make_layout(BLOCK_M, 1)),
+            fx.make_view(lds.gemm.sa_pong.ptr, fx.make_layout(BLOCK_M, 1)),
+        ]
 
         uni_cp_atom = fx.make_copy_atom(fx.UniversalCopy128b(), weight_dtype)
         a_r2s = fx.make_tiled_copy(
@@ -280,6 +316,51 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu", OUT_FP8=F
             if const_expr(mfma_cnt - used > 0):
                 rocdl.sched_mfma(mfma_cnt - used)
 
+        a_rows_per_rep = _thrs_m
+        a_my_row = tid // _thrs_k
+
+        def load_a(k):
+            if const_expr(A_BF16):
+                a_bf_idx.copy(bf_cp_atom, k, a_bf_frag)
+            else:
+                a_idx.copy(buf_cp_atom_r, k, a_cp_frag)
+
+        def quant_a(write_i):
+            """aiter's per_1x128 quant of the bf16 tile rows this thread holds (16
+            values; _thrs_k consecutive lanes share a row): amax floor 1e-10, scale =
+            amax * fp32(1/240), q = med3(x * (1 / scale), -240, 240) -> fp8."""
+            rep_m = fx.size(fx.get_shape(a_bf_frag)[1]).to_py_value()
+            for m in range_constexpr(rep_m):
+                v = Vec(a_bf_frag[None, m, 0].load())
+                xs = [v[j].to(fx.Float32) for j in range_constexpr(_val_per_thr)]
+                amax = fx.Float32(1e-10)
+                for x in xs:
+                    amax = amax.maximumf(fx.absf(x))
+                for sh in range_constexpr(_thrs_k.bit_length() - 1):
+                    amax = amax.maximumf(
+                        amax.shuffle_xor(fx.Int32(1 << sh), fx.Int32(64))
+                    )
+                scale = amax * fx.Float32(1.0 / 240.0)
+                inv = fx.Float32(1.0) / scale
+                words = []
+                for w in range_constexpr(_val_per_thr // 4):
+                    q = [
+                        (xs[w * 4 + j] * inv)
+                        .maximumf(fx.Float32(-240.0))
+                        .minimumf(fx.Float32(240.0))
+                        for j in range_constexpr(4)
+                    ]
+                    pk = rocdl.cvt_pk_fp8_f32(
+                        T.i32, _raw(q[0]), _raw(q[1]), _raw(fx.Int32(0)), False
+                    )
+                    pk = rocdl.cvt_pk_fp8_f32(T.i32, _raw(q[2]), _raw(q[3]), pk, True)
+                    words.append(fx.Int32(pk))
+                a_cp_frag[None, m, 0].store(
+                    Vec.from_elements(words, fx.Int32).bitcast(weight_dtype)
+                )
+                # Every lane of the row writes the same value.
+                sa_lds[write_i][a_my_row + m * a_rows_per_rep] = scale
+
         def _sload(off):
             v = buffer_ops.buffer_load(
                 ws_rsrc,
@@ -292,19 +373,26 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu", OUT_FP8=F
         def load_scales(k_cur):
             sb_gate = _sload(gate_off + k_cur)
             sb_up = _sload(up_off + k_cur)
+            if const_expr(A_BF16):
+                return [sb_gate, sb_up]
             rows = [
                 a_scale_tensor[row_toks[j] + k_cur]
                 for j in range_constexpr(n_row_loads)
             ]
             return [sb_gate, sb_up] + rows
 
-        def fold(scales):
+        def fold(scales, read_i):
             sb_gate, sb_up = fx.Float32(scales[0]), fx.Float32(scales[1])
             for n in range_constexpr(_n_reps):
-                src = fx.Float32(scales[2 + (n * 16) // 64]).bitcast(fx.Int32)
-                sa = fx.Int32(
-                    rocdl.ds_bpermute(T.i32, _raw(fx.Int32(bperm_addr[n])), _raw(src))
-                ).bitcast(fx.Float32)
+                if const_expr(A_BF16):
+                    sa = fx.Float32(sa_lds[read_i][n * 16 + lane % 16])
+                else:
+                    src = fx.Float32(scales[2 + (n * 16) // 64]).bitcast(fx.Int32)
+                    sa = fx.Int32(
+                        rocdl.ds_bpermute(
+                            T.i32, _raw(fx.Int32(bperm_addr[n])), _raw(src)
+                        )
+                    ).bitcast(fx.Float32)
                 sg = Vec.filled(4, sa * sb_gate, fx.Float32)
                 su = Vec.filled(4, sa * sb_up, fx.Float32)
                 for m in range_constexpr(_m_reps):
@@ -321,7 +409,7 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu", OUT_FP8=F
             write_i = read_i ^ 1
             next_scales = None
             if const_expr(do_prefetch):
-                a_idx.copy(buf_cp_atom_r, k_next, a_cp_frag)
+                load_a(k_next)
                 fx.copy(
                     buf_cp_atom_r, bl_g2r[None, None, None, k_next], bl_ret_st[write_i]
                 )
@@ -354,23 +442,27 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu", OUT_FP8=F
                                 a_frag[None, n, (k, ki)],
                                 p_up[None, m, n],
                             )
-            fold(scales)
+            fold(scales, read_i)
             if const_expr(do_prefetch):
+                if const_expr(A_BF16):
+                    quant_a(write_i)
                 fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w[write_i])
                 hot_loop_scheduler()
             rocdl.sched_barrier(0)
             gpu.barrier()
             return next_scales
 
-        a_idx.copy(buf_cp_atom_r, fx.Int32(0), a_cp_frag)
+        load_a(fx.Int32(0))
         fx.copy(buf_cp_atom_r, bl_g2r[None, None, None, fx.Int32(0)], bl_ret_st[0])
         fx.copy(buf_cp_atom_r, br_g2r[None, None, None, fx.Int32(0)], br_ret_st[0])
         scales0 = load_scales(fx.Int32(0))
         rocdl.s_waitcnt(vmcnt=0)
+        if const_expr(A_BF16):
+            quant_a(0)
         fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w[0])
         gpu.barrier()
 
-        n_sc = 2 + n_row_loads
+        n_sc = 2 if const_expr(A_BF16) else 2 + n_row_loads
         acc_init = [c_gate.load(), c_up.load()] + scales0
         results = acc_init
         for iv, state in range(0, num_tiles // 2 - 1, 1, init=acc_init):

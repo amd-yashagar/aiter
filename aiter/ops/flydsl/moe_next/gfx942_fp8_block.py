@@ -53,7 +53,7 @@ def _tile(config, gpu, inter_dim):
 
 
 @functools.cache
-def _gateup(N, K, topk, block_m, block_n, act, out_fp8):
+def _gateup(N, K, topk, block_m, block_n, act, out_fp8, a_bf16):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_block.gateup import (
         compile_gateup,
     )
@@ -66,6 +66,7 @@ def _gateup(N, K, topk, block_m, block_n, act, out_fp8):
         BLOCK_N=block_n,
         activation=act,
         OUT_FP8=out_fp8,
+        A_BF16=a_bf16,
     )
 
 
@@ -179,7 +180,15 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
             output_aux=AUX_SORT_OPUS,
         )
         quant = aiter.get_hip_quant(QuantType.per_1x128)
-        xq, xs = quant(x, quant_dtype=dtypes.fp8)
+        a_bf16 = bool(
+            _configs(self._gpu(w))
+            .get(call.config or "default", {})
+            .get("inline_a_quant", False)
+        )
+        if a_bf16:
+            xq, xs = x, torch.empty(1, dtype=torch.float32, device=x.device)
+        else:
+            xq, xs = quant(x, quant_dtype=dtypes.fp8)
         tasks = int(sorted_eids.shape[0])
         fused_quant = block_n == 256
         if fused_quant:
@@ -192,7 +201,7 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
             out1 = torch.empty((M, topk, I), dtype=torch.bfloat16, device=x.device)
             out1_scale = xs
         _launch(
-            _gateup(2 * I, D, topk, block_m, block_n, act, fused_quant),
+            _gateup(2 * I, D, topk, block_m, block_n, act, fused_quant, a_bf16),
             xq,
             w.w1,
             out1,
