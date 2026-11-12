@@ -61,7 +61,19 @@ def _score(out, ref):
 
 
 def diagnose(case, rows=16, seed=0, log=print):
-    from . import accuracy, workload
+    """Score the dispatch output against references, in two stages.
+
+    1. *Numerics.* The rounding points of the path that ran are read from its route
+       (``numerics_from_route``); where the route does not name them (in-kernel MX quants) or
+       as a cross-check, the reference is built at each combination of scale rule and
+       rounding before the quant (fp32_direct and bf16_then). The closest becomes the
+       baseline. A SwiGLU semantics variant scored against the wrong rounding point can
+       match by coincidence (an fp32_direct a4w4 kernel read "no +1" against a bf16_then
+       baseline), so stage 2 never mixes them.
+    2. *Semantics* at that baseline: SwiGLU limit off, no ``+1``, gate and up swapped, bias
+       off or read in interleaved order, bf16 activations, an unquantized intermediate.
+    """
+    from . import accuracy, routes, workload
 
     S = workload.resolve(case)
     M = min(case.token, rows)
@@ -71,66 +83,96 @@ def diagnose(case, rows=16, seed=0, log=print):
     kw = workload.fused_kwargs(S, aw, bias, mask)
     import aiter.fused_moe as fm
 
-    out = fm.fused_moe(hs.clone(), aw["w1"], aw["w2"], tw, ti, **kw).clone()
+    with routes.RouteRecorder() as rec:
+        out = fm.fused_moe(hs.clone(), aw["w1"], aw["w2"], tw, ti, **kw).clone()
     torch.cuda.synchronize()
+    route = routes.route_from_record(rec.last()) if rec.records else {}
     ridx = torch.arange(M, device="cuda")
     fam = accuracy.quant_name(S)
     mx = fam in ("mx_fp4", "mx_fp8")
 
-    def numerics(act_rule="round_up", inter_rule="round_up", act=True, inter=True):
-        a = f"{fam}_{act_rule}" if (mx and act) else ("none" if mx else fam or "none")
-        if not mx and not act:
-            a = "none"
-        iq = f"{fam}_{inter_rule}" if (mx and inter) else (fam or "none")
-        n = {
-            "act_quant": a,
-            "inter": f"bf16_then_{iq}" if inter and iq != "none" else "bf16",
-            "combine": "bf16_atomic",
-        }
-        return accuracy.normalize_numerics(S, n)
-
-    def ref(b=bias, n=None, **sw):
-        n = n or numerics()
-        with swiglu_variant(**sw):
-            return accuracy.path_ref(S, rw, b, hs, tw, ti, mask, ridx, n)
-
     results = {}
 
-    def add(name, fn):
+    def score(name, fn, group):
         try:
             r = fn()
         except Exception as e:  # noqa: BLE001
-            log(f"  {name:<34} not computable: {type(e).__name__}: {str(e)[:80]}")
-            return
-        results[name] = _score(out[:M], r)
+            log(f"  {name:<44} not computable: {type(e).__name__}: {str(e)[:80]}")
+            return None
+        results[name] = _score(out[:M], r) + (group,)
         log(
-            f"  {name:<34} rel_l2 {results[name][0]:.4f}  logits_diff {results[name][1]:.5f}"
+            f"  {name:<44} rel_l2 {results[name][0]:.4f}  "
+            f"logits_diff {results[name][1]:.5f}"
         )
+        return results[name]
 
-    log(f"{case.id} {S.act.name} {fam} bias={S.bias} gate_mode={S.gate_mode} M={M}")
-    exact = accuracy.exact_ref(S, rw, bias, hs, tw, ti, mask, ridx)
-    results["ref_exact"] = _score(out[:M], exact)
     log(
-        f"  {'ref_exact':<34} rel_l2 {results['ref_exact'][0]:.4f}  logits_diff {results['ref_exact'][1]:.5f}"
+        f"{case.id} {S.act.name} {fam} bias={S.bias} gate_mode={S.gate_mode} M={M} "
+        f"route={route.get('kernel1', '')[:40]}"
     )
-    add("baseline (limit 7, alpha 1.702, +1)", lambda: ref())
+    exact = accuracy.exact_ref(S, rw, bias, hs, tw, ti, mask, ridx)
+    results["ref_exact"] = _score(out[:M], exact) + ("exact",)
+    log(
+        f"  {'ref_exact':<44} rel_l2 {results['ref_exact'][0]:.4f}  "
+        f"logits_diff {results['ref_exact'][1]:.5f}"
+    )
+
+    def ref(n, b=bias, **sw):
+        with swiglu_variant(**sw):
+            return accuracy.path_ref(S, rw, b, hs, tw, ti, mask, ridx, n)
+
+    # stage 1: rounding points
+    n0 = accuracy.numerics_from_route(S, route)
+    bases = {}
+    if accuracy.has_in_kernel(n0):
+        bases = {
+            f"numerics {k}": v for k, v in accuracy.in_kernel_variants(S, n0).items()
+        }
+    else:
+        bases = {"numerics from the route": n0}
+        for rounding in ("fp32_direct", "bf16_then"):
+            iq = n0["inter_quant"]
+            if iq == "none" or n0["inter"] == "bf16":
+                continue
+            v = dict(
+                n0,
+                inter="fp32_direct" if rounding == "fp32_direct" else f"bf16_then_{iq}",
+            )
+            bases[f"numerics {rounding} (route rule)"] = v
+        if mx:
+            for rule in ("round_up", "even"):
+                v = dict(n0, act_quant=f"{fam}_{rule}", inter_quant=f"{fam}_{rule}")
+                if n0["inter"].startswith("bf16_then_"):
+                    v["inter"] = f"bf16_then_{fam}_{rule}"
+                bases[f"numerics route rounding, {rule}"] = v
+    for name, n in bases.items():
+        score(name, lambda n=n: ref(n), "numerics")
+    nums = {k: v for k, v in results.items() if v[2] == "numerics"}
+    base_name = min(nums, key=lambda k: nums[k][0]) if nums else None
+    base = bases[base_name] if base_name else n0
+    if base_name:
+        log(f"  -> baseline for the semantics variants: {base_name}")
+
+    # stage 2: semantics at that baseline
+    sem = {}
     if S.act.name == "Swiglu":
-        add("no swiglu limit", lambda: ref(mode="none"))
-        add("no +1 on the linear branch", lambda: ref(plus1=False))
-        add("gate and up swapped", lambda: ref(swap=True))
+        sem["no swiglu limit"] = lambda: ref(base, mode="none")
+        sem["no +1 on the linear branch"] = lambda: ref(base, plus1=False)
+        sem["gate and up swapped"] = lambda: ref(base, swap=True)
     if bias is not None:
-        add("bias off", lambda: ref(b=None))
+        sem["bias off"] = lambda: ref(base, b=None)
         pos = interleave_position(S).to("cuda")
-        b1 = bias[0][:, pos]
-        add("bias1 read in interleaved order", lambda: ref(b=(b1, bias[1])))
-        add("bias2 off", lambda: ref(b=(bias[0], None)))
+        sem["bias1 read in interleaved order"] = lambda: ref(
+            base, b=(bias[0][:, pos], bias[1])
+        )
+        sem["bias2 off"] = lambda: ref(base, b=(bias[0], None))
     if mx:
-        other = "even"
-        add("MX activation rule even", lambda: ref(n=numerics(act_rule=other)))
-        add("MX intermediate rule even", lambda: ref(n=numerics(inter_rule=other)))
-        add("MX both rules even", lambda: ref(n=numerics(other, other)))
-        add("bf16 activations", lambda: ref(n=numerics(act=False)))
-        add("unquantized intermediate", lambda: ref(n=numerics(inter=False)))
+        sem["bf16 activations"] = lambda: ref(dict(base, act_quant="none"))
+        sem["unquantized intermediate"] = lambda: ref(
+            dict(base, inter="bf16", inter_quant="none")
+        )
+    for name, fn in sem.items():
+        score(name, fn, "semantics")
     pick = {k: v for k, v in results.items() if k != "ref_exact"}
     if pick:
         best = min(pick, key=lambda k: pick[k][0])
