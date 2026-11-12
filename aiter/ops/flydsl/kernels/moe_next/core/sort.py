@@ -642,7 +642,7 @@ def _oneshot_body(
     pad,
 ):
     """The whole sort in one workgroup, for at most ``rounds`` * BLOCK routes
-    (``rounds`` <= STAGE_ROUNDS, from the static token count): every route's id
+    (``rounds`` from the static token count, up to 12): every route's id
     and weight is loaded once, up front, beside the mask."""
     n = tokens * fx.Int32(topk)
     wave = tid // fx.Int32(WAVE)

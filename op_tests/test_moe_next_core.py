@@ -454,10 +454,11 @@ def _check_dynamic_tensor(tm, x, rows):
     return bad
 
 
-def _dyn_path(token, topk, K):
+def _dyn_path(token, E, topk, K):
     from aiter.ops.flydsl.kernels.moe_next.core.quant import SINGLE_WG_ELEMS
+    from aiter.ops.flydsl.moe_next.core.tile_map import oneshot_max_routes
 
-    if token * topk > 2048:
+    if token * topk > oneshot_max_routes(E):
         return "count + scatter"
     if token * K <= SINGLE_WG_ELEMS:
         return "one workgroup"
@@ -480,8 +481,8 @@ def test_dynamic_tensor():
         (8, 64, 8, 4096, None, "inf"),
         (8, 64, 8, 4096, None, "zero"),
         (8, 64, 8, 8192, None, "plain"),
-        (256, 64, 8, 7168, None, "plain"),  # last one-shot route count
-        (257, 64, 8, 7168, None, "plain"),  # first count + scatter
+        (384, 64, 8, 7168, None, "plain"),  # last one-shot route count (3072)
+        (385, 64, 8, 7168, None, "plain"),  # first count + scatter
         (4, 64, 4, 2048, 2, "plain"),
         (8, 256, 8, 7168, None, "nan"),
         (8, 256, 8, 7168, None, "inf"),
@@ -512,7 +513,7 @@ def test_dynamic_tensor():
                 "K": K,
                 "local": local,
                 "input": kind,
-                "path": _dyn_path(token, topk, K),
+                "path": _dyn_path(token, E, topk, K),
                 "exact": True,
             }
         )
@@ -535,7 +536,7 @@ def test_dynamic_tensor():
                 "K": K,
                 "local": None,
                 "input": "graph replay, new x",
-                "path": _dyn_path(token, 8, K),
+                "path": _dyn_path(token, 256, 8, K),
                 "exact": True,
             }
         )

@@ -15,7 +15,16 @@ from aiter.jit.utils.chip_info import get_cu_num
 TILE_M = (16, 32, 64, 128)
 # Up to this many route slots (M * topk) one workgroup sorts them all from
 # registers; above, the sort is count + scatter.
-ONESHOT_MAX_ROUTES = 2048
+ONESHOT_MAX_ROUTES = 3072  # one-shot rounds bound (12 x 256 routes)
+
+
+def oneshot_max_routes(num_experts: int) -> int:
+    """Routes up to which the one-workgroup sort beats the two-launch one
+    (MI300X, both zero-filling: break-even near 3072 routes at E <= 256 and
+    2560 at E = 512)."""
+    return ONESHOT_MAX_ROUTES if num_experts <= 256 else 2560
+
+
 CHUNK_MIN_ROUTES = 1024
 MAX_CHUNKS = 128
 ZERO_BYTES_PER_WG = 64 * 1024
@@ -238,7 +247,7 @@ def route_to_tiles(
             tm.a_scale = qs = quant_scale.view(1)
         elif quant_mode == "per_tensor_fp8":
             tm.a_scale = qs = torch.empty(1, dtype=torch.float32, device=dev)
-            if m * topk <= ONESHOT_MAX_ROUTES and m * k <= SINGLE_WG_ELEMS:
+            if m * topk <= oneshot_max_routes(num_experts) and m * k <= SINGLE_WG_ELEMS:
                 quant, qw = ("per_tensor_fp8_single", k, fp8_max), 1
             else:
                 quant = ("per_tensor_fp8_dynamic", k, fp8_max)
@@ -270,13 +279,13 @@ def route_to_tiles(
         tile_m,
         expert_mask is not None,
         num_local_tokens is not None,
-        rounds=min(8, max(1, -(-n_routes // 256))),
+        rounds=max(1, -(-min(n_routes, oneshot_max_routes(num_experts)) // 256)),
         with_loc=with_loc_ids,
         quant=quant,
         pad="sentinel" if pad_rows else ("poison" if _debug() else "none"),
     )
     stream = torch.cuda.current_stream(dev)
-    if n_routes <= ONESHOT_MAX_ROUTES:
+    if n_routes <= oneshot_max_routes(num_experts):
         if dyn is not None:  # partial amaxes here, the quant in its own launch
             qw2, n_part = dyn
             qs = torch.empty(n_part, dtype=torch.int32, device=dev)
