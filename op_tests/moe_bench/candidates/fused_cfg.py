@@ -392,7 +392,7 @@ class FusedCfgSource(Source):
             by_bm.setdefault(c.group, []).append(c)
         stage_marg = {}
         best_overall = []
-        for group, lst in by_bm.items():
+        for lst in by_bm.values():
             s1_names = sorted({c.meta["s1"] for c in lst})
             s2_names = sorted({c.meta["s2"] for c in lst})
             find = {(c.meta["s1"], c.meta["s2"]): c for c in lst}
