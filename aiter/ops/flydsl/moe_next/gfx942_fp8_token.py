@@ -171,9 +171,12 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
     # None follows the route config's "combine"; subclasses pin it.
     combine: ClassVar[str | None] = "atomic"
 
+    # The quant types this id serves; its numerics name their quant point.
+    quants: ClassVar[tuple] = (QuantType.per_Token,)
+
     def supports(self, spec, m, topk, call=None):
-        if spec.quant not in _QUANTS:
-            return "needs per_Token or per_Tensor"
+        if spec.quant not in self.quants:
+            return f"needs {' or '.join(q.name for q in self.quants)}"
         if spec.w_dtype != dtypes.fp8 or not spec.g1u1 or not spec.w_shuffled:
             return "needs shuffled fp8 g1u1 weights"
         if spec.act not in _ACTS:
@@ -402,6 +405,7 @@ class Gfx942Fp8TokenDecode(Gfx942Fp8TokenPrefill):
         "combine": "fp32_reduce",
     }
     combine: ClassVar[str | None] = None
+    quants: ClassVar[tuple] = (QuantType.per_Token, QuantType.per_Tensor)
     MAX_ROUTES = 1024
 
     def supports(self, spec, m, topk, call=None):
@@ -532,6 +536,33 @@ class Gfx942Fp8TokenPrefillRows(Gfx942Fp8TokenPrefill):
     numerics: ClassVar[dict] = {
         "act_quant": "per_token_fp8",
         "inter": "bf16_then_per_token_fp8",
+        "combine": "bf16_rows_fp32_sum",
+    }
+    combine: ClassVar[str | None] = "rows"
+
+
+@register_kernel
+class Gfx942Fp8TensorPrefill(Gfx942Fp8TokenPrefill):
+    """Per-tensor prefill: the same kernels with scalar scales; aiter's static or
+    dynamic per-tensor activation quant and dynamic per-tensor intermediate quant."""
+
+    id = "gfx942_fp8_tensor.prefill"
+    family = "fp8-tensor"
+    quants: ClassVar[tuple] = (QuantType.per_Tensor,)
+    numerics: ClassVar[dict] = {
+        "act_quant": "per_tensor_fp8",
+        "inter": "bf16_then_per_tensor_fp8",
+        "combine": "bf16_atomic",
+    }
+
+
+@register_kernel
+class Gfx942Fp8TensorPrefillRows(Gfx942Fp8TensorPrefill):
+    id = "gfx942_fp8_tensor.prefill_rows"
+    epilogue = "reduce"
+    numerics: ClassVar[dict] = {
+        "act_quant": "per_tensor_fp8",
+        "inter": "bf16_then_per_tensor_fp8",
         "combine": "bf16_rows_fp32_sum",
     }
     combine: ClassVar[str | None] = "rows"
