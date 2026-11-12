@@ -78,6 +78,8 @@ class _Fp8BlockGfx950(MoeKernel):
             return "model_dim % 256 or inter_dim % 128"
         if spec.out_dtype not in (None, torch.bfloat16):
             return "output dtype is not bf16"
+        if spec.doweight_stage1:
+            return "doweight_stage1 not verified against aiter's route-weight placement"
         if spec.global_experts != spec.experts:
             return "EP not implemented"
         if call is None:
@@ -106,11 +108,12 @@ class _Fp8BlockGfx950(MoeKernel):
 
     def warmup(self, weights, m, topk, config):
         self._launchers(
+            topk,
             weights.spec,
             _tile_config(weights.gpu, config, m, topk, weights.spec.experts),
         )
 
-    def _launchers(self, spec, cfg):
+    def _launchers(self, topk, spec, cfg):
         from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage1 import (
             compile_stage1,
         )
@@ -130,9 +133,11 @@ class _Fp8BlockGfx950(MoeKernel):
             model_dim=spec.model_dim,
             inter_dim=spec.inter_dim,
             experts=spec.experts,
+            topk=topk,
             tile_m=cfg["tile_m"],
             tile_n=cfg["tile_n2"],
             doweight_stage1=spec.doweight_stage1,
+            combine=cfg.get("combine", "atomic_bf16"),
         )
         return s1, s2
 
@@ -147,19 +152,25 @@ class _Fp8BlockGfx950(MoeKernel):
         state = weights.state[self.id]
         cfg = _tile_config(weights.gpu, call.config, call.m, call.topk, spec.experts)
         tm = cfg["tile_m"]
-        s1, s2 = self._launchers(spec, cfg)
+        s1, s2 = self._launchers(call.topk, spec, cfg)
+        combine = cfg.get("combine", "atomic_bf16")
         x = call.hidden_states
         M, D, I = call.m, spec.model_dim, spec.inter_dim
         xq, xs = per_group_quant_hip(x, quant_dtype=dtypes.fp8, group_size=128)
-        sorted_ids, sorted_w, sorted_e, nvalid, out = moe_sorting(
+        # atomic_bf16: the sort zeroes the output (or output=); atomic_f32: it zeroes
+        # an f32 buffer; rows_f32 writes every route row, so nothing is zeroed.
+        sorted_ids, sorted_w, sorted_e, nvalid, buf = moe_sorting(
             call.topk_ids,
             call.topk_weight,
             spec.experts,
             D,
-            torch.bfloat16,
+            torch.float32 if combine == "atomic_f32" else torch.bfloat16,
             block_size=tm,
-            output=call.output,
+            output=call.output if combine == "atomic_bf16" else None,
+            accumulate=combine != "rows_f32",
         )
+        if combine == "rows_f32":
+            buf = torch.empty((M * call.topk, D), dtype=torch.float32, device=x.device)
         rows = sorted_ids.numel()
         tiles = sorted_e.numel()
         inter = torch.empty((rows, I), dtype=dtypes.fp8, device=x.device)
@@ -184,7 +195,7 @@ class _Fp8BlockGfx950(MoeKernel):
         )
         _run_compiled(
             s2,
-            out,
+            buf,
             inter.view(torch.int8),
             inter_s,
             weights.w2.view(torch.int8),
@@ -198,6 +209,14 @@ class _Fp8BlockGfx950(MoeKernel):
             tiles,
             stream,
         )
+        if combine == "atomic_bf16":
+            return buf
+        out = call.output
+        if out is None:
+            out = torch.empty((M, D), dtype=torch.bfloat16, device=x.device)
+        if combine == "rows_f32":
+            buf = buf.view(M, call.topk, D).sum(dim=1)
+        out.copy_(buf)
         return out
 
 
