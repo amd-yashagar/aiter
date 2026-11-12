@@ -23,6 +23,12 @@
       "tile_n2": 128,
       "stage1": "8wave"
     },
+    "p128w8s2": {
+      "tile_m": 128,
+      "tile_n2": 128,
+      "stage1": "8wave",
+      "stage2": "8wave"
+    },
     "d16_s2": {
       "tile_m": 16,
       "tile_n2": 128,

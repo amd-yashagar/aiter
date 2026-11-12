@@ -157,6 +157,9 @@ class _Fp8BlockGfx950(MoeKernel):
         from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage2 import (
             compile_stage2,
         )
+        from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage2_8wave import (
+            compile_stage2_8wave,
+        )
 
         if cfg.get("stage1") == "8wave":
             s1 = compile_stage1_8wave(
@@ -176,16 +179,27 @@ class _Fp8BlockGfx950(MoeKernel):
                 doweight_stage1=spec.doweight_stage1,
                 splits=splits,
             )
-        s2 = compile_stage2(
-            model_dim=spec.model_dim,
-            inter_dim=spec.inter_dim,
-            experts=spec.experts,
-            topk=topk,
-            tile_m=cfg["tile_m"],
-            tile_n=cfg["tile_n2"],
-            doweight_stage1=spec.doweight_stage1,
-            combine=cfg.get("combine", "atomic_bf16"),
-        )
+        if cfg.get("stage2") == "8wave":
+            s2 = compile_stage2_8wave(
+                model_dim=spec.model_dim,
+                inter_dim=spec.inter_dim,
+                experts=spec.experts,
+                topk=topk,
+                tile_m=cfg["tile_m"],
+                doweight_stage1=spec.doweight_stage1,
+                combine=cfg.get("combine", "atomic_bf16"),
+            )
+        else:
+            s2 = compile_stage2(
+                model_dim=spec.model_dim,
+                inter_dim=spec.inter_dim,
+                experts=spec.experts,
+                topk=topk,
+                tile_m=cfg["tile_m"],
+                tile_n=cfg["tile_n2"],
+                doweight_stage1=spec.doweight_stage1,
+                combine=cfg.get("combine", "atomic_bf16"),
+            )
         return s1, s2
 
     def __call__(self, call: MoeCall) -> torch.Tensor:
