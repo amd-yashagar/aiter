@@ -5666,20 +5666,41 @@ def get_2stage_cfgs(
             has_bias=enable_bias,
             stage2_has_bias=enable_bias,
         )
+    # Resolved activations are bf16 below AITER_BF16_FP8_MOE_BOUND tokens for any
+    # activation with interleaved MXFP4 weights, but only Swiglu and SiTUv2 have
+    # a16w4 kernels. For Silu with bf16 output, CK-Tile split-k is the only
+    # backend (its fp16 output is not usable).
+    a16w4_interleaved_without_ck = (
+        q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+        and dtype == dtypes.bf16
+        and activation == ActivationType.Silu
+        and gate_mode == GateMode.INTERLEAVE
+        and not kernelName1
+    )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and q_dtype_w in [dtypes.fp4x2]
         and is_shuffled
         and not (activation == ActivationType.Swiglu and q_dtype_a == dtypes.fp4x2)
-        and (ksplit > 1 or swiglu_mxfp4_bf16_cktile)
+        and (ksplit > 1 or swiglu_mxfp4_bf16_cktile or a16w4_interleaved_without_ck)
     ):
         # GPT-OSS Swiglu can use bf16/fp16 activations for small batches while
         # keeping the generic preshuffled fp4 weights. CK2stages has no
         # heuristic kernel for that A16W4 combination, so use CK-Tile.
         # Use CK-Tile's split-k epilogue for the generic preshuffled MXFP4
         # layout. The non-split gate/up epilogue is reserved for legacy A16W4.
-        _min_split_k = 2 if swiglu_mxfp4_bf16_cktile else 1
+        if a16w4_interleaved_without_ck and has_stage1_bias:
+            raise NotImplementedError(
+                f"{activation} with bf16/fp16 activations and MXFP4 weights runs "
+                "on CK-Tile split-k, which does not support the stage1 expert "
+                "bias; pass fp8 activations (a8w4) or drop bias1"
+            )
+        _min_split_k = (
+            2 if swiglu_mxfp4_bf16_cktile or a16w4_interleaved_without_ck else 1
+        )
         _split_k = max(int(ksplit), _min_split_k)
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
@@ -5770,6 +5791,19 @@ def get_2stage_cfgs(
                 "(AITER_SITUV2_A8W4=1 / AITER_SITUV2_A4W4=1) when the weights "
                 "and shape meet the FlyDSL layout rules (fp8 activations need "
                 "gate_mode=INTERLEAVE weights)."
+            )
+        if (
+            not kernelName1
+            and q_type == QuantType.per_1x32
+            and q_dtype_w == dtypes.fp4x2
+            and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+        ):
+            raise NotImplementedError(
+                f"No backend for {activation} with {q_dtype_a} activations, "
+                f"{dtype} output and MXFP4 weights (gate_mode={gate_mode.value}): "
+                "CK 2-stage has no such instance, CK-Tile covers Silu with "
+                "interleaved weights and bf16 output, and the a16w4 kernels "
+                "cover Swiglu and SiTUv2"
             )
         if kernelName2 and kernelName2.startswith("flydsl_"):
             stage2_func = functools.partial(
