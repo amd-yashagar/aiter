@@ -880,6 +880,56 @@ def test_flydsl_a16wfp4_situv2_e2e(
     assert ld < 1e-2, f"a16w4 SiTUv2 cos/logits_diff too large: {ld:.3e}"
 
 
+@_SKIP
+def test_flydsl_a16wfp4_situv2_fp16_output():
+    """fp16 hidden states through the bf16-only a16w4 kernels.
+
+    Those kernels store bf16 bits, so an fp16 call used to return garbage
+    (cos diff about 0.44). The fp16 result must match the bf16 call on the
+    same inputs, which the other tests here check against a reference."""
+    token, model_dim, inter_dim, E, topk = 32, 512, 256, 16, 4
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    inp = torch.randn((token, model_dim), dtype=dtypes.bf16, device="cuda")
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16, device="cuda")
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtypes.bf16, device="cuda")
+    score = torch.randn((token, E), dtype=dtypes.bf16, device="cuda")
+
+    w1_qt, w1_scale = _quantize_mxfp4_by_expert(w1)
+    w2_qt, w2_scale = _quantize_mxfp4_by_expert(w2)
+    w1_qt = w1_qt.view(E, inter_dim * 2, model_dim // 2)
+    w2_qt = w2_qt.view(E, model_dim, inter_dim // 2)
+    w1_gui = shuffle_weight_a16w4(w1_qt, 16, False)
+    w2_gui = shuffle_weight_a16w4(w2_qt, 16, False)
+    w1_scale_gui = shuffle_scale_a16w4(w1_scale, E, False)
+    w2_scale_gui = shuffle_scale_a16w4(w2_scale, E, False)
+
+    outs = {}
+    for dtype in (dtypes.bf16, dtypes.fp16):
+        topk_weights, topk_ids = fused_topk(inp.to(dtype), score.to(dtype), topk, True)
+        outs[dtype] = fused_moe(
+            inp.to(dtype),
+            w1_gui,
+            w2_gui,
+            topk_weights,
+            topk_ids,
+            w1_scale=w1_scale_gui,
+            w2_scale=w2_scale_gui,
+            quant_type=QuantType.per_1x32,
+            activation=ActivationType.Situv2,
+            doweight_stage1=False,
+            gate_mode=GateMode.SEPARATED.value,
+            beta=1.0,
+            linear_beta=1.0,
+        )
+
+    assert outs[dtypes.fp16].dtype == dtypes.fp16
+    assert not outs[dtypes.fp16].isnan().any().item()
+    ld = _cos_diff(outs[dtypes.bf16].float(), outs[dtypes.fp16].float())
+    assert ld < 1e-3, f"a16w4 SiTUv2 fp16 vs bf16 cos/logits_diff too large: {ld:.3e}"
+
+
 def _stage1_reference(hidden, weight, expert_ids, limit, activation_bf16):
     projected = torch.empty(
         (hidden.shape[0], expert_ids.shape[1], weight.shape[1]),

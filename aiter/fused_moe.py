@@ -1768,7 +1768,7 @@ def _fused_moe_impl(
         and _can_reroute_mxfp4_to_flydsl(
             model_dim=model_dim,
             inter_dim=inter_dim,
-            dtype=dtype,
+            dtype=dtypes.bf16,
             q_dtype_a=q_dtype_a,
             q_dtype_w=q_dtype_w,
             q_type=quant_type,
@@ -1804,6 +1804,55 @@ def _fused_moe_impl(
                 raise NotImplementedError(
                     f"a16w4 (bf16 A x MXFP4 W) {_a16w4_why} is not supported: {_why}."
                 )
+
+    # The a16w-mix FlyDSL kernels (a16w4 and a16wi4) read bf16 activations and
+    # store bf16 whatever dtype is asked for: run them in bf16 and cast the result.
+    if (
+        _is_a16w4_situv2
+        or _is_a16w4_swiglu_rerouted
+        or (quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2)
+    ) and (dtype != dtypes.bf16 or hidden_states.dtype != dtypes.bf16):
+        result = _fused_moe_impl(
+            hidden_states.to(dtypes.bf16),
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            expert_mask=expert_mask,
+            activation=activation.value,
+            quant_type=quant_type.value,
+            doweight_stage1=doweight_stage1,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_size_M=block_size_M,
+            num_local_tokens=num_local_tokens,
+            moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+            dtype=dtypes.bf16,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            bias1=bias1,
+            bias2=bias2,
+            swiglu_limit=swiglu_limit,
+            beta=beta,
+            linear_beta=linear_beta,
+            gate_mode=gate_mode,
+            stage2_scatter=stage2_scatter,
+            quant_dtype_a=quant_dtype_a,
+            quant_dtype_a2=quant_dtype_a2,
+            _q_dtype_a=_q_dtype_a,
+            _metadata_transform=_metadata_transform,
+            _metadata_config_file=_metadata_config_file,
+            _stage1_extra_args=_stage1_extra_args,
+            _stage2_extra_args=_stage2_extra_args,
+            _stage2_override=_stage2_override,
+            _enforce_metadata_block_size=_enforce_metadata_block_size,
+        ).to(dtype)
+        if output is not None:
+            output.copy_(result)
+            return output
+        return result
 
     config_situ_beta, config_situ_linear_beta, _ = _normalize_mxfp4_activation_params(
         activation, beta, linear_beta, swiglu_limit
