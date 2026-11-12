@@ -18,7 +18,7 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
-from aiter.moe import MoeKernel, register_kernel
+from aiter.moe import MoeKernel, compile_only, register_kernel
 from aiter.ops.flydsl.moe_common import GateMode
 
 _CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
@@ -136,6 +136,12 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
         if call is not None:
             if call.hidden_states.dtype != torch.bfloat16:
                 return "bf16 hidden_states only"
+            if call.out_dtype != torch.bfloat16:
+                return "bf16 output only"
+            if call.w1_scale is None or call.w2_scale is None:
+                return "needs weight scales"
+            if not (call.w1_scale.is_contiguous() and call.w2_scale.is_contiguous()):
+                return "contiguous fp32 weight scales only"
             if call.expert_mask is not None or call.num_local_tokens is not None:
                 return "EP and num_local_tokens not implemented yet"
             if call.a1_scale is not None or call.a2_scale is not None:
@@ -148,6 +154,51 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
 
     def _gpu(self, weights):
         return getattr(weights, "gpu", None) or "mi300x"
+
+    def warmup(self, weights, m, topk, config):
+        import flydsl.compiler as flyc
+        import flydsl.expr as fx
+
+        spec = weights.spec
+        D, I = spec.model_dim, spec.inter_dim
+        block_m, block_n, n_split, down_m = _tile(config, self._gpu(weights), I)
+        a_bf16 = self._inline_a_quant(weights, config)
+        fused = block_n == 256
+        with compile_only():
+            gu = _gateup(
+                2 * I, D, topk, block_m, block_n, _ACTS[spec.act], fused, a_bf16
+            )
+            out_t = fx.Uint8 if fused else fx.BFloat16
+            in_t = fx.BFloat16 if a_bf16 else fx.Uint8
+            types = (
+                in_t,
+                fx.Uint8,
+                out_t,
+                fx.Int32,
+                fx.Int32,
+                fx.Int32,
+                fx.Float32,
+                fx.Float32,
+                fx.Float32,
+            )
+            gu(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
+            dn = _down.__wrapped__(D, I, topk, block_m, n_split, down_m)
+            types = (
+                fx.Uint8,
+                fx.Uint8,
+                fx.BFloat16,
+                fx.Int32,
+                fx.Float32,
+                fx.Int32,
+                fx.Int32,
+                fx.Float32,
+                fx.Float32,
+            )
+            dn(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
+
+    def _inline_a_quant(self, weights, config):
+        cfg = _configs(self._gpu(weights)).get(config or "default", {})
+        return bool(cfg.get("inline_a_quant", False))
 
     def __call__(self, call):
         from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
@@ -180,11 +231,7 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
             output_aux=AUX_SORT_OPUS,
         )
         quant = aiter.get_hip_quant(QuantType.per_1x128)
-        a_bf16 = bool(
-            _configs(self._gpu(w))
-            .get(call.config or "default", {})
-            .get("inline_a_quant", False)
-        )
+        a_bf16 = self._inline_a_quant(w, call.config)
         if a_bf16:
             xq, xs = x, torch.empty(1, dtype=torch.float32, device=x.device)
         else:
@@ -203,12 +250,12 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
         _launch(
             _gateup(2 * I, D, topk, block_m, block_n, act, fused_quant, a_bf16),
             xq,
-            w.w1,
+            call.w1,
             out1,
             sorted_ids,
             sorted_eids,
             num_valid,
-            w.w1_scale,
+            call.w1_scale,
             xs,
             out1_scale,
             M,
@@ -220,13 +267,13 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
         _launch(
             _down(D, I, topk, block_m, n_split, down_m),
             aq,
-            w.w2,
+            call.w2,
             rows,
             sorted_ids,
             sorted_w,
             sorted_eids,
             num_valid,
-            w.w2_scale,
+            call.w2_scale,
             as_,
             M,
             tasks,
