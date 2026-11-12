@@ -119,13 +119,19 @@ def make_shim(tmpdir):
     shim = os.path.join(tmpdir, "shim")
     os.makedirs(shim, exist_ok=True)
     link = os.path.join(shim, "moe_bench_shim")
-    if not os.path.islink(link):
+    # Re-point on every run: a shim left by another harness tree under the same TMPDIR
+    # would silently import that tree's harness.
+    if not os.path.islink(link) or os.path.realpath(link) != os.path.realpath(HERE):
+        if os.path.lexists(link):
+            os.unlink(link)
         os.symlink(HERE, link)
     return shim
 
 
 def needs_shim(tree):
-    return not os.path.isdir(os.path.join(tree, "op_tests", "moe_bench"))
+    """True unless the tree's own op_tests/moe_bench is exactly this harness."""
+    own = os.path.join(tree, "op_tests", "moe_bench")
+    return not os.path.isdir(own) or os.path.realpath(own) != os.path.realpath(HERE)
 
 
 def worker_env(tree, tmpdir, extra=None, extra_path=None):
@@ -138,21 +144,33 @@ def worker_env(tree, tmpdir, extra=None, extra_path=None):
 
 
 def probe_meta(tree, node, launcher, tmpdir):
-    """GPU and software versions, from a short worker on a claimed GPU."""
+    """GPU and software versions, from a short worker on a claimed GPU.
+
+    Also asserts that the harness a worker imports is the one running this command.
+    """
+    shimmed = needs_shim(tree)
+    pkg = "moe_bench_shim" if shimmed else "op_tests.moe_bench"
     code = (
         "import json,torch,importlib.metadata as m;"
         "import aiter;from aiter.jit.utils.chip_info import get_gfx,get_cu_num;"
         "p=torch.cuda.get_device_properties(0);"
         "print('META'+json.dumps({'gpu':p.name,'gfx':get_gfx(),'cu_num':get_cu_num(),"
         "'rocm':torch.version.hip,'torch':torch.__version__,"
-        "'flydsl':m.version('flydsl')}))"
+        "'flydsl':m.version('flydsl')}));"
+        "import importlib,os;"
+        f"print('HARNESS'+os.path.dirname(importlib.import_module('{pkg}').__file__))"
     )
     cmd = [sys.executable, "-c", code]
-    proc = _launch(cmd, launcher, worker_env(tree, tmpdir), capture=True, wait=600)
-    info = {}
+    env = worker_env(tree, tmpdir, extra_path=make_shim(tmpdir) if shimmed else None)
+    proc = _launch(cmd, launcher, env, capture=True, wait=600)
+    info, imported = {}, ""
     for line in (proc or "").splitlines():
         if line.startswith("META"):
             info = json.loads(line[4:])
+        elif line.startswith("HARNESS"):
+            imported = os.path.realpath(line[7:])
+    check_harness(HERE, imported)
+    info.update(harness_expected=os.path.realpath(HERE), harness_imported=imported)
     sha, dirty = tree_info(tree)
     info.update(
         node=node,
@@ -165,6 +183,16 @@ def probe_meta(tree, node, launcher, tmpdir):
         ),
     )
     return info
+
+
+def check_harness(expected, imported):
+    """Refuse to run when workers would import another tree's harness."""
+    if not imported or os.path.realpath(expected) != os.path.realpath(imported):
+        raise RuntimeError(
+            f"worker imports the harness from {imported or '(nowhere)'}, but this run uses "
+            f"{os.path.realpath(expected)}; a stale shim or a harness copy inside the tree "
+            "under test would measure the wrong code"
+        )
 
 
 def _launch(cmd, launcher, env, capture=False, wait=0):
@@ -362,7 +390,9 @@ class GroupJob:
             ev = json.loads(line)
             self.last_event = time.time()
             kind = ev.get("event")
-            if kind == "case_start":
+            if kind == "worker_start":
+                check_harness(HERE, ev.get("harness", ""))
+            elif kind == "case_start":
                 self.inflight = ev["case_id"]
                 self.phase = ev.get("phase", "")
             elif kind == "row":

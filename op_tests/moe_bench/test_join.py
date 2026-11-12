@@ -77,3 +77,27 @@ def test_a16w4_false_layout_equals_std16():
         fp4_utils.e8m0_shuffle(s.clone()).view(torch.uint8),
         shuffle_scale_a16w4(s.clone(), e, False).view(torch.uint8),
     )
+
+
+def test_shim_is_repointed_and_harness_checked(tmp_path):
+    import os
+
+    import pytest
+
+    from op_tests.moe_bench import runner
+
+    other = tmp_path / "other_harness"
+    other.mkdir()
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    os.symlink(other, shim / "moe_bench_shim")  # left by another tree's run
+    runner.make_shim(str(tmp_path))
+    assert os.path.realpath(shim / "moe_bench_shim") == os.path.realpath(runner.HERE)
+    runner.check_harness(runner.HERE, runner.HERE)
+    with pytest.raises(RuntimeError):
+        runner.check_harness(runner.HERE, str(other))
+    with pytest.raises(RuntimeError):
+        runner.check_harness(runner.HERE, "")
+    tree = tmp_path / "tree"
+    (tree / "op_tests" / "moe_bench").mkdir(parents=True)  # a stale copy of the harness
+    assert runner.needs_shim(str(tree))

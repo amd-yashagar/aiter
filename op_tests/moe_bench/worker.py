@@ -443,7 +443,15 @@ def main(argv=None):
     cases = [Case(r, parse_extra(r.get("extra", ""))) for r in spec["cases"]]
     modes = spec["modes"]
     with open(a.out, "a") as fh:
-        emit(fh, {"event": "worker_start", "pid": os.getpid(), "cases": len(cases)})
+        emit(
+            fh,
+            {
+                "event": "worker_start",
+                "pid": os.getpid(),
+                "cases": len(cases),
+                "harness": os.path.realpath(os.path.dirname(__file__)),
+            },
+        )
         if spec.get("first"):
             for c in cases:
                 run_first_case(c, fh, spec["first"])

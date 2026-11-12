@@ -602,7 +602,15 @@ def main(argv=None):
 
     cases = [Case(r, parse_extra(r.get("extra", ""))) for r in spec["cases"]]
     with open(a.out, "a") as fh:
-        emit(fh, {"event": "worker_start", "pid": os.getpid(), "cases": len(cases)})
+        emit(
+            fh,
+            {
+                "event": "worker_start",
+                "pid": os.getpid(),
+                "cases": len(cases),
+                "harness": os.path.realpath(os.path.dirname(__file__)),
+            },
+        )
         run_bar_group(cases, spec, fh)
         emit(fh, {"event": "worker_done"})
     return 0
