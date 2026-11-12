@@ -117,6 +117,11 @@ def test_cktile_stage2_matches_reference(monkeypatch, inter_dim, num_experts, to
         pytest.skip("the CK-Tile module predates the padded-K scale layout")
     if a8:
         monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")
+    # Keep a16w4 on CK-Tile: with tagged interleaved weights the FlyDSL takeover would
+    # otherwise serve inter_dim 384 and 640.
+    monkeypatch.setattr(
+        fused_moe_module, "_can_reroute_mxfp4_to_flydsl", lambda **_: False
+    )
     fused_moe_module.get_2stage_cfgs.cache_clear()
     ref, out = _reference_and_output(inter_dim, num_experts, topk, a8)
 
