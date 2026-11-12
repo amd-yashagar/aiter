@@ -701,6 +701,32 @@ _GEN_DATA_1STAGE_KEYS = [
 ]
 
 
+# Activation tags the ASM kernel symbols carry (`..._silu_...`, `..._swiglu_oai`).
+_ASM_ACTIVATION_TAGS = {
+    ActivationType.Silu: "silu",
+    ActivationType.Gelu: "gelu",
+    ActivationType.Swiglu: "swiglu",
+    ActivationType.Situv2: "situv2",
+}
+
+
+def _asm_kernel_matches_activation(kernel_name, act_type, fused_stage1=False):
+    """Whether an ASM candidate computes ``act_type``.
+
+    A symbol that names an activation serves that one. The 2-stage ASM stage-1
+    kernels (``fmoe_stage1_*``) name none: their fused epilogue is SiLU, so
+    they serve only Silu (split-K candidates apply the activation outside).
+    """
+    kernel_name = str(kernel_name).lower()
+    own = _ASM_ACTIVATION_TAGS.get(act_type)
+    others = [t for a, t in _ASM_ACTIVATION_TAGS.items() if t != own]
+    if own is not None and f"_{own}" in kernel_name:
+        return True
+    if any(f"_{t}" in kernel_name for t in others):
+        return False
+    return not fused_stage1 or act_type == ActivationType.Silu
+
+
 class FmoeTuner(TunerCommon):
     SUPPORTS_FAST_SCAN = False
     SUPPORTS_POWER_SELECT = True
@@ -3182,6 +3208,8 @@ class FmoeTuner(TunerCommon):
                 continue
 
             for el in asm_kernels_1stage.get((tile_m, tile_n, 0), []):
+                if not _asm_kernel_matches_activation(el, act_type):
+                    continue
                 # Only no_sort/emsort consume raw topk. Post-reduce candidates
                 # time the sorted-input producer and its reduction together.
                 flat_flag = int(asm_1stage_flat.get(el, AsmMoeMode.SORTED))
@@ -3421,6 +3449,10 @@ class FmoeTuner(TunerCommon):
             ):
                 for el in asm_kernels.get(blockM, []):
                     if _is_tune_excluded_kernel(el):
+                        continue
+                    if not _asm_kernel_matches_activation(
+                        el, act_type, fused_stage1=True
+                    ):
                         continue
                     tasks.append(
                         (
