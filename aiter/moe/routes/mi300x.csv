@@ -1,2 +1,2 @@
 family,model_dim,inter_dim,experts,topk,act,doweight_stage1,m_min,m_max,kernel,config,verified,note
-fp8-block,4096,256,513,11,silu,0,4096,4096,gfx942_fp8_block.prefill,default,meta new-time-ada8276f3 harness 375eaa320,Qwen3.5-397B; -1.4/-2.8% vs bar warm/cold; M 1024-3072 and 6144-8192 lose 17-60%
+fp8-block,4096,256,513,11,silu,0,4096,4096,gfx942_fp8_block.prefill,default,meta new-time-ada8276f3 harness 375eaa320 + paired A/B (fp8blk/ab_q35.py),Qwen3.5-397B; paired vs bar over 8 reps: warm 0.9934 (0.987-0.996) cold 0.9705 (0.967-0.976); M 1024-3072 and 6144-8192 lose 17-60%
