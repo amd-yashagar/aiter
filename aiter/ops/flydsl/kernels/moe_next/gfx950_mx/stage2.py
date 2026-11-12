@@ -31,12 +31,12 @@ from .stage1 import _scale_atoms
 
 
 def blocks_per_wg(model_dim, m_tiles, cu_num=256):
-    """Channel blocks one workgroup loops over: the largest of 7, 4, 2, 1 that
-    divides model_dim / 256 and still leaves two workgroups per CU."""
+    """Channel blocks one workgroup loops over: 2 when model_dim / 256 is even and
+    that still leaves four workgroups per CU (measured best of 1, 2, 4, 7 on
+    DSV4-Pro and Kimi-K3 prefill), else 1."""
     nb = model_dim // 256
-    for c in (7, 4, 2, 1):
-        if nb % c == 0 and (nb // c) * m_tiles >= 2 * cu_num:
-            return c
+    if nb % 2 == 0 and (nb // 2) * m_tiles >= 4 * cu_num:
+        return 2
     return 1
 
 
