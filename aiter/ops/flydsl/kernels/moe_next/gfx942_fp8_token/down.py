@@ -21,10 +21,13 @@ from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import common as fxh
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _f32_to_bf16
 
 
-def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True, N_SPLIT=1):
+def compile_down(
+    *, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True, N_SPLIT=1, WAVES_N=1
+):
     """N = model_dim, K = inter_dim. ATOMIC adds into out[token]; otherwise each
     sorted row is stored to out[sorted_row] for a separate per-token sum. Each
-    workgroup walks 1 / N_SPLIT of the N tiles."""
+    workgroup walks 1 / N_SPLIT of the N tiles. WAVES_N wave rows split the
+    tile's rows, so each wave holds 1 / WAVES_N of A and C in registers."""
     assert K % 64 == 0
     assert N % 128 == 0, "pairs of 64-column N tiles"
     assert (N // 64) % (2 * N_SPLIT) == 0, "each split walks pairs of N tiles"
@@ -34,7 +37,9 @@ def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True, N_SPLIT=
     BLOCK_N = 64
     BLOCK_K = 64
     KT = K // BLOCK_K
-    A_ROWS_PER_PASS = 256 // (BLOCK_N // 2)
+    assert WAVES_N in (1, 2) and BLOCK_M % (16 * WAVES_N) == 0
+    NTHR = 256 * WAVES_N
+    A_ROWS_PER_PASS = NTHR // (BLOCK_N // 2)
     flyobj = fxh.FlyObjCache()
 
     @flyc.kernel
@@ -140,7 +145,7 @@ def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True, N_SPLIT=
                 fxh.make_1d_coord_tensor(ldsA0, 1, fx.make_int_tuple(0))
             )
             for dst, row, col in fxh.all_copy_atoms(
-                cp_ldsA0, cp_rows, cp_cols, atom_bits=128, num_threads=256
+                cp_ldsA0, cp_rows, cp_cols, atom_bits=128, num_threads=NTHR
             ):
                 sorted_id = row[0].bitcast(fx.Uint32)
                 atom_A = fxh.atom_tensor(
@@ -170,7 +175,7 @@ def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True, N_SPLIT=
             nBN = N // BLOCK_N // N_SPLIT
             n0 = n_split * nBN
 
-            mm = flyobj.create_thr_mma(weight_dtype, (4, 1, 1))
+            mm = flyobj.create_thr_mma(weight_dtype, (4, WAVES_N, 1))
             c_fake_tensor = fx.make_view(
                 fx.get_iter(arg_p_input),
                 fx.make_ordered_layout((BLOCK_N, BLOCK_M), (0, 1)),
@@ -203,7 +208,7 @@ def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True, N_SPLIT=
                     )
 
             tcopyLDS, cp_ldsc = flyobj.get_tiled_copy_coalesced_mn(
-                ldsC[None, None, 0], copy_atom_bits=128, num_threads=256
+                ldsC[None, None, 0], copy_atom_bits=128, num_threads=NTHR
             )
             thrv_ldsC = tcopyLDS.partition_S(ldsC)
             copy_atom_ = flyobj.get_universal_copy_atom(fragC_bf16.dtype, 64)
@@ -330,6 +335,6 @@ def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True, N_SPLIT=
             p_w_scale,
             p_a_scale,
             M,
-        ).launch(grid=(N_SPLIT, task_num, 1), block=(256, 1, 1), stream=stream)
+        ).launch(grid=(N_SPLIT, task_num, 1), block=(NTHR, 1, 1), stream=stream)
 
     return launch
