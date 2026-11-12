@@ -25,7 +25,7 @@ def oneshot_max_routes(num_experts: int) -> int:
     return ONESHOT_MAX_ROUTES if num_experts <= 256 else 2560
 
 
-CHUNK_MIN_ROUTES = 1024
+CHUNK_MIN_ROUTES = 512
 MAX_CHUNKS = 128
 ZERO_BYTES_PER_WG = 64 * 1024
 # A zero-fill this large runs in the count launch (it would compete with long

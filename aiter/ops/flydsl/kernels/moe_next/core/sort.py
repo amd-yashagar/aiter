@@ -51,9 +51,10 @@ WAVES = BLOCK // WAVE
 OOB = 0x7FFFFFFF
 STAGE_ROUNDS = 8
 STAGE = STAGE_ROUNDS * BLOCK
-# Two-launch histogram and scatter stage: CHUNK_MIN_ROUTES (1024) routes, so a
-# minimum chunk runs no masked rounds (8 rounds took 2.2x as long on MI300X).
-HIST_ROUNDS = 4
+# Two-launch histogram and scatter stage: CHUNK_MIN_ROUTES (512) routes, so a
+# minimum chunk runs no masked rounds (MI300X: 2 rounds over 512-route chunks
+# beat 4 over 1024 by 10-25% at M 512-4096; 8 rounds took 2.2x as long).
+HIST_ROUNDS = 2
 HIST_STAGE = HIST_ROUNDS * BLOCK
 COUNT_BATCH = 32
 
