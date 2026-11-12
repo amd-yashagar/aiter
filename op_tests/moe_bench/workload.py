@@ -630,7 +630,33 @@ def fused_kwargs(S, aiter_w, bias, expert_mask):
     }
     if expert_mask is not None:
         kw["expert_mask"] = expert_mask
+    qa = act_dtype_override(S)
+    if qa is not None:
+        kw["quant_dtype_a"] = qa
     return kw
+
+
+def act_dtype_override(S):
+    """quant_dtype_a for MX rows labelled a4w4/a8w4.
+
+    aiter resolves some of these rows to bf16 activations (Situv2 under the default env,
+    INTERLEAVE/Swiglu a8w4 and separated Swiglu a4w4 below AITER_BF16_FP8_MOE_BOUND), which
+    runs a16w4 instead of the labelled family. vLLM and SGLang set the activation dtype
+    per call (SGLang moe_runner/aiter.py:318-327 ``quant_dtype_a=fp8``; vLLM
+    rocm_aiter_moe.py:341-347 ``quant_dtype_a`` for DSv4.1 a4w4), so the harness does the
+    same: the row's own activation dtype is passed explicitly (convention: per-call
+    ``quant_dtype_a``, not the AITER_SITUV2_A4W4/A8W4 env). Rows labelled a16w4 are left
+    alone.
+    """
+    from aiter import dtypes
+
+    if (
+        S.qtype.name == "per_1x32"
+        and S.wq == dtypes.fp4x2
+        and S.aq in (dtypes.fp4x2, dtypes.fp8)
+    ):
+        return S.aq
+    return None
 
 
 def flops(S, M):

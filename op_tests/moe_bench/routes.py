@@ -409,6 +409,7 @@ def dry_route(case, S=None):
                 linear_beta=S.linear_beta,
                 gate_mode=S.gate_mode,
                 num_local_tokens=meta((1,), torch.int32) if S.num_local_frac else None,
+                quant_dtype_a=workload.act_dtype_override(S),
                 _metadata_transform=transform,
             )
         except _DryStop:
