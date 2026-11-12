@@ -1693,6 +1693,7 @@ def _fused_moe_impl(
         q_dtype_a = quant_dtype_a
     elif _q_dtype_a is not None:
         q_dtype_a = _q_dtype_a
+    _validate_quant_type_vs_weight_dtype(quant_type, q_dtype_w)
 
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
@@ -4029,6 +4030,23 @@ def _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled):
             "gfx950 fp8 CK MoE reads the shuffle_weight() layout on "
             "both w1 and w2; unshuffled per_Tensor and per_Token "
             "weights are unsupported"
+        )
+
+
+def _validate_quant_type_vs_weight_dtype(quant_type, weight_dtype):
+    """Refuse a quantized ``quant_type`` on unquantized weights up front.
+
+    The call otherwise reaches an activation quant op that has no such output type
+    and aborts the process (AITER_CHECK) instead of raising.
+    """
+    if quant_type != QuantType.No and weight_dtype in (
+        dtypes.bf16,
+        dtypes.fp16,
+        dtypes.fp32,
+    ):
+        raise ValueError(
+            f"quant_type={quant_type} needs quantized expert weights, got "
+            f"{weight_dtype}; use QuantType.No for unquantized weights"
         )
 
 
