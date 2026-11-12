@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Weights of one MoE layer, prepared once, with their per-M routes."""
+"""Per-weight-set routing state, built lazily on the first eager call."""
 
 import threading
+import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-
-from aiter import dtypes
 
 from .kernel import MoeKernel
 from .log import log_once
@@ -20,7 +19,7 @@ from .spec import MoeSpec
 
 @dataclass(frozen=True)
 class Resolved:
-    """The route for one call key; ``kernel`` None means aiter's path."""
+    """The route for one call key; ``kernel`` None means today's path."""
 
     kernel: MoeKernel | None
     route: Route
@@ -30,98 +29,135 @@ class Resolved:
 
 @dataclass
 class MoeWeights:
-    """aiter-layout weights (what fused_moe takes) plus kernel state.
+    """One weight set's state: weak references to the caller's aiter-layout
+    tensors (never a copy, and never keeping them alive), the layer's
+    fused_moe arguments, and kernel state. A kernel reads the tensors of the
+    call it serves from ``MoeCall``.
 
-    ``fused_moe_kwargs`` holds the prepare-level fused_moe arguments exactly as
-    the caller gave them; the fallback passes them back unchanged. ``state``
-    maps a kernel id to what its ``prepare_weights`` returned; derived layouts
-    live there, beside the aiter-layout tensors, never in place of them.
+    ``state`` maps a kernel id to what its ``prepare_weights`` returned: small
+    state only (scale reorders, tile metadata, per-expert pointers, compiled
+    handles). ``versions`` are the tensors' ``_version`` when it was built.
     """
 
     spec: MoeSpec
-    w1: torch.Tensor
-    w2: torch.Tensor
+    w1_ref: weakref.ref
+    w2_ref: weakref.ref
     fused_moe_kwargs: dict[str, Any]
     gpu: str
     table: RouteTable
-    topk: int | None = None
-    handle: int = 0
+    versions: tuple = ()
     uncovered: frozenset = frozenset()
     state: dict[str, Any] = field(default_factory=dict)
     failed: set = field(default_factory=set)
+    compiled: set = field(default_factory=set)
     _routes: dict = field(default_factory=dict, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def kwarg(self, name: str, default=None):
-        """A prepare-level fused_moe argument as given (``default`` if unset)."""
-        return self.fused_moe_kwargs.get(name, default)
+        """A layer-level fused_moe argument as the caller gave it."""
+        v = self.fused_moe_kwargs.get(name)
+        return default if v is None else v
 
     @property
-    def w1_scale(self):
-        return self.fused_moe_kwargs.get("w1_scale")
+    def w1(self) -> torch.Tensor | None:
+        return self.w1_ref()
 
     @property
-    def w2_scale(self):
-        return self.fused_moe_kwargs.get("w2_scale")
-
-    @property
-    def bias1(self):
-        return self.fused_moe_kwargs.get("bias1")
-
-    @property
-    def bias2(self):
-        return self.fused_moe_kwargs.get("bias2")
+    def w2(self) -> torch.Tensor | None:
+        return self.w2_ref()
 
     def resolve(
-        self,
-        m: int,
-        topk: int,
-        hidden_dtype: torch.dtype = dtypes.bf16,
-        has_a1_scale: bool = False,
-    ) -> Resolved:
-        """Host-only, cached per (M, topk, hidden dtype, a1_scale given)."""
-        key = (m, topk, hidden_dtype, has_a1_scale)
+        self, m, topk, hidden_dtype, out_dtype, a_dtype, has_a1_scale, build=True
+    ) -> Resolved | None:
+        """Host-only, cached per call key; lock-free on a hit. With
+        ``build=False`` (capture, tracing) a miss returns None."""
+        key = (m, topk, hidden_dtype, out_dtype, a_dtype, has_a1_scale)
         hit = self._routes.get(key)
+        if hit is None and not build:
+            return None
         if hit is None:
             with self._lock:
                 hit = self._routes.get(key)
                 if hit is None:
-                    hit = self._resolve(*key)
+                    hit = self._resolve(m, topk, a_dtype)
                     self._routes[key] = hit
         return hit
 
-    def _resolve(self, m, topk, hidden_dtype, has_a1_scale) -> Resolved:
-        family = self.spec.family(m, hidden_dtype, has_a1_scale)
-        route = self.table.lookup(self.spec, family, topk, m)
+    def _kernel_for(self, route: Route):
+        """(kernel, reason): the route's kernel if it can serve this layer."""
         if route.is_fallback:
-            return Resolved(None, route, family, f"route {route.source}")
+            return None, f"route {route.source}"
         kernel = get_kernel(route.kernel)
         if kernel is None:
-            reason = f"unknown kernel {route.kernel!r} ({route.source})"
-            log_once(f"aiter.moe: {reason}")
-            return Resolved(None, route, family, reason)
+            log_once(
+                f"aiter.moe: route {route.source} names unknown kernel {route.kernel!r}"
+            )
+            return None, f"unknown kernel {route.kernel!r} ({route.source})"
         if kernel.id in self.failed:
-            return Resolved(None, route, family, f"{kernel.id} failed earlier")
+            return None, f"{kernel.id} failed earlier"
         missing = self.uncovered - kernel.handles_kwargs
         if missing:
-            reason = f"{kernel.id} does not implement {sorted(missing)}"
+            return None, f"{kernel.id} does not implement {sorted(missing)}"
+        return kernel, ""
+
+    def _resolve(self, m, topk, a_dtype) -> Resolved:
+        family = self.spec.family(a_dtype)
+        route = self.table.lookup(self.spec, family, topk, m)
+        kernel, reason = self._kernel_for(route)
+        if kernel is None:
             return Resolved(None, route, family, reason)
         reason = kernel.supports(self.spec, m, topk)
         if reason:
             log_once(f"aiter.moe: {kernel.id} declines {self.spec} at M={m}: {reason}")
             return Resolved(None, route, family, f"{kernel.id} declines: {reason}")
+        self._prepare(kernel)
+        self._compile(kernel, route, m, topk)
+        if kernel.id in self.failed:
+            return Resolved(None, route, family, f"{kernel.id} failed to compile")
+        return Resolved(kernel, route, family, f"route {route.source}")
+
+    def _prepare(self, kernel):
         if kernel.id not in self.state:
             self.state[kernel.id] = kernel.prepare_weights(self)
-        return Resolved(kernel, route, family, f"route {route.source}")
+
+    def _compile(self, kernel, route, m, topk):
+        key = (kernel.id, route.config, route.source)
+        if key in self.compiled:
+            return
+        try:
+            kernel.warmup(self, m, topk, route.config)
+            self.compiled.add(key)
+        except Exception as exc:
+            from .router import strict
+
+            if strict():
+                raise
+            self.mark_failed(kernel, exc, f"compile M={m}")
+
+    def compile_all(self, topk: int) -> None:
+        """Compile every kernel and config this GPU's table maps for this
+        shape and topk, across all M buckets, so a later capture finds them."""
+        for row in self.table.rows:
+            if not row.matches_shape(self.spec, topk):
+                continue
+            kernel, _ = self._kernel_for(row.route)
+            if kernel is None or kernel.supports(self.spec, row.m_min, topk):
+                continue
+            with self._lock:
+                self._prepare(kernel)
+                self._compile(kernel, row.route, row.m_min, topk)
+
+    def ready(self, kernel, route) -> bool:
+        return (kernel.id, route.config, route.source) in self.compiled
 
     def mark_failed(self, kernel: MoeKernel, exc: BaseException, where: str) -> None:
         """Send every later call this weight set's ``kernel`` would serve to
-        aiter's path."""
+        today's path. Never called during a capture."""
         with self._lock:
             self.failed.add(kernel.id)
             self.state.pop(kernel.id, None)
             self._routes.clear()
         log_once(
             f"aiter.moe: {kernel.id} failed at {where} for {self.spec}; "
-            f"using aiter's path from now on: {exc!r}"
+            f"using today's path from now on: {exc!r}"
         )

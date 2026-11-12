@@ -8,7 +8,6 @@ from dataclasses import dataclass
 import torch
 
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import get_inter_dim, resolve_activation_dtype
 from aiter.ops.flydsl.moe_common import GateMode
 
 # per_128x128 weights are served as per_1x128, as in fused_moe's quant_remap.
@@ -74,6 +73,8 @@ class MoeSpec:
         intermediate_pad: int = 0,
         num_global_experts: int | None = None,
     ) -> "MoeSpec":
+        from aiter.fused_moe import get_inter_dim
+
         experts, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
         quant = QuantType(int(quant_type))
         return cls(
@@ -97,24 +98,10 @@ class MoeSpec:
             intermediate_pad=int(intermediate_pad),
         )
 
-    def a_dtype(
-        self, m: int, hidden_dtype=dtypes.bf16, has_a1_scale: bool = False
-    ) -> torch.dtype:
-        """The activation dtype fused_moe quantizes to at token count ``m``."""
-        return resolve_activation_dtype(
-            self.quant,
-            self.w_dtype,
-            activation=self.act,
-            gate_mode=self.gate_mode,
-            M=m,
-            hidden_dtype=hidden_dtype,
-            has_a1_scale=has_a1_scale,
-        )
-
-    def family(
-        self, m: int, hidden_dtype=dtypes.bf16, has_a1_scale: bool = False
-    ) -> str:
-        """The quant family at token count ``m``; names match the tier files."""
+    def family(self, a_dtype: torch.dtype) -> str:
+        """The quant family; names match the tier files. ``a_dtype`` is the
+        activation dtype fused_moe resolved for the call (it depends on M for
+        per_1x32)."""
         q, w = self.quant, self.w_dtype
         if q == QuantType.No:
             return "a16w16"
@@ -133,10 +120,9 @@ class MoeSpec:
                 return "a16wi4"
             if w == dtypes.fp8:
                 return "mxfp8"
-            a = self.a_dtype(m, hidden_dtype, has_a1_scale)
-            if a in (dtypes.bf16, dtypes.fp16):
+            if a_dtype in (dtypes.bf16, dtypes.fp16):
                 return "a16w4"
-            if a == dtypes.fp8:
+            if a_dtype == dtypes.fp8:
                 return "a8w4"
             return "a4w4"
         return f"unknown-{q.name}"

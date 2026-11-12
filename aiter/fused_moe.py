@@ -1541,6 +1541,26 @@ def fused_moe_(
     )
 
 
+# Routing to aiter.moe's kernels: None until the first call decides, then
+# False when AITER_MOE_DISABLE=1 or no route table applies to this GPU.
+_MOE_ROUTING = None
+_MOE_ROUTER = None
+
+
+def _moe_try_route(*args):
+    """aiter.moe.router.try_route, imported on first use; None means today's path."""
+    global _MOE_ROUTING, _MOE_ROUTER
+    if _MOE_ROUTER is None:
+        from aiter.moe import router
+
+        _MOE_ROUTER = router
+    if _MOE_ROUTING is None:
+        _MOE_ROUTING = _MOE_ROUTER.active()
+        if not _MOE_ROUTING:
+            return None
+    return _MOE_ROUTER.try_route(*args)
+
+
 def _fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1693,6 +1713,54 @@ def _fused_moe_impl(
         q_dtype_a = quant_dtype_a
     elif _q_dtype_a is not None:
         q_dtype_a = _q_dtype_a
+
+    if _MOE_ROUTING is not False:
+        routed = _moe_try_route(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            expert_mask,
+            num_local_tokens,
+            output,
+            a1_scale,
+            a2_scale,
+            w1_scale,
+            w2_scale,
+            bias1,
+            bias2,
+            dtype,
+            q_dtype_a,
+            _q_dtype_a is not None
+            or _metadata_transform is not None
+            or _metadata_config_file is not None
+            or _stage1_extra_args is not None
+            or _stage2_extra_args is not None
+            or _stage2_override is not None
+            or _enforce_metadata_block_size,
+            stage2_scatter,
+            # the layer arguments, in aiter.moe.router.LAYER_KWARGS order
+            (
+                activation,
+                quant_type,
+                doweight_stage1,
+                gate_mode,
+                swiglu_limit,
+                beta,
+                linear_beta,
+                hidden_pad,
+                intermediate_pad,
+                block_size_M,
+                moe_sorting_dispatch_policy,
+                quant_type_a,
+                quant_dtype_a,
+                quant_dtype_a2,
+                herd_topk,
+            ),
+        )
+        if routed is not None:
+            return routed
 
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4

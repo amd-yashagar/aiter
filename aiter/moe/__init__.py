@@ -1,39 +1,37 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MoE entry point with per-GPU routing to new kernels and aiter's path as fallback.
+"""Routing behind aiter.fused_moe to new per-GPU MoE kernels (internal).
 
-    weights = aiter.moe.prepare(w1, w2, w1_scale=s1, w2_scale=s2,
-                                quant_type=QuantType.per_1x128)
-    out = aiter.moe.forward(hidden_states, weights, topk_weight, topk_ids)
+``aiter.fused_moe.fused_moe`` stays the entry. At the top of its body it asks
+``router.try_route`` whether a new kernel serves the call; if not, today's path
+runs unchanged. Environment:
 
-``forward`` returns what ``aiter.fused_moe.fused_moe`` returns for the same
-tensors. Environment: ``AITER_MOE_DISABLE=1`` sends every call to aiter's
-path; ``AITER_MOE_ROUTES=<csv or kernel[:config]>`` replaces the route table
-(tests); ``AITER_MOE_STRICT=1`` raises kernel errors instead of falling back
-(tests); ``AITER_MOE_GPU=<name>`` overrides GPU detection.
+- ``AITER_MOE_DISABLE=1``: no routing (checked once per process; call
+  ``refresh()`` after changing AITER_MOE_* variables in-process).
+- ``AITER_MOE_STRICT=1``: raise router and kernel errors (tests, climbs).
+- ``AITER_MOE_ROUTES=<csv or kernel[:config]>``: replace the route table (tests).
+- ``AITER_MOE_GPU=<name>``: override GPU detection.
+- ``AITER_MOE_DEBUG=1``: log each route decision once per key.
 """
 
-from .entry import CALL_KWARGS, PREPARE_KWARGS, explain, fallback, forward, prepare
-from .kernel import MoeCall, MoeKernel
+from .kernel import MoeCall, MoeKernel, compile_only
 from .registry import get_kernel, kernels, register_kernel, unregister_kernel
+from .router import last_route, refresh
 from .spec import FAMILIES, MoeSpec
 from .weights import MoeWeights
 
 __all__ = [
-    "CALL_KWARGS",
     "FAMILIES",
-    "PREPARE_KWARGS",
     "MoeCall",
     "MoeKernel",
     "MoeSpec",
     "MoeWeights",
-    "explain",
-    "fallback",
-    "forward",
+    "compile_only",
     "get_kernel",
     "kernels",
-    "prepare",
+    "last_route",
+    "refresh",
     "register_kernel",
     "unregister_kernel",
 ]

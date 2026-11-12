@@ -3,6 +3,8 @@
 
 """The interface every family kernel implements."""
 
+import contextlib
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -18,20 +20,29 @@ if TYPE_CHECKING:
 class MoeCall:
     """One forward call, as the router hands it to a kernel.
 
-    ``m`` is ``hidden_states.shape[0]`` and ``topk`` is ``topk_ids.shape[1]``.
+    ``m`` is ``hidden_states.shape[0]`` and ``topk`` is ``topk_ids.shape[1]``;
+    ``out_dtype`` is the output dtype fused_moe resolved; ``global_experts`` is
+    the size of ``expert_mask`` under EP, else the local expert count.
     ``config`` is the route row's config name. When ``output`` is given the
-    kernel writes into it and returns it. ``extra`` holds call-level
-    fused_moe arguments a kernel must decline unless it implements them
-    (``stage2_scatter``). Prepare-level arguments (scales, bias,
-    swiglu_limit, betas, pads) are on ``weights``.
+    kernel writes into it and returns it. ``w1``, ``w2``, their scales and the
+    biases are the call's own tensors, in the caller's layout. Other
+    layer-level arguments (swiglu_limit, betas, pads) are on ``weights``.
     """
 
     hidden_states: torch.Tensor
     topk_weight: torch.Tensor
     topk_ids: torch.Tensor
     weights: "MoeWeights"
+    w1: torch.Tensor
+    w2: torch.Tensor
+    w1_scale: torch.Tensor | None
+    w2_scale: torch.Tensor | None
+    bias1: torch.Tensor | None
+    bias2: torch.Tensor | None
     m: int
     topk: int
+    out_dtype: torch.dtype
+    global_experts: int
     config: str = ""
     expert_mask: torch.Tensor | None = None
     num_local_tokens: torch.Tensor | None = None
@@ -44,9 +55,20 @@ class MoeCall:
     def spec(self) -> MoeSpec:
         return self.weights.spec
 
-    @property
-    def out_dtype(self) -> torch.dtype:
-        return self.spec.out_dtype or self.hidden_states.dtype
+
+@contextlib.contextmanager
+def compile_only():
+    """Compile FlyDSL kernels without launching them (``COMPILE_ONLY=1``): under
+    FlyDSL 0.5.0 a ``@flyc.jit`` call can otherwise launch once on a visible GPU."""
+    old = os.environ.get("COMPILE_ONLY")
+    os.environ["COMPILE_ONLY"] = "1"
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("COMPILE_ONLY", None)
+        else:
+            os.environ["COMPILE_ONLY"] = old
 
 
 class MoeKernel:
@@ -61,8 +83,14 @@ class MoeKernel:
     id: ClassVar[str] = ""
     family: ClassVar[str] = ""
     archs: ClassVar[tuple[str, ...]] = ()
-    # Not-yet-covered prepare keywords (entry.NOT_YET_COVERED_KWARGS) this
-    # kernel implements; any other one set on a layer makes it decline.
+    # "tiles": the kernel sorts with core.tile_map.route_to_tiles; "direct": it
+    # takes raw topk_ids/topk_weight and owns EP masks, -1 ids,
+    # num_local_tokens and the zero-fill itself (its supports() bounds M*topk).
+    routing: ClassVar[str] = "tiles"
+    # "atomic": the sort zero-fills the output; "reduce": every row is written once.
+    epilogue: ClassVar[str] = "atomic"
+    # Not-yet-covered layer keywords (router.NOT_YET_COVERED) this kernel
+    # implements; any other one set on a layer makes it decline.
     handles_kwargs: ClassVar[frozenset] = frozenset()
 
     def supports(
@@ -77,16 +105,18 @@ class MoeKernel:
         raise NotImplementedError
 
     def prepare_weights(self, weights: "MoeWeights") -> Any:
-        """Run once per weight set, at load. Returns this kernel's state for
-        those weights (derived layouts, scale reshapes, compiled handles); the
-        router stores it in ``weights.state[self.id]``. Must not modify the
-        aiter-layout tensors, which the fallback still uses."""
+        """Run once per weight set, on its first eager call. Returns this
+        kernel's small state for those weights (scale reorders, tile metadata,
+        per-expert pointers); the router stores it in ``weights.state[self.id]``.
+        Never a weight copy, and never a change to the caller's tensors, which
+        today's path still reads."""
         return None
 
     def warmup(self, weights: "MoeWeights", m: int, topk: int, config: str) -> None:
-        """Compile everything a call at token count ``m`` will launch, so a
-        compile error surfaces at prepare time rather than under graph
-        capture."""
+        """Compile everything a call at token count ``m`` will launch, without
+        launching anything (run compiles under ``kernel.compile_only()``). It
+        runs on the first eager call of a weight set, for every M bucket the
+        route table maps, so a later graph capture finds the kernels ready."""
 
     def __call__(self, call: MoeCall) -> torch.Tensor:
         """Compute the layer; must be graph-capture safe (no host sync)."""

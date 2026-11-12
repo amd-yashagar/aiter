@@ -79,13 +79,20 @@ class RouteRow:
     route: Route = FALLBACK_ROUTE
 
     def matches(self, spec: MoeSpec, family: str, topk: int, m: int) -> bool:
+        return (
+            self.m_min <= m <= self.m_max
+            and (self.family == "*" or self.family == family)
+            and self.matches_shape(spec, topk)
+        )
+
+    def matches_shape(self, spec: MoeSpec, topk: int) -> bool:
+        """The row's shape and layer columns, ignoring M and family."""
+
         def eq(field, value):
             return field == "*" or field == str(value)
 
         return (
-            self.m_min <= m <= self.m_max
-            and eq(self.family, family)
-            and eq(self.model_dim, spec.model_dim)
+            eq(self.model_dim, spec.model_dim)
             and eq(self.inter_dim, spec.inter_dim)
             and eq(self.experts, spec.experts)
             and eq(self.topk, topk)
@@ -134,7 +141,7 @@ class RouteTable:
 
     @classmethod
     def override(cls, routes) -> "RouteTable":
-        """A test-only table from ``prepare(routes=...)`` or ``AITER_MOE_ROUTES``.
+        """A test-only table from ``AITER_MOE_ROUTES``.
 
         ``routes`` is a RouteTable; a CSV path (``*.csv`` or an existing
         file); ``"<kernel>[:<config>]"`` or
@@ -191,10 +198,9 @@ def table_for(gpu: str) -> RouteTable:
     return RouteTable.load(ROUTES_DIR / f"{name}.csv")
 
 
-def resolve_table(gpu: str, routes=None) -> RouteTable:
-    """``routes`` (from prepare), else ``AITER_MOE_ROUTES``, else the GPU's table."""
-    if routes is None:
-        routes = os.getenv("AITER_MOE_ROUTES") or None
-    if routes is not None:
+def resolve_table(gpu: str) -> RouteTable:
+    """``AITER_MOE_ROUTES`` (tests and kernel bring-up), else the GPU's table."""
+    routes = os.getenv("AITER_MOE_ROUTES")
+    if routes:
         return RouteTable.override(routes)
     return table_for(gpu)
