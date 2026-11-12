@@ -4804,6 +4804,22 @@ def get_2stage_cfgs(
                 f"unsupported {unsupported}; using default heuristics"
             )
 
+    # The EMSORT asm kernels (flat=2) return wrong results on gfx942: the only
+    # one shipped there, fmoe_bf16_a16_blockscaleFp8_..._emsort_16x128_pf3,
+    # fails at every shape and token count tried.
+    if (
+        cfg is not None
+        and cfg.get("run_1stage", False)
+        and get_gfx() == "gfx942"
+        and cfg.get("flat", AsmMoeMode.SORTED) == AsmMoeMode.EMSORT
+    ):
+        logger.warning(
+            f"[fused_moe] discarding EMSORT 1-stage tuned config "
+            f"{cfg.get('kernelName1')!r} for {keys}: EMSORT kernels are not "
+            "supported on gfx942; using default heuristics"
+        )
+        cfg = None
+
     use_non_temporal_load = False
     if cfg is None or bypass_tuned_config:
         ksplit = 0
