@@ -434,13 +434,13 @@ def compile_gateup(
             write_i = read_i ^ 1
             next_scales = None
             if const_expr(do_prefetch):
-                load_a(k_next)
                 fx.copy(
                     buf_cp_atom_r, bl_g2r[None, None, None, k_next], bl_ret_st[write_i]
                 )
                 fx.copy(
                     buf_cp_atom_r, br_g2r[None, None, None, k_next], br_ret_st[write_i]
                 )
+                load_a(k_next)
                 next_scales = load_scales(k_next)
             p_gate.fill(0)
             p_up.fill(0)
@@ -595,8 +595,19 @@ def compile_gateup(
         M: fx.Int32,
     ):
         tid = gpu.thread_idx.x
-        blk_n = gpu.block_idx.x
-        e_idx = gpu.block_idx.y
+        # XCD-aware remap: blocks are dealt round-robin to the 8 XCDs; give each
+        # XCD a contiguous chunk so same-expert tiles share one L2.
+        gx = N // BLOCK_N
+        gy = fx.Int32(gpu.grid_dim.y)
+        bid = fx.Int32(gpu.block_idx.y) * gx + fx.Int32(gpu.block_idx.x)
+        total = gy * gx
+        RR = 8
+        full = (total // (8 * RR)) * (8 * RR)
+        j = bid // 8
+        remap = (j // RR) * (8 * RR) + (bid % 8) * RR + j % RR
+        new_id = fx.arith.select(bid < full, remap, bid)
+        blk_n = new_id % gx
+        e_idx = new_id // gx
 
         in_ptr = fx.recast_iter(weight_dtype, fxh._as_ptr(p_input))
         arg_p_input = fx.make_view(in_ptr, fx.make_layout((M, K), (K, 1)))
