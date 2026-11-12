@@ -117,7 +117,12 @@ def test_gfx950_has_no_a16w16_fmoe_asm_kernel(dtype):
 )
 @pytest.mark.parametrize("dtype", [dtypes.bf16, dtypes.fp16])
 def test_tuned_1stage_row_without_the_kernel_is_discarded(monkeypatch, tmp_path, dtype):
-    meta = _dispatch(monkeypatch, tmp_path, dtype)
+    # With the g1u0 dispatch guard, a discarded row ends in a refusal instead of
+    # a 2-stage meta; either way the row must not be returned as 1-stage.
+    try:
+        meta = _dispatch(monkeypatch, tmp_path, dtype)
+    except NotImplementedError:
+        return
     assert not meta.run_1stage
 
 
