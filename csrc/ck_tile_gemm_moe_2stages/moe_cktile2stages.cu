@@ -585,3 +585,12 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
     }
     return Y;
 }
+
+bool cktile_moe_padded_scale_k()
+{
+#ifdef CK_TILE_MOE_FLATMM_PADDED_SCALE_K
+    return true;
+#else
+    return false;
+#endif
+}

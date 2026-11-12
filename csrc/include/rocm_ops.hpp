@@ -1336,7 +1336,11 @@ namespace py = pybind11;
           py::arg("activation")     = 0,             \
           py::arg("block_m")        = 32,            \
           py::arg("split_k")        = 1,             \
-          py::arg("kernel_name")    = std::string(""));
+          py::arg("kernel_name")    = std::string("")); \
+                                                     \
+    m.def("cktile_moe_padded_scale_k",               \
+          &cktile_moe_padded_scale_k,                \
+          "cktile_moe_padded_scale_k");
 
 #define MHA_VARLEN_FWD_PYBIND                            \
     m.def("mha_varlen_fwd",                              \
