@@ -17,6 +17,7 @@ from flydsl.expr.typing import Vector as Vec
 
 FP8_MAX = 448.0  # OCP e4m3fn on gfx950
 FP8_MAX_RCP = float(np.float32(1.0) / np.float32(FP8_MAX))
+AMAX_FLOOR = 1e-10  # csrc/include/quant_amax_floor.h kAmaxFloor
 
 
 def reps(tensor, mode):
