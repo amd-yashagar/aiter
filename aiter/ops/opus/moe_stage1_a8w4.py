@@ -6,10 +6,54 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from csrc.opus_moe.opus_moe_common import (
+    OPUS_A8W4_STAGE1_INSTANCES,
+    opus_a8w4_stage1_instance_supports_shape,
+)
+
 from ...jit.core import compile_ops
 from ..enum import ActivationType
 
 _OPUS_MOE_STAGE1_A8W4_SCALE_GROUP = 32
+_STAGE1_INSTANCE_BY_NAME = {
+    name: inst
+    for inst in OPUS_A8W4_STAGE1_INSTANCES
+    for name in (inst.name, inst.profile_name)
+}
+
+
+def cfg_is_supported(
+    kernel_name,
+    *,
+    gfx: str,
+    model_dim: int,
+    inter_dim: int,
+    inter_dim_pad: int,
+    block_m: int,
+) -> tuple[bool, str]:
+    """Check what the Opus stage1 host code asserts, which aborts the process."""
+
+    inst = _STAGE1_INSTANCE_BY_NAME.get(str(kernel_name))
+    if inst is None:
+        return False, f"unknown Opus A8W4 stage1 kernelName1={kernel_name!r}"
+    if gfx != "gfx950":
+        return False, f"requires gfx950, got {gfx}"
+    if int(block_m) != inst.block_m:
+        return (
+            False,
+            f"{inst.name} expects sorted block_m={inst.block_m}, got {block_m}",
+        )
+    if not opus_a8w4_stage1_instance_supports_shape(
+        inst,
+        model_dim=model_dim,
+        logical_inter_dim=inter_dim,
+        inter_dim_pad=inter_dim_pad,
+    ):
+        return False, (
+            f"{inst.name} does not support model_dim={model_dim} "
+            f"inter_dim={inter_dim} inter_dim_pad={inter_dim_pad}"
+        )
+    return True, ""
 
 
 def _opus_runtime_swiglu_limit(

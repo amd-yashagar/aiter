@@ -65,6 +65,7 @@ from aiter.ops.moe_mxfp4_aux import (
     _mxfp4_moe_sort_internal_is_supported,
     is_mxfp4_moe_scatter_supported,
 )
+from aiter.ops.opus import moe_stage1_a8w4 as _opus_a8w4_stage1
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
@@ -4662,6 +4663,22 @@ def get_2stage_cfgs(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
                     "using default heuristics"
                 )
+
+    if cfg is not None and kn1.startswith("opus_moe1_"):
+        opus_supported, opus_reason = _opus_a8w4_stage1.cfg_is_supported(
+            kn1,
+            gfx=gfx,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            inter_dim_pad=intermediate_pad,
+            block_m=cfg.get("block_m", BLOCK_SIZE_M),
+        )
+        if not opus_supported:
+            cfg = None
+            logger.warning(
+                f"[fused_moe] Opus stage1 config unsupported ({opus_reason}); "
+                "using default heuristics"
+            )
 
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
     kernel_name1 = kn1 if cfg is not None else ""
