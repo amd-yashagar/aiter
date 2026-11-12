@@ -70,6 +70,7 @@ def parse_config(config):
             "xc",
             "nw",
             "sp",
+            "rb",
         )
         if key in keys and tok[len(key) :]:
             out[key] = int(tok[len(key) :])
@@ -217,7 +218,7 @@ class _MxGfx950(MoeKernel):
             swiglu_limit=spec.swiglu_limit,
             situ_beta=float(beta),
             situ_linear_beta=float(lbeta),
-            round_bf16=False,
+            round_bf16=bool(cfg.get("rb", 0)),
             tile_n=tn,
             ahead=la,
             read_ahead=cfg.get("ra", 1),
