@@ -1763,7 +1763,7 @@ def _fused_moe_impl(
     # Validate the Swiglu shapes that get re-routed onto the a16w4 FlyDSL port
     # against the runtime-only constraints that get_2stage_cfgs cannot see.
     _is_a16w4_swiglu_rerouted = (
-        inter_dim % 256 != 0
+        (inter_dim % 256 != 0 or get_gfx() != "gfx950")
         and q_dtype_a == dtypes.bf16
         and _can_reroute_mxfp4_to_flydsl(
             model_dim=model_dim,
@@ -4146,7 +4146,11 @@ def get_2stage_cfgs(
     _has_input_activation_scales=False,
 ):
     gate_mode = GateMode(gate_mode)
-    cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
+    # CK-Tile MXFP4 instances are only built for gfx950 (gen_instances.py skips them
+    # elsewhere), so on any other arch the module fails to load (undefined symbol).
+    cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and (
+        inter_dim % 256 != 0 or get_gfx() != "gfx950"
+    )
     if q_type == QuantType.per_1x128 and activation == ActivationType.Silu:
         swiglu_limit = normalize_swiglu_limit(swiglu_limit)
     flydsl_can_take_over = _can_reroute_mxfp4_to_flydsl(
@@ -6761,6 +6765,11 @@ def cktile_moe_stage1(
             "CK-Tile MXFP4 stage1 requires model_dim to be a multiple of 256; "
             f"got {model_dim}"
         )
+    if w1.dtype == dtypes.fp4x2 and get_gfx() != "gfx950":
+        raise NotImplementedError(
+            "CK-Tile MXFP4 MoE kernels are only built for gfx950; "
+            f"gfx={get_gfx()!r} has none"
+        )
     token_num = hidden_states.shape[0]
     _, _n1, k1 = w1.shape
     _, k2, n2 = w2.shape
@@ -6920,6 +6929,11 @@ def cktile_moe_stage2(
 ):
     _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
     # Defense in depth for direct callers and tuned metadata.
+    if w2.dtype == dtypes.fp4x2 and get_gfx() != "gfx950":
+        raise NotImplementedError(
+            "CK-Tile MXFP4 MoE kernels are only built for gfx950; "
+            f"gfx={get_gfx()!r} has none"
+        )
     if w2.dtype == dtypes.fp4x2 and inter_dim % 256 != 0:
         raise NotImplementedError(
             "CK-Tile MXFP4 stage2 requires inter_dim to be a multiple of 256; "

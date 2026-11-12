@@ -880,6 +880,81 @@ def test_flydsl_a16wfp4_situv2_e2e(
     assert ld < 1e-2, f"a16w4 SiTUv2 cos/logits_diff too large: {ld:.3e}"
 
 
+@pytest.mark.skipif(get_gfx() != "gfx942", reason="CK-Tile MXFP4 is gfx950-only")
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_swiglu_a16w4_on_gfx942_avoids_cktile(with_bias):
+    """a16w4 Swiglu on gfx942: CK-Tile MXFP4 instances are not built there, so
+    the call used to fail on an undefined symbol at module load. Without bias
+    it must run on the FlyDSL port and match the reference; with bias (which
+    the port lacks) it must be refused."""
+    token, model_dim, inter_dim, E, topk = 16, 512, 256, 16, 4
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    inp = torch.randn((token, model_dim), dtype=dtypes.bf16, device="cuda")
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16, device="cuda")
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtypes.bf16, device="cuda")
+    score = torch.randn((token, E), dtype=dtypes.bf16, device="cuda")
+    topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+
+    w1_qt, w1_scale = _quantize_mxfp4_by_expert(w1)
+    w2_qt, w2_scale = _quantize_mxfp4_by_expert(w2)
+    w1_qt = w1_qt.view(E, inter_dim * 2, model_dim // 2)
+    w2_qt = w2_qt.view(E, model_dim, inter_dim // 2)
+    o1 = torch_moe_stage1(
+        inp,
+        w1_qt.view(dtypes.fp4x2),
+        w2_qt.view(dtypes.fp4x2),
+        topk_weights,
+        topk_ids,
+        dtype=dtypes.bf16,
+        activation=ActivationType.Swiglu,
+        quant_type=QuantType.per_1x32,
+        a1_scale=None,
+        w1_scale=w1_scale.view(E, inter_dim * 2, model_dim // 32),
+        doweight=False,
+    )
+    ref = torch_moe_stage2(
+        o1.view(token, topk, inter_dim),
+        w1_qt.view(dtypes.fp4x2),
+        w2_qt.view(dtypes.fp4x2),
+        topk_weights,
+        topk_ids,
+        dtype=dtypes.bf16,
+        quant_type=QuantType.per_1x32,
+        w2_scale=w2_scale.view(E, model_dim, inter_dim // 32),
+        a2_scale=None,
+        doweight=True,
+    )
+
+    bias1 = bias2 = None
+    if with_bias:
+        bias1 = torch.randn((E, inter_dim * 2), dtype=dtypes.fp32, device="cuda")
+        bias2 = torch.randn((E, model_dim), dtype=dtypes.fp32, device="cuda")
+
+    def call():
+        return fused_moe(
+            inp,
+            shuffle_weight_a16w4(w1_qt, 16, False),
+            shuffle_weight_a16w4(w2_qt, 16, False),
+            topk_weights,
+            topk_ids,
+            w1_scale=shuffle_scale_a16w4(w1_scale, E, False),
+            w2_scale=shuffle_scale_a16w4(w2_scale, E, False),
+            quant_type=QuantType.per_1x32,
+            activation=ActivationType.Swiglu,
+            bias1=bias1,
+            bias2=bias2,
+        )
+
+    if with_bias:
+        with pytest.raises(NotImplementedError, match="bias"):
+            call()
+        return
+    ld = _cos_diff(ref.float(), call().float())
+    assert ld < 1e-3, f"a16w4 Swiglu cos/logits_diff too large: {ld:.3e}"
+
+
 def _stage1_reference(hidden, weight, expert_ids, limit, activation_bf16):
     projected = torch.empty(
         (hidden.shape[0], expert_ids.shape[1], weight.shape[1]),
