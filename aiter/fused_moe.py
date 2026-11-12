@@ -109,6 +109,8 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
 # Adaptive sort has no shape fallback, so output_aux is limited to generated shapes.
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
+_USE_TOPK_SOFTMAX_HIP = os.environ.get("AITER_TOPK_SOFTMAX_HIP", "0") == "1"
+_USE_TOPK_SOFTMAX_SHIFT = os.environ.get("AITER_TOPK_SOFTMAX_SHIFT", "1") == "1"
 
 AUX_SORT_OPUS = "opus"
 
@@ -7417,6 +7419,37 @@ def cktile_moe_stage2(
     return out
 
 
+_TOPK_SHIFT_CACHE: dict = {}
+_TOPK_SHIFT_CACHE_BYTES = 0
+_TOPK_SHIFT_CACHE_LIMIT = 64 << 20
+
+
+def _topk_shift_buffer(gating_output: torch.Tensor) -> torch.Tensor:
+    """fp32 scratch for the row-max-shifted logits, one per (device, stream, shape).
+
+    Decode-sized buffers are cached so a decode step does not allocate (and a CUDA
+    graph keeps a stable address per captured shape); large ones are allocated per
+    call, where the allocation is lost in the kernel time. The buffer is written and
+    read by two back-to-back kernels on one stream, so the stream is part of the key:
+    calls on different streams (two-batch overlap) never share it.
+    """
+    global _TOPK_SHIFT_CACHE_BYTES
+    device = gating_output.device
+    key = (
+        device,
+        torch._C._cuda_getCurrentRawStream(device.index),
+        gating_output.shape,
+    )
+    buf = _TOPK_SHIFT_CACHE.get(key)
+    if buf is None:
+        buf = torch.empty(gating_output.shape, dtype=dtypes.fp32, device=device)
+        nbytes = buf.numel() * 4
+        if _TOPK_SHIFT_CACHE_BYTES + nbytes <= _TOPK_SHIFT_CACHE_LIMIT:
+            _TOPK_SHIFT_CACHE[key] = buf
+            _TOPK_SHIFT_CACHE_BYTES += nbytes
+    return buf
+
+
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -7435,9 +7468,15 @@ def fused_topk(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
-    # The asm kernel takes no pad-row count.
+    # The asm kernel takes no pad-row count. It computes exp() without subtracting the
+    # row max (a logit 88 or more above the rest overflows to NaN weights and
+    # duplicated ids), so it gets the row-max-shifted fp32 logits.
+    # AITER_TOPK_SOFTMAX_HIP=1 uses the HIP kernel instead, and so does the shifted
+    # path for E <= 256 and M >= 2048, where the HIP kernel is the faster correct one.
     if (
-        num_valid_rows is None
+        not _USE_TOPK_SOFTMAX_HIP
+        and not (_USE_TOPK_SOFTMAX_SHIFT and expert <= 256 and M >= 2048)
+        and num_valid_rows is None
         and get_gfx() in ["gfx942", "gfx950"]
         and (expert, topk)
         in [
@@ -7460,13 +7499,23 @@ def fused_topk(
             topk_ids = torch.empty(
                 (M + 3) // 4 * 4, topk, dtype=dtypes.i32, device=hidden_states.device
             )
-        aiter.topk_softmax_asm(
-            topk_weights,
-            topk_ids,
-            token_expert_indicies,
-            gating_output,
-            renormalize,
-        )
+        if _USE_TOPK_SOFTMAX_SHIFT:
+            aiter.topk_softmax_asm_shifted(
+                topk_weights,
+                topk_ids,
+                token_expert_indicies,
+                gating_output,
+                _topk_shift_buffer(gating_output),
+                renormalize,
+            )
+        else:
+            aiter.topk_softmax_asm(
+                topk_weights,
+                topk_ids,
+                token_expert_indicies,
+                gating_output,
+                renormalize,
+            )
         topk_weights = topk_weights[:M, :]
         topk_ids = topk_ids[:M, :]
     else:

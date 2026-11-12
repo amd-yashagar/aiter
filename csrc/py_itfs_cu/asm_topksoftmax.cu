@@ -142,3 +142,105 @@ void topk_softmax_asm(aiter_tensor_t* topk_weights,         // [num_tokens, topk
                              1,                     // bdz
                              stream});
 }
+
+// The asm top-k softmax kernels evaluate exp() without subtracting the row max and
+// overflow for a logit 88 or more above the rest. Softmax is shift invariant, so the
+// caller feeds them logits shifted by the row max, as fp32 (a bf16 shift would round
+// near-tied logits and could change the top-k ids).
+namespace {
+constexpr int SHIFT_THREADS = 256;
+
+__device__ inline float shift_load(const float* p, int i) { return p[i]; }
+__device__ inline float shift_load(const uint16_t* p, int i)
+{
+    return __uint_as_float(static_cast<uint32_t>(p[i]) << 16);
+}
+
+template <typename T>
+__global__ void row_max_shift_kernel(const T* __restrict__ x,
+                                     float* __restrict__ out,
+                                     int num_experts,
+                                     long x_stride)
+{
+    const T* row_in = x + blockIdx.x * x_stride;
+    float* row_out  = out + static_cast<long>(blockIdx.x) * num_experts;
+    float m         = -INFINITY;
+    for(int i = threadIdx.x; i < num_experts; i += SHIFT_THREADS)
+        m = fmaxf(m, shift_load(row_in, i));
+    for(int off = warpSize / 2; off > 0; off >>= 1)
+        m = fmaxf(m, __shfl_xor(m, off));
+    __shared__ float wave_max[SHIFT_THREADS / 32];
+    const int wave = threadIdx.x / warpSize;
+    if(threadIdx.x % warpSize == 0)
+        wave_max[wave] = m;
+    __syncthreads();
+    m = -INFINITY;
+    for(int w = 0; w < SHIFT_THREADS / warpSize; ++w)
+        m = fmaxf(m, wave_max[w]);
+    if(m == -INFINITY)
+        m = 0.f;
+    // exp(x - 80) = 1.8e-35 is still a normal fp32; below the normal range the
+    // kernel's weights flush to zero and it repeats the first expert id. Weights that
+    // small renormalize to 0, so clamping does not change the result.
+    for(int i = threadIdx.x; i < num_experts; i += SHIFT_THREADS)
+    {
+        const float d = shift_load(row_in, i) - m;
+        row_out[i]    = d < -80.f ? -80.f : d;
+    }
+}
+} // namespace
+
+static void
+topk_row_max_shift(aiter_tensor_t* gating_output, // [num_tokens, num_experts], bf16 or fp32
+                   aiter_tensor_t* shifted,       // [num_tokens, num_experts], fp32
+                   hipStream_t stream)
+{
+    const int num_experts = gating_output->size(-1);
+    const long num_tokens = gating_output->numel() / num_experts;
+    AITER_CHECK(shifted->dtype() == AITER_DTYPE_fp32,
+                __func__,
+                ": shifted must be float32, got ",
+                AiterDtype_to_str(shifted->dtype()));
+    AITER_CHECK(shifted->numel() == gating_output->numel(),
+                __func__,
+                ": shifted must have the shape of gating_output");
+    AITER_CHECK(gating_output->stride(-1) == 1, __func__, ": gating_output must be row contiguous");
+    if(num_tokens == 0)
+        return;
+    const HipDeviceGuard device_guard(gating_output->device_id);
+    const long x_stride = gating_output->stride(0);
+    if(gating_output->dtype() == AITER_DTYPE_fp32)
+        row_max_shift_kernel<float><<<num_tokens, SHIFT_THREADS, 0, stream>>>(
+            static_cast<const float*>(gating_output->ptr),
+            static_cast<float*>(shifted->ptr),
+            num_experts,
+            x_stride);
+    else if(gating_output->dtype() == AITER_DTYPE_bf16)
+        row_max_shift_kernel<uint16_t><<<num_tokens, SHIFT_THREADS, 0, stream>>>(
+            static_cast<const uint16_t*>(gating_output->ptr),
+            static_cast<float*>(shifted->ptr),
+            num_experts,
+            x_stride);
+    else
+        AITER_CHECK(false,
+                    __func__,
+                    ": unsupport gating_output dtype:",
+                    AiterDtype_to_str(gating_output->dtype()));
+}
+
+// topk_softmax_asm on logits shifted by their row max. `shifted` is a caller-allocated
+// fp32 buffer of the gating_output shape, written by the shift kernel and read by the
+// asm kernel on the same stream.
+AITER_C_ITFS
+void topk_softmax_asm_shifted(aiter_tensor_t* topk_weights,
+                              aiter_tensor_t* topk_indices,
+                              aiter_tensor_t* token_expert_indices,
+                              aiter_tensor_t* gating_output,
+                              aiter_tensor_t* shifted,
+                              int need_renorm,
+                              hipStream_t stream)
+{
+    topk_row_max_shift(gating_output, shifted, stream);
+    topk_softmax_asm(
+        topk_weights, topk_indices, token_expert_indices, shifted, need_renorm, stream);
+}
