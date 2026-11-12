@@ -151,7 +151,11 @@ def test_fmoe(
     expected_kernel1: str | None = None,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
-        return
+        # A silent return was recorded as a result, so these paths looked checked
+        # on gfx942. The case loop skips them with a message before this point.
+        raise RuntimeError(
+            f"test_fmoe: per_1x32 MoE is gfx950-only, not checkable on {get_gfx()}"
+        )
     if actType == aiter.ActivationType.Situv2:
         beta = DEFAULT_SITUV2_BETA if beta is None else float(beta)
         linear_beta = (
@@ -673,14 +677,27 @@ def test_fmoe(
         assert (
             not asm_flat_mxfp4 or logits_diff < 2e-3
         ), f"accuracy check failed (asm FLAT MXFP4): logits_diff={logits_diff}"
-    elif has_nan:
-        logger.warning("accuracy check failed (non-strict): output contains NaN")
-    elif err != 0 and logits_diff > 0.01:
-        logger.warning(
-            f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
-        )
+    accuracy_failed = False
+    if not strict_accuracy:
+        if has_nan:
+            logger.warning("accuracy check failed (non-strict): output contains NaN")
+            accuracy_failed = True
+        elif err != 0 and logits_diff > 0.01:
+            logger.warning(
+                f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
+            )
+            accuracy_failed = True
+        elif asm_flat_mxfp4 and logits_diff >= 2e-3:
+            logger.warning(
+                f"accuracy check failed (non-strict, asm FLAT MXFP4): logits_diff={logits_diff}"
+            )
+            accuracy_failed = True
 
-    return {"us": us2, "logits_diff": float(logits_diff)}
+    return {
+        "us": us2,
+        "logits_diff": float(logits_diff),
+        "accuracy_failed": accuracy_failed,
+    }
 
 
 l_quant = [
@@ -828,6 +845,12 @@ parser.add_argument(
     bias. Default is [True] for backward compatibility. Use
     --stage2-bias f for bias-free models, or --stage2-bias t f to test both.
     FLAT MXFP4 assembly kernels do not apply this bias.""",
+)
+parser.add_argument(
+    "--allow-accuracy-failures",
+    action="store_true",
+    help="Log accuracy failures of the legacy sweep but still exit 0 (the sweep runs "
+    "every case either way; by default it exits 1 if any case failed accuracy).",
 )
 parser.add_argument(
     "--no-flydsl-csv",
@@ -1294,6 +1317,11 @@ def _format_moe_2stage_case(kwargs):
 
 
 def _moe_2stage_skip_reason(kwargs):
+    if get_gfx() != "gfx950" and kwargs["qType"] == aiter.QuantType.per_1x32:
+        return (
+            "per_1x32 MoE (a4w4, a8w4, a16w4, a16wi4, mxfp8) is gfx950-only and "
+            f"cannot be checked on {get_gfx()}"
+        )
     route_workspace_reason = _moe_2stage_route_workspace_skip_reason(kwargs)
     if route_workspace_reason is not None:
         return route_workspace_reason
@@ -2867,6 +2895,7 @@ def _write_bench_csv(rows):
 
 df = []
 seen = 0
+accuracy_failures = []
 for kwargs, extras in case_iter:
     seen += 1
     skip_reason = _moe_2stage_skip_reason(kwargs)
@@ -2913,6 +2942,8 @@ for kwargs, extras in case_iter:
         continue
     ret.update(extras)
     df.append(ret)
+    if ret.get("accuracy_failed"):
+        accuracy_failures.append(_format_moe_2stage_case(kwargs))
     _write_bench_csv(df)
 
 aiter.logger.info(
@@ -2924,3 +2955,12 @@ aiter.logger.info(
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+
+if accuracy_failures:
+    aiter.logger.error(
+        "moe_2stage: %d case(s) failed the accuracy check:\n%s",
+        len(accuracy_failures),
+        "\n".join(accuracy_failures),
+    )
+    if not args.allow_accuracy_failures:
+        sys.exit(1)
