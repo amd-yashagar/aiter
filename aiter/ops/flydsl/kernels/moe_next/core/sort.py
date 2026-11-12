@@ -51,6 +51,10 @@ WAVES = BLOCK // WAVE
 OOB = 0x7FFFFFFF
 STAGE_ROUNDS = 8
 STAGE = STAGE_ROUNDS * BLOCK
+# Two-launch histogram and scatter stage: CHUNK_MIN_ROUTES (1024) routes, so a
+# minimum chunk runs no masked rounds (8 rounds took 2.2x as long on MI300X).
+HIST_ROUNDS = 4
+HIST_STAGE = HIST_ROUNDS * BLOCK
 COUNT_BATCH = 32
 
 
@@ -216,15 +220,15 @@ def _histogram(
     key_bits,
 ):
     """hist[e] += routes of expert e in [begin, end); loads are issued a stage
-    (STAGE_ROUNDS rounds) at a time."""
-    stages = (end - begin + fx.Int32(STAGE - 1)) // fx.Int32(STAGE)
+    (HIST_ROUNDS rounds) at a time."""
+    stages = (end - begin + fx.Int32(HIST_STAGE - 1)) // fx.Int32(HIST_STAGE)
     for st in range(fx.Int32(0), stages, fx.Int32(1)):
-        i0 = begin + fx.Int32(st) * fx.Int32(STAGE) + tid
+        i0 = begin + fx.Int32(st) * fx.Int32(HIST_STAGE) + tid
         raw = [
             _load_route(
                 ids_it, None, i0 + fx.Int32(k * BLOCK), end, False, topk, n_total
             )
-            for k in range_constexpr(STAGE_ROUNDS)
+            for k in range_constexpr(HIST_ROUNDS)
         ]
         routes = [
             _check(
@@ -238,9 +242,9 @@ def _histogram(
                 topk,
                 key_bits,
             )
-            for k in range_constexpr(STAGE_ROUNDS)
+            for k in range_constexpr(HIST_ROUNDS)
         ]
-        for k in range_constexpr(STAGE_ROUNDS):
+        for k in range_constexpr(HIST_ROUNDS):
             e, valid = routes[k][0], routes[k][1]
             if valid:
                 fx.atomic_add(hist + fx.Int64(e), fx.Int32(1), syncscope="workgroup")
@@ -446,6 +450,75 @@ def _rank_round(
         _lds_st(tbl, c0, slot)
 
 
+def _stage_routes(ids_it, w_it, base, tid, end, n_total, topk):
+    """Loads of one HIST_ROUNDS-round stage from route ``base``."""
+    return [
+        _load_route(
+            ids_it, w_it, base + fx.Int32(k * BLOCK) + tid, end, True, topk, n_total
+        )
+        for k in range_constexpr(HIST_ROUNDS)
+    ]
+
+
+def _stage_check(raw, mask_lds, base, tid, num_experts, has_mask, topk, key_bits):
+    return [
+        _check(
+            raw[k][0],
+            raw[k][1],
+            mask_lds,
+            num_experts,
+            has_mask,
+            raw[k][3],
+            base + fx.Int32(k * BLOCK) + tid,
+            topk,
+            key_bits,
+        )
+        for k in range_constexpr(HIST_ROUNDS)
+    ]
+
+
+@flyc.jit
+def _scatter_stage(
+    raw,
+    routes,
+    run,
+    tbl,
+    wave,
+    tid,
+    base,
+    sids_it,
+    sw_it,
+    topk,
+    e_cap,
+    loc_it,
+    end,
+    with_loc,
+):
+    for k in range_constexpr(HIST_ROUNDS):
+        if base + fx.Int32(k * BLOCK) < end:
+            e, valid, below, cnt = routes[k]
+            _rank_round(
+                run,
+                tbl,
+                wave,
+                k,
+                e,
+                valid,
+                below,
+                cnt,
+                raw[k][2],
+                base + fx.Int32(k * BLOCK) + tid,
+                sids_it,
+                sw_it,
+                topk,
+                e_cap,
+                loc_it,
+                end,
+                with_loc,
+            )
+    gpu.barrier()
+
+
 @flyc.jit
 def _rank_and_scatter(
     run,
@@ -466,57 +539,53 @@ def _rank_and_scatter(
     e_cap,
     loc_it,
     with_loc,
+    first,
 ):
     """Scatter routes [begin, end) in route order; run[e] holds each expert's
     next row. Rounds alternate tbl halves, so each needs two barriers; rounds
-    past ``end`` are skipped (the test is uniform across the workgroup)."""
+    past ``end`` are skipped (the test is uniform across the workgroup).
+    ``first`` = (loads, checks) of stage 0, issued early by the caller so
+    their latency overlaps the count sum and scan."""
     wave = tid // fx.Int32(WAVE)
-    stages = (end - begin + fx.Int32(STAGE - 1)) // fx.Int32(STAGE)
-    for st in range(fx.Int32(0), stages, fx.Int32(1)):
-        base = begin + fx.Int32(st) * fx.Int32(STAGE)
-        raw = [
-            _load_route(
-                ids_it, w_it, base + fx.Int32(k * BLOCK) + tid, end, True, topk, n_total
-            )
-            for k in range_constexpr(STAGE_ROUNDS)
-        ]
-        routes = [
-            _check(
-                raw[k][0],
-                raw[k][1],
-                mask_lds,
-                num_experts,
-                has_mask,
-                raw[k][3],
-                base + fx.Int32(k * BLOCK) + tid,
-                topk,
-                key_bits,
-            )
-            for k in range_constexpr(STAGE_ROUNDS)
-        ]
-        for k in range_constexpr(STAGE_ROUNDS):
-            if base + fx.Int32(k * BLOCK) < end:
-                e, valid, below, cnt = routes[k]
-                _rank_round(
-                    run,
-                    tbl,
-                    wave,
-                    k,
-                    e,
-                    valid,
-                    below,
-                    cnt,
-                    raw[k][2],
-                    base + fx.Int32(k * BLOCK) + tid,
-                    sids_it,
-                    sw_it,
-                    topk,
-                    e_cap,
-                    loc_it,
-                    end,
-                    with_loc,
-                )
-        gpu.barrier()
+    _scatter_stage(
+        first[0],
+        first[1],
+        run,
+        tbl,
+        wave,
+        tid,
+        begin,
+        sids_it,
+        sw_it,
+        topk,
+        e_cap,
+        loc_it,
+        end,
+        with_loc,
+    )
+    stages = (end - begin + fx.Int32(HIST_STAGE - 1)) // fx.Int32(HIST_STAGE)
+    for st in range(fx.Int32(1), stages, fx.Int32(1)):
+        base = begin + fx.Int32(st) * fx.Int32(HIST_STAGE)
+        raw = _stage_routes(ids_it, w_it, base, tid, end, n_total, topk)
+        routes = _stage_check(
+            raw, mask_lds, base, tid, num_experts, has_mask, topk, key_bits
+        )
+        _scatter_stage(
+            raw,
+            routes,
+            run,
+            tbl,
+            wave,
+            tid,
+            base,
+            sids_it,
+            sw_it,
+            topk,
+            e_cap,
+            loc_it,
+            end,
+            with_loc,
+        )
 
 
 @flyc.jit
@@ -948,6 +1017,11 @@ def build(
             if has_local:
                 tokens = _ld(_it(ltok), c0)
             n = tokens * fx.Int32(topk)
+            begin = bid * chunk
+            end = begin + chunk
+            end = (end < n).select(end, n)
+            begin = (begin < end).select(begin, end)
+            raw0 = _stage_routes(ids_it, w_it, begin, tid, end, n, topk)
             mask_lds = lds.mask.ptr
             if has_mask:
                 _load_mask(mask_lds, mask_it, tid, E, e_cap)
@@ -955,6 +1029,9 @@ def build(
             _clear(run, e_cap, tid)
             _clear(tbl, 2 * WAVES * e_cap, tid)
             gpu.barrier()
+            routes0 = _stage_check(
+                raw0, mask_lds, begin, tid, E, has_mask, topk, key_bits
+            )
             _sum_counts(hist, run, _it(counts), tid, bid, n_chunks, E, e_cap)
             sentinel = (fx.Int32(topk) << fx.Int32(24)) | tokens
             total = _expert_scan(
@@ -989,10 +1066,6 @@ def build(
                 e = fx.Int32(k) + tid
                 _lds_st(run, _lds(run, e) + _lds(start, e), e)
             gpu.barrier()
-            begin = bid * chunk
-            end = begin + chunk
-            end = (end < n).select(end, n)
-            begin = (begin < end).select(begin, end)
             _rank_and_scatter(
                 run,
                 tbl,
@@ -1012,6 +1085,7 @@ def build(
                 e_cap,
                 _it(loc_ids),
                 with_loc,
+                (raw0, routes0),
             )
 
     @flyc.jit
