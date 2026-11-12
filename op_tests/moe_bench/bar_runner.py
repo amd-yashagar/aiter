@@ -357,7 +357,7 @@ def cmd_bar(args):
         flush=True,
     )
     t0 = time.time()
-    if kind == "new" and tree != os.path.abspath(args.aiter):
+    if runner.needs_shim(tree):
         shim = runner.make_shim(tmpdir)
         for j in jobs:
             j.pkg = "moe_bench_shim"
