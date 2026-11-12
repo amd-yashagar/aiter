@@ -118,7 +118,9 @@ def force_config(row, tmpdir):
     import aiter.fused_moe as fm
     from aiter.jit.core import AITER_CONFIGS
 
-    path = os.path.join(tmpdir, "force_fmoe.csv")
+    # one file per worker: workers of one run share the tmpdir, and a shared file was
+    # rewritten under a running candidate (EmptyDataError, another worker's row)
+    path = os.path.join(tmpdir, f"force_fmoe_{os.getpid()}.csv")
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_COLS)
         w.writeheader()

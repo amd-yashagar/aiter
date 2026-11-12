@@ -205,6 +205,7 @@ class BarGroupJob(runner.GroupJob):
         kind="bar",
         sources=None,
         source_modules=(),
+        screen="full",
         **k,
     ):
         super().__init__(*a, **k)
@@ -213,6 +214,7 @@ class BarGroupJob(runner.GroupJob):
         self.kind = kind
         self.sources = sources
         self.source_modules = list(source_modules)
+        self.screen = screen
         self.bad = {}
         self.main_failures = {}
         self.dispatch_us = {}
@@ -231,6 +233,7 @@ class BarGroupJob(runner.GroupJob):
             },
             "sources": self.sources,
             "source_modules": self.source_modules,
+            "screen": self.screen,
             "tmpdir": self.tmpdir,
         }
 
@@ -656,6 +659,7 @@ def _run_pass(args, kind):
             kind=kind,
             sources=sources,
             source_modules=args.source_module or (),
+            screen=args.screen,
         )
         for k, cs in groups
     ]

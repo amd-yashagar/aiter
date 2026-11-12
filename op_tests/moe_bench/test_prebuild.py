@@ -107,8 +107,44 @@ def test_workers_cannot_compile_under_the_guard(monkeypatch):
 
 def test_children_build_with_the_gpu_hidden_and_the_arch_named():
     env = prebuild._child_env(16)
-    assert env["HIP_VISIBLE_DEVICES"] == "-1" and env["CUDA_VISIBLE_DEVICES"] == ""
+    # empty hides the GPU everywhere; "-1" aborts the runtime on TheRock wheels
+    for var in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        assert env[var] == "", var
     assert env["GPU_ARCHS"].startswith("gfx") and env["MAX_JOBS"] == "16"
-    assert "ROCR_VISIBLE_DEVICES" not in env or env["ROCR_VISIBLE_DEVICES"] != ""
     assert prebuild.NO_BUILD_ENV not in env
     assert workload is not None
+
+
+def test_only_compile_failures_are_remembered_and_built_modules_are_forgotten(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    need = prebuild.plan([PTPC])
+    target = min(m for m in need if m.startswith("module_moe_ck2stages"))
+
+    class P:
+        def __init__(self, out):
+            self.stdout, self.stderr = out, ""
+
+    def fake_run(cmd, **kw):
+        return P(kw_out["text"])
+
+    monkeypatch.setattr(prebuild.subprocess, "run", fake_run)
+    monkeypatch.setattr(prebuild, "plan", lambda cases: {target: need[target]})
+    # an environment failure ("Sequence '-1' not recognized") is not recorded
+    kw_out = {"text": "agent.cpp:208 Sequence '-1' not recognized"}
+    res = prebuild.run_prebuild([], jobs=1, log=lambda *_: None)
+    assert res["failed"] == [target] and prebuild.known_failed() == {}
+    # a compile that ran and failed is
+    kw_out = {"text": f"build [{target}] under /x failed !!!!!!"}
+    prebuild.run_prebuild([], jobs=1, log=lambda *_: None)
+    assert target in prebuild.known_failed()
+
+    # --prebuild-retry tries it again; once it builds, the record is dropped
+    def build_it(cmd, **kw):
+        (tmp_path / f"{target}.so").write_bytes(b"")
+        return P("")
+
+    monkeypatch.setattr(prebuild.subprocess, "run", build_it)
+    res = prebuild.run_prebuild([], jobs=1, log=lambda *_: None, retry_failed=True)
+    assert res["built"] == [target] and prebuild.known_failed() == {}

@@ -170,6 +170,15 @@ def main(argv=None):
         "the cases need on the CPU (no GPU lease), then exit",
     )
     p.add_argument(
+        "--screen",
+        choices=("full", "two-phase"),
+        default="full",
+        help="bar mode: full = marginal-effect pair screening with a one-seed accuracy "
+        "check per screened candidate; two-phase = a timing-only warm screen of every "
+        "candidate, then the full measurement and accuracy for the top 8 and anything "
+        "within 5%% of the best (widened if every finalist fails)",
+    )
+    p.add_argument(
         "--prebuild-only",
         action="store_true",
         help="build the modules the cases need (as --mode prebuild) and exit",

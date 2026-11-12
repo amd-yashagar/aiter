@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 STATIC = ("module_aiter_core", "module_moe_asm", "module_moe_fmoe_asm", "module_quant")
 NO_BUILD_ENV = "MOE_BENCH_NO_BUILD"
+COMPILE_FAILED = "failed !!!!!!"  # aiter.jit.core.raise_build_error
 
 
 def jit_dir():
@@ -231,10 +232,12 @@ def _child_env(max_jobs):
     from aiter.jit.utils.chip_info import get_gfx
 
     env = dict(os.environ)
-    # rocminfo still sees the chip with the GPU hidden from HIP; the arch is named
-    # explicitly so the child never has to look (ROCR_VISIBLE_DEVICES would blind it)
+    # Empty values hide the GPU on every ROCm stack; "-1" aborts the runtime on TheRock
+    # wheels ("Sequence '-1' not recognized"). With ROCR_VISIBLE_DEVICES empty rocminfo
+    # sees no chip, so the arch is named explicitly and the child never has to look.
     env.update(
-        HIP_VISIBLE_DEVICES="-1",
+        HIP_VISIBLE_DEVICES="",
+        ROCR_VISIBLE_DEVICES="",
         CUDA_VISIBLE_DEVICES="",
         GPU_ARCHS=os.environ.get("GPU_ARCHS") or get_gfx(),
         MAX_JOBS=str(max_jobs),
@@ -310,11 +313,25 @@ def run_prebuild(
             log(f"prebuild: {'built' if ok else 'FAILED'} {md} in {sec:.0f}s")
             if not ok:
                 log("  " + tail.replace("\n", "\n  "))
-    if failed:
-        record = known_failed()
-        record.update({m: tails.get(m, "") for m in failed})
+    # only a compile that ran and failed is a property of the module; anything else
+    # (the environment, a killed child) is retried by the next prebuild
+    record = known_failed()
+    genuine = {m for m in failed if COMPILE_FAILED in tails.get(m, "")}
+    record = {
+        m: v
+        for m, v in record.items()
+        if m not in built and not os.path.exists(module_path(m))
+    }
+    record.update({m: tails[m] for m in genuine})
+    if record != known_failed():
         with open(failed_path(), "w") as f:
             json.dump(record, f, indent=1)
+    transient = sorted(set(failed) - genuine)
+    if transient:
+        log(
+            f"prebuild: {len(transient)} failures were not compile errors (not recorded, "
+            "retried next time): " + ", ".join(transient[:5])
+        )
     log(
         f"prebuild: {len(built)} built, {len(failed)} failed, {len(present)} already "
         f"present, {time.time() - t0:.0f}s ({jobs} at a time, MAX_JOBS={per} each)"

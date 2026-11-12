@@ -139,9 +139,12 @@ class Measurer:
         self.fh, self.case_id = fh, case_id
         self.records = []  # confirmed results for the bar
 
-    def measure(self, cand, quick=False, modes=("warm",)):
-        """Returns {"ok", "us", "outcome", ...}; emits one ``cand`` event per mode."""
-        res = self._measure(cand, quick, modes)
+    def measure(self, cand, quick=False, modes=("warm",), check=True):
+        """Returns {"ok", "us", "outcome", ...}; emits one ``cand`` event per mode.
+
+        ``check=False`` is the timing-only screen of two-phase bar mode: the router check
+        and a short warm timing, no accuracy (finalists get the full measurement)."""
+        res = self._measure(cand, quick, modes, check)
         self._tally(cand, res)
         return res
 
@@ -159,7 +162,7 @@ class Measurer:
             t.get(res.get("outcome") or ("ok" if res.get("ok") else "error"), 0) + 1
         )
 
-    def _measure(self, cand, quick=False, modes=("warm",)):
+    def _measure(self, cand, quick=False, modes=("warm",), check=True):
         import torch
 
         from aiter import dtypes
@@ -205,6 +208,8 @@ class Measurer:
                 res["unnamed"] = "'<lambda>'" in reason
                 self._emit(base, modes, status="router-discarded", detail=reason)
                 return res
+            if not check:
+                return self._time_only(cand, base, call, route, res)
             if self.acc_refs is None:
                 res["outcome"] = "noref"
                 self._emit(
@@ -377,6 +382,34 @@ class Measurer:
                 del hs
             self._path_cache[key] = by_seed
         return self._path_cache[key]
+
+    def _time_only(self, cand, base, call, route, res):
+        from .timing import Timer
+
+        timer = Timer(call, self.ctx.hidden_static, self.pool)
+        timer.prepare_graph()
+        if hasattr(cand, "probe_route"):
+            cand.probe_route("capture")
+        res["timing_mode"] = timer.mode
+        st = timer.time(cold=False, quick=True)
+        res["by_mode"] = {"warm": st}
+        self._emit(
+            base,
+            ["warm"],
+            status="ok",
+            detail="timing-only screen (accuracy checked for finalists)",
+            timing_mode=timer.mode,
+            **st,
+            new_kernel_id=getattr(cand, "kernel_id", ""),
+            kernel1=route.get("kernel1", ""),
+            kernel2=route.get("kernel2", ""),
+            route_key=route.get("route_key", ""),
+        )
+        res["ok"] = True
+        res["outcome"] = "ok"
+        res["unchecked"] = True
+        res["us"] = st["median_us"]
+        return res
 
     def refs_for_variants(self, variants):
         """{seed: {"exact", "path_<rule>"...}}: one ref_path per candidate scale rule."""
@@ -645,6 +678,9 @@ def run_bar_group(cases, spec, fh):
                 fh,
                 {"event": "log", "msg": f"{c.id} {src.name}: {len(cands)} candidates"},
             )
+            if mode_kind == "bar" and spec.get("screen") == "two-phase":
+                two_phase(meas, cands, bad.get(c.id, ()), modes, results)
+                continue
             if mode_kind == "bar":
                 keep = src.screen(ctx, cands, _Screener(meas, bad.get(c.id, ())))
             else:
@@ -669,6 +705,44 @@ def run_bar_group(cases, spec, fh):
 
         unforce()
         torch.cuda.empty_cache()
+
+
+FINALISTS_TOP = 8
+FINALISTS_BAND = 0.05  # also anything within 5% of the best screened time
+
+
+def two_phase(meas, cands, bad, modes, results):
+    """Two-phase bar screening of one source's candidates.
+
+    Phase 1 times every candidate briefly and warm, without the accuracy check. Phase 2
+    runs the full measurement (warm and cold timing, accuracy) for the finalists: the
+    fastest ``FINALISTS_TOP`` plus anything within ``FINALISTS_BAND`` of the best screened
+    time. If every finalist fails, the set widens by the next ``FINALISTS_TOP`` screened
+    candidates until one passes or none is left. Results go into ``results``.
+    """
+    bad = set(bad)
+    screened = []
+    for cand in cands:
+        if cand.id in bad:
+            continue
+        r = meas.measure(cand, quick=True, modes=("warm",), check=False)
+        if r["ok"]:
+            screened.append((r["us"], cand))
+    screened.sort(key=lambda t: t[0])
+    if not screened:
+        return
+    best = screened[0][0]
+    n = max(
+        FINALISTS_TOP, sum(1 for us, _ in screened if us <= best * (1 + FINALISTS_BAND))
+    )
+    done = 0
+    while done < len(screened):
+        for _, cand in screened[done:n]:
+            results[cand.id] = meas.measure(cand, quick=False, modes=modes)
+        done = n
+        if any(results[c.id].get("ok") for _, c in screened[:done]):
+            return
+        n = min(len(screened), n + FINALISTS_TOP)
 
 
 class _Screener:
