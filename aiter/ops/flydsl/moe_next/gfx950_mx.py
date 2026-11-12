@@ -92,6 +92,7 @@ class _MxGfx950(MoeKernel):
     routing = "tiles"
     handles_kwargs = frozenset({"quant_dtype_a"})
     prefill = False
+    round_bf16 = False
 
     def supports(self, spec, m, topk, call=None):
         if get_gfx_runtime() != "gfx950":
@@ -218,7 +219,7 @@ class _MxGfx950(MoeKernel):
             swiglu_limit=spec.swiglu_limit,
             situ_beta=float(beta),
             situ_linear_beta=float(lbeta),
-            round_bf16=bool(cfg.get("rb", 0)),
+            round_bf16=self.round_bf16 or bool(cfg.get("rb", 0)),
             tile_n=tn,
             ahead=la,
             read_ahead=cfg.get("ra", 1),
@@ -491,13 +492,25 @@ _FAMILIES = {
 }
 
 
-def _make(fam, prefill):
+def _make(fam, prefill, swiglu=False):
+    """One kernel id per family and regime. ``swiglu`` registers the a4w4 Swiglu
+    variant: it rounds the activation to bf16 before the intermediate's MX quant, as
+    aiter's a4w4 Swiglu path and the reference do (fp32_direct is 2% off there, the
+    clamps put many values on fp4 rounding boundaries)."""
     a_dt, w_dt = _FAMILIES[fam]
-    name = f"Mx{fam.capitalize()}Gfx950{'Prefill' if prefill else 'Decode'}"
+    tag = f"{fam}_swiglu" if swiglu else fam
+    name = f"Mx{tag.title().replace('_', '')}Gfx950{'Prefill' if prefill else 'Decode'}"
+    split_swiglu = fam == "a4w4"
 
     def supports(self, spec, m, topk, call=None):
         if spec.w_dtype != w_dt:
             return f"weights are {spec.w_dtype}, not {fam}"
+        if split_swiglu and (spec.act == ActivationType.Swiglu) != swiglu:
+            return (
+                "a4w4 Swiglu is served by gfx950_mx_a4w4_swiglu"
+                if not swiglu
+                else "not Swiglu"
+            )
         if call is not None:
             a = activation_dtype(
                 spec, call.weights, call.w1, m, call.hidden_states.dtype, False
@@ -506,17 +519,19 @@ def _make(fam, prefill):
                 return f"activation dtype {a} is not {fam}"
         return _MxGfx950.supports(self, spec, m, topk, call)
 
+    act_q = _ACT_TERM[_DT[a_dt]]
     cls = type(
         name,
         (_MxGfx950,),
         {
-            "id": f"gfx950_mx_{fam}.{'prefill' if prefill else 'decode'}",
+            "id": f"gfx950_mx_{tag}.{'prefill' if prefill else 'decode'}",
             "family": fam,
             "epilogue": "reduce" if prefill else "atomic",
             "prefill": prefill,
+            "round_bf16": swiglu,
             "numerics": {
-                "act_quant": _ACT_TERM[_DT[a_dt]],
-                "inter": "fp32_direct",
+                "act_quant": act_q,
+                "inter": f"bf16_then_{act_q}" if swiglu else "fp32_direct",
                 "combine": "bf16_rows_fp32_sum" if prefill else "bf16_atomic",
             },
             "supports": supports,
@@ -528,3 +543,5 @@ def _make(fam, prefill):
 for _fam in _FAMILIES:
     for _prefill in (False, True):
         _make(_fam, _prefill)
+for _prefill in (False, True):
+    _make("a4w4", _prefill, swiglu=True)
