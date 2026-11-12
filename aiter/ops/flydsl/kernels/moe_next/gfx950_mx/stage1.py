@@ -78,6 +78,8 @@ def _build_stage1(
     xcd=False,
     waves=4,
     sched_pin=False,
+    waves_per_eu=0,
+    xcd_group=1,
 ):
     K = int(model_dim)
     INTER = int(inter_dim)
@@ -335,7 +337,7 @@ def _build_stage1(
         nblk = fx.Int32(gpu.block_id("x"))
         mblk = fx.Int32(gpu.block_id("y"))
         if const_expr(XCD):
-            nblk, mblk = cm.xcd_tile(nblk, mblk, NX)
+            nblk, mblk = cm.xcd_tile(nblk, mblk, NX, int(xcd_group))
         m_row = mblk * fx.Int32(BM)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base = fx.Int32(fx.ptrtoint(lds.buf.ptr))
@@ -786,6 +788,9 @@ def _build_stage1(
             stream=stream,
         )
 
+    if waves_per_eu:
+        # register budget for that many waves per SIMD (the compiler spills past it)
+        launch_mx_stage1.compile_hints["waves_per_eu"] = int(waves_per_eu)
     return launch_mx_stage1
 
 

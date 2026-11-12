@@ -70,6 +70,9 @@ def parse_config(config):
             "xc",
             "nw",
             "sp",
+            "o1",
+            "o2",
+            "xg",
         )
         if key in keys and tok[len(key) :]:
             out[key] = int(tok[len(key) :])
@@ -196,6 +199,7 @@ class _MxGfx950(MoeKernel):
         )
         reduce = self.epilogue == "reduce"
         xcd = bool(cfg.get("xc", 1 if self.prefill else 0))
+        xg = cfg.get("xg", 1)
         a_bytes = spec.model_dim if a == "fp8" else spec.model_dim // 2
         direct = (
             not self.prefill
@@ -232,6 +236,8 @@ class _MxGfx950(MoeKernel):
             xcd=xcd,
             waves=4 if direct else cfg.get("nw", 4),
             sched_pin=bool(cfg.get("sp", 0)),
+            waves_per_eu=cfg.get("o1", 0),
+            xcd_group=xg,
         )
         s2 = compile_stage2(
             model_dim=spec.model_dim,
@@ -247,9 +253,11 @@ class _MxGfx950(MoeKernel):
             nt=bool(cfg.get("nt", 1)),
             direct=direct,
             xcd=xcd,
+            waves_per_eu=cfg.get("o2", 0),
+            xcd_group=xg,
         )
         r = compile_reduce(model_dim=spec.model_dim, topk=topk) if reduce else None
-        return bm, a, q, s1, s2, r, (direct, bool(cfg.get("iq", 0)), xcd)
+        return bm, a, q, s1, s2, r, (direct, bool(cfg.get("iq", 0)), xcd, xg)
 
     def warmup(self, weights, m, topk, config):
         import flydsl.expr as fx
@@ -328,7 +336,8 @@ class _MxGfx950(MoeKernel):
             )
         rows, mblocks = sids.numel(), se.numel()
         if direct[2]:
-            mblocks = (mblocks + 7) // 8 * 8
+            pad = 8 * direct[3]
+            mblocks = (mblocks + pad - 1) // pad * pad
         stream = fx.Stream(torch.cuda.current_stream(dev))
         aq = torch.empty(
             (M, D // 2 if a == "fp4" else D), dtype=torch.uint8, device=dev

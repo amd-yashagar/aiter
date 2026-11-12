@@ -158,15 +158,18 @@ def buffer_load16(addr_i64, base_dw, lane_dw, nt=False):
     return fx.Vector(frag.load())
 
 
-def xcd_tile(bx, by, nx):
-    """(column block, tile) for a grid of nx column blocks by a multiple of 8 tiles,
-    so every column block of tile m runs on XCD m % 8 (workgroup id w is dispatched
-    to XCD w % 8): a tile's token rows are then fetched into one XCD's L2."""
+def xcd_tile(bx, by, nx, group=1):
+    """(column block, tile) for a grid of nx column blocks by a multiple of 8 * group
+    tiles: workgroup id w is dispatched to XCD w % 8, and every column block of tiles
+    group * k .. group * k + group - 1 runs on XCD k % 8, back to back. With group 1 a
+    tile's token rows are fetched into one XCD's L2; a larger group keeps an expert's
+    consecutive tiles there too, so its weights are read from HBM once."""
     pid = by * fx.Int32(nx) + bx
     xc = pid & fx.Int32(7)
     q = pid >> fx.Int32(3)
-    n = q % fx.Int32(nx)
-    m = (q // fx.Int32(nx)) * fx.Int32(8) + xc
+    s = q % fx.Int32(group)
+    n = (q // fx.Int32(group)) % fx.Int32(nx)
+    m = ((q // fx.Int32(group * nx)) * fx.Int32(8) + xc) * fx.Int32(group) + s
     return n, m
 
 
