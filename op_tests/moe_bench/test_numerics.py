@@ -59,6 +59,24 @@ def test_core_vocabulary_is_accepted_and_recorded():
 
 
 @pytest.mark.parametrize(
+    "combine", ["bf16_atomic", "fp32_atomic", "bf16_rows_fp32_sum", "fp32_reduce"]
+)
+def test_every_core_combine_is_accepted_and_recorded(combine):
+    S = _S()
+    n = accuracy.normalize_numerics(S, _decl(combine=combine))
+    assert n["combine"] == combine
+    cand = types.SimpleNamespace(declared_numerics=_decl(combine=combine))
+    assert accuracy.numerics_key(accuracy.numerics_of(S, cand, {})).endswith(
+        f"combine={combine}"
+    )
+    # combine does not change the rounding points the references are built at
+    other = accuracy.normalize_numerics(S, _decl(combine="bf16_atomic"))
+    assert accuracy.same_rounding(
+        accuracy.numerics_key(n), accuracy.numerics_key(other)
+    )
+
+
+@pytest.mark.parametrize(
     "bad",
     [
         {"act_quant": "hip"},

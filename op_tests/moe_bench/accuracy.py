@@ -230,7 +230,7 @@ def _local_ids(ti, mask):
 
 ACT_QUANT = ("none", "per_token_fp8", "per_1x128_fp8", "mx_fp4", "mx_fp8")
 INTER = ("bf16", "fp32_direct")  # or bf16_then_<quant>
-COMBINE = ("bf16_atomic", "fp32_reduce")
+COMBINE = ("bf16_atomic", "fp32_atomic", "bf16_rows_fp32_sum", "fp32_reduce")
 
 
 class NumericsError(ValueError):
@@ -265,8 +265,9 @@ def normalize_numerics(S, declared, derived=False):
     ``inter`` (bf16, fp32_direct, bf16_then_<quant>) and ``combine`` (bf16_atomic,
     fp32_reduce). Anything else raises NumericsError: a guess would score the kernel
     against the wrong reference. ``per_tensor_fp8`` is accepted for per-tensor cases
-    (aiter paths round there; core has no name for it yet). ``combine`` is recorded and
-    validated but not modeled: the references sum in fp64.
+    (aiter paths round there; core has no name for it yet). ``combine`` (bf16_atomic, fp32_atomic,
+    bf16_rows_fp32_sum, fp32_reduce) is recorded as declared and validated, not modeled:
+    the references sum in fp64.
     """
     if not isinstance(declared, dict):
         raise NumericsError(f"numerics must be a dict, got {declared!r}")
