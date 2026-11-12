@@ -387,6 +387,31 @@ def mark_router_discards(bar_csv, candidates_csv, reason):
     return sorted(hit)
 
 
+def repair_bar_csv(path, out=None):
+    """Rewrite a bar CSV whose rows were appended by runs with different BAR_COLS (a
+    column added between a run and its resume): rows are told apart by field count and
+    mapped onto the current columns; the file gets the union header."""
+    csv.field_size_limit(1 << 28)
+    with open(path, newline="") as f:
+        rows = list(csv.reader(f))
+    old = rows[0]
+    new = list(BAR_COLS)
+    cols = new + [c for c in old if c not in new]
+    fixed = []
+    for r in rows[1:]:
+        if len(r) == len(new):
+            fixed.append(dict(zip(new, r)))
+        elif len(r) == len(old):
+            fixed.append(dict(zip(old, r)))
+        else:
+            raise ValueError(f"{path}: row of {len(r)} fields fits neither header")
+    with open(out or path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows(fixed)
+    return len(fixed)
+
+
 def cmd_bar(args):
     """bar mode, or new mode: routing on, routing off (AITER_MOE_DISABLE), first calls."""
     if args.kind != "new":
