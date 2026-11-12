@@ -183,17 +183,23 @@ def test_fused_topk_large_logit_gap_at_large_m(num_experts, topk, dtype):
 
 
 @pytest.mark.parametrize(
-    "num_experts,num_tokens,want",
+    "num_experts,topk,num_tokens,want",
     [
-        (256, 16, "shifted"),
-        (256, 1024, "shifted"),
-        (256, 4096, "hip"),
-        (128, 4096, "hip"),
-        (384, 4096, "shifted"),
-        (640, 32768, "shifted"),
+        (256, 8, 16, "shifted"),
+        (256, 8, 1024, "shifted"),
+        (256, 8, 2048, "shifted"),
+        (256, 8, 4096, "hip"),
+        (128, 8, 2048, "shifted"),
+        (128, 8, 4096, "hip"),
+        (128, 6, 1024, "shifted"),
+        (128, 6, 2048, "hip"),
+        (256, 6, 2048, "hip"),
+        (128, 4, 2048, "hip"),
+        (384, 8, 4096, "shifted"),
+        (640, 8, 32768, "shifted"),
     ],
 )
-def test_fused_topk_backend_choice(monkeypatch, num_experts, num_tokens, want):
+def test_fused_topk_backend_choice(monkeypatch, num_experts, topk, num_tokens, want):
     calls = []
     for name in ("topk_softmax", "topk_softmax_asm_shifted"):
         real = getattr(aiter, name)
@@ -207,7 +213,7 @@ def test_fused_topk_backend_choice(monkeypatch, num_experts, num_tokens, want):
     hidden_states = torch.randn(num_tokens, 64, dtype=torch.bfloat16)
     gating_output = torch.randn(num_tokens, num_experts, dtype=torch.bfloat16)
 
-    fused_topk(hidden_states, gating_output, 8, True)
+    fused_topk(hidden_states, gating_output, topk, True)
 
     assert calls == ["topk_softmax" if want == "hip" else "topk_softmax_asm_shifted"]
 
