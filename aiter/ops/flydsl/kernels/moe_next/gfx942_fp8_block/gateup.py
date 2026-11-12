@@ -65,10 +65,23 @@ def compile_gateup(
         sa_ping: fx.Array[fx.Float32, BLOCK_M, 16]
         sa_pong: fx.Array[fx.Float32, BLOCK_M, 16]
 
-    @fx.union
-    class SharedStorage:
-        sorted_lds: fx.Array[fx.Int32, 256, 16]
-        gemm: GemmBuffers
+    if OUT_FP8:
+        # The epilogue quantizes from the FP32 activation output, as aiter's ASM
+        # 1-stage path does (no bf16 rounding before the per_1x128 quant).
+        assert BLOCK_M * contiguous_n * 4 <= 64 * 1024
+
+        @fx.union
+        class SharedStorage:
+            sorted_lds: fx.Array[fx.Int32, 256, 16]
+            gemm: GemmBuffers
+            cshuf: fx.Array[fx.Float32, BLOCK_M * contiguous_n, 16]
+
+    else:
+
+        @fx.union
+        class SharedStorage:
+            sorted_lds: fx.Array[fx.Int32, 256, 16]
+            gemm: GemmBuffers
 
     TensorWithIndex, _read_sorted_index, _ = make_gemm_helpers(
         K, weight_dtype, BLOCK_M, TOPK
@@ -93,6 +106,18 @@ def compile_gateup(
                 acc = Vec.from_elements(acc, fx.Float32)
                 out_bf16[None, m, n].store(_f32_to_bf16(acc))
         return out_bf16
+
+    def _gateup_pair_f32(gate_frag, up_frag):
+        out = fx.make_fragment_like(gate_frag, dtype=fx.Float32)
+        m_reps = fx.size(fx.get_shape(gate_frag)[1]).to_py_value()
+        n_reps = fx.size(fx.get_shape(gate_frag)[2]).to_py_value()
+        for m in range_constexpr(m_reps):
+            for n in range_constexpr(n_reps):
+                gate = gate_frag[None, m, n].load()
+                up = up_frag[None, m, n].load()
+                acc = [_act(gate[j], up[j]) for j in range_constexpr(gate.numel)]
+                out[None, m, n].store(Vec.from_elements(acc, fx.Float32))
+        return out
 
     def _make_gateup_weight_view(p_weight, expert_id):
         group_layout = fx.make_layout(
@@ -487,16 +512,16 @@ def compile_gateup(
     COLS = SCALE_BLOCK // (256 // BLOCK_M)
 
     def _quant_store(lds_c, row, part, sid, blk_n, p_output, p_out_scale, M):
-        """One row of 128 bf16 values is read by 256 / BLOCK_M threads; same math
+        """One row of 128 FP32 values is read by 256 / BLOCK_M threads; same math
         and rounding as aiter's per_1x128 quant on gfx942: amax (floor 1e-10),
         scale = amax * fp32(1/240), q = med3(x * (1 / scale), -240, 240) -> fp8."""
         TPR = 256 // BLOCK_M
         vals = []
-        for c in range_constexpr(COLS // 8):
-            col = part * COLS + c * 8
+        for c in range_constexpr(COLS // 4):
+            col = part * COLS + c * 4
             v = fxh.atom_tensor(lds_c, (row, col), 128).load()
-            for j in range_constexpr(8):
-                vals.append(Vec(v)[j].to(fx.Float32))
+            for j in range_constexpr(4):
+                vals.append(fx.Float32(Vec(v)[j]))
         amax = fx.Float32(1e-10)
         for x in vals:
             amax = amax.maximumf(fx.absf(x))
@@ -665,43 +690,68 @@ def compile_gateup(
                 lds,
             )
 
-            c_out_bf16 = _gateup_pair_bf16(c_gate_frag, c_up_frag)
-
             _, _tiled_mma = _make_tiled_mma()
-            cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
-            cshuf_atom_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
-            cshuf_ptr = fx.recast_iter(fx.BFloat16, lds.gemm.a_ping.ptr)
-            swz_c = fx.SwizzleType.get(3, 3, 3)
-            lds_c_store = fx.make_view(
-                cshuf_ptr,
-                fx.make_composed_layout(
-                    fx.static(swz_c),
-                    fx.make_ordered_layout((contiguous_n, BLOCK_M), order=(0, 1)),
-                ),
-            )
-            lds_c = fx.make_view(
-                cshuf_ptr,
-                fx.make_composed_layout(
-                    fx.static(swz_c),
-                    fx.make_ordered_layout((BLOCK_M, contiguous_n), order=(1, 0)),
-                ),
-            )
-            gpu.barrier()
-            store_c = fx.make_tiled_copy_C(cshuf_atom_w, _tiled_mma).get_slice(tid)
-            fx.copy(
-                cshuf_atom_w,
-                store_c.retile(c_out_bf16),
-                store_c.partition_D(lds_c_store),
-            )
-            gpu.barrier()
-            if const_expr(not OUT_FP8):
+            if const_expr(OUT_FP8):
+                c_act = _gateup_pair_f32(c_gate_frag, c_up_frag)
+                cs_ptr = lds.cshuf.peek().ptr
+                swz32 = fx.static(fx.SwizzleType.get(3, 2, 5))
+                lds_c32_store = fx.make_view(
+                    cs_ptr,
+                    fx.make_composed_layout(
+                        swz32,
+                        fx.make_ordered_layout((contiguous_n, BLOCK_M), order=(0, 1)),
+                    ),
+                )
+                lds_c32 = fx.make_view(
+                    cs_ptr,
+                    fx.make_composed_layout(
+                        swz32,
+                        fx.make_ordered_layout((BLOCK_M, contiguous_n), order=(1, 0)),
+                    ),
+                )
+                gpu.barrier()
+                c32_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
+                store_c32 = fx.make_tiled_copy_C(c32_atom, _tiled_mma).get_slice(tid)
+                fx.copy(
+                    c32_atom,
+                    store_c32.retile(c_act),
+                    store_c32.partition_D(lds_c32_store),
+                )
+                gpu.barrier()
+                _quant_store(
+                    lds_c32, q_row, q_part, q_sid, blk_n, p_output, p_out_scale, M
+                )
+            else:
+                c_out_bf16 = _gateup_pair_bf16(c_gate_frag, c_up_frag)
+                cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+                cshuf_atom_r = fx.make_copy_atom(fx.UniversalCopy128b(), fx.BFloat16)
+                cshuf_ptr = fx.recast_iter(fx.BFloat16, lds.gemm.a_ping.ptr)
+                swz_c = fx.SwizzleType.get(3, 3, 3)
+                lds_c_store = fx.make_view(
+                    cshuf_ptr,
+                    fx.make_composed_layout(
+                        fx.static(swz_c),
+                        fx.make_ordered_layout((contiguous_n, BLOCK_M), order=(0, 1)),
+                    ),
+                )
+                lds_c = fx.make_view(
+                    cshuf_ptr,
+                    fx.make_composed_layout(
+                        fx.static(swz_c),
+                        fx.make_ordered_layout((BLOCK_M, contiguous_n), order=(1, 0)),
+                    ),
+                )
+                gpu.barrier()
+                store_c = fx.make_tiled_copy_C(cshuf_atom_w, _tiled_mma).get_slice(tid)
+                fx.copy(
+                    cshuf_atom_w,
+                    store_c.retile(c_out_bf16),
+                    store_c.partition_D(lds_c_store),
+                )
+                gpu.barrier()
                 rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
                 fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
                 c_out.copy(buf_atom_w128, blk_n, rd)
-            else:
-                _quant_store(
-                    lds_c, q_row, q_part, q_sid, blk_n, p_output, p_out_scale, M
-                )
 
     @flyc.jit
     def launch(

@@ -5,12 +5,6 @@
   "down_n_split": 2,
   "down_block_m": 64
  },
- "prefill-bf16inter": {
-  "block_m": 128,
-  "block_n": 128,
-  "down_n_split": 2,
-  "down_block_m": 64
- },
  "prefill-bm128-d64-s1": {
   "block_m": 128,
   "block_n": 256,

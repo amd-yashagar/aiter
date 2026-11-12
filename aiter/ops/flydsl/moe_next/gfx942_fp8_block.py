@@ -13,6 +13,7 @@ configs/<gpu>/fp8-block.json.
 import functools
 import json
 import os
+from typing import ClassVar
 
 import torch
 
@@ -44,9 +45,13 @@ def _tile(config, gpu, inter_dim):
     down_m = min(block_m, int(cfg.get("down_block_m", block_m)))
     while down_m > 16 and down_m * inter_dim > 16384:
         down_m //= 2
+    block_n = int(cfg.get("block_n", 256))
+    # A bf16 intermediate would round more than the declared numerics allow.
+    if block_n != 256:
+        raise ValueError(f"fp8-block config {config!r}: block_n must be 256")
     return (
         block_m,
-        int(cfg.get("block_n", 128)),
+        block_n,
         int(cfg.get("down_n_split", 1)),
         down_m,
     )
@@ -103,6 +108,13 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
     archs = ("gfx942",)
     routing = "tiles"
     epilogue = "reduce"
+    # Each route's down output is rounded to bf16, then the topk rows are summed
+    # in fp32 (sorted_sum); aiter's ASM 1-stage path bf16-atomics them instead.
+    numerics: ClassVar[dict] = {
+        "act_quant": "per_1x128_fp8",
+        "inter": "fp32_direct",
+        "combine": "bf16_rows_fp32_reduce",
+    }
 
     def supports(self, spec, m, topk, call=None):
         if spec.quant != QuantType.per_1x128:
@@ -163,12 +175,11 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
         D, I = spec.model_dim, spec.inter_dim
         block_m, block_n, n_split, down_m = _tile(config, self._gpu(weights), I)
         a_bf16 = self._inline_a_quant(weights, config)
-        fused = block_n == 256
         with compile_only():
-            gu = _gateup(
-                2 * I, D, topk, block_m, block_n, _ACTS[spec.act], fused, a_bf16
+            gu = _gateup.__wrapped__(
+                2 * I, D, topk, block_m, block_n, _ACTS[spec.act], True, a_bf16
             )
-            out_t = fx.Uint8 if fused else fx.BFloat16
+            out_t = fx.Uint8
             in_t = fx.BFloat16 if a_bf16 else fx.Uint8
             types = (
                 in_t,
@@ -237,32 +248,22 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
         else:
             xq, xs = quant(x, quant_dtype=dtypes.fp8)
         tasks = int(sorted_eids.shape[0])
-        fused_quant = block_n == 256
-        if fused_quant:
-            aq = torch.empty((M * topk, I), dtype=dtypes.fp8, device=x.device)
-            as_ = torch.empty(
-                (M * topk, I // 128), dtype=torch.float32, device=x.device
-            )
-            out1, out1_scale = aq, as_
-        else:
-            out1 = torch.empty((M, topk, I), dtype=torch.bfloat16, device=x.device)
-            out1_scale = xs
+        aq = torch.empty((M * topk, I), dtype=dtypes.fp8, device=x.device)
+        as_ = torch.empty((M * topk, I // 128), dtype=torch.float32, device=x.device)
         _launch(
-            _gateup(2 * I, D, topk, block_m, block_n, act, fused_quant, a_bf16),
+            _gateup(2 * I, D, topk, block_m, block_n, act, True, a_bf16),
             xq,
             call.w1,
-            out1,
+            aq,
             sorted_ids,
             sorted_eids,
             num_valid,
             call.w1_scale,
             xs,
-            out1_scale,
+            as_,
             M,
             tasks,
         )
-        if not fused_quant:
-            aq, as_ = quant(out1.view(M * topk, I), quant_dtype=dtypes.fp8)
         rows = torch.empty((tasks * block_m, D), dtype=torch.bfloat16, device=x.device)
         _launch(
             _down(D, I, topk, block_m, n_split, down_m),
