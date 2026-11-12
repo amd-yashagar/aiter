@@ -49,6 +49,7 @@ class _Tile:
     tile_m: int
     gu_waves: int
     ch: int
+    ks: int
     pw: int
     pa: int
     w_cache: int
@@ -67,6 +68,9 @@ def _tile(config, gpu, model_dim, inter_dim):
         ch //= 2
     while gw > 1 and inter_dim % (16 * gw):
         gw //= 2
+    ks = int(cfg.get("gateup_ks", 1))
+    while ks > 1 and (steps // ch) % ks:
+        ks //= 2
     nbd, waves = int(cfg.get("down_nbd", 4)), int(cfg.get("down_waves", 4))
     while waves > 1 and model_dim % (16 * nbd * waves):
         waves //= 2
@@ -77,12 +81,22 @@ def _tile(config, gpu, model_dim, inter_dim):
     pwd = int(cfg.get("down_pw", 2))
     coalesce = bool(cfg.get("down_coalesce", True))
     return _Tile(
-        int(cfg.get("tile_m", 64)), gw, ch, pw, pa, w_cache, nbd, waves, pwd, coalesce
+        int(cfg.get("tile_m", 64)),
+        gw,
+        ch,
+        ks,
+        pw,
+        pa,
+        w_cache,
+        nbd,
+        waves,
+        pwd,
+        coalesce,
     )
 
 
 @functools.cache
-def _gateup(N, K, s_max, waves, ch, pw, pa, w_cache, act, swiglu_limit):
+def _gateup(N, K, s_max, waves, ch, ks, pw, pa, w_cache, act, swiglu_limit):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token_mid.gateup import (
         compile_gateup,
     )
@@ -93,6 +107,7 @@ def _gateup(N, K, s_max, waves, ch, pw, pa, w_cache, act, swiglu_limit):
         S_MAX=s_max,
         WAVES=waves,
         CH=ch,
+        KS=ks,
         PW=pw,
         PA=pa,
         W_CACHE=w_cache,
@@ -206,7 +221,17 @@ class Gfx942Fp8TokenMid(MoeKernel):
         s_max = t.tile_m // 16
         with compile_only():
             gu = _gateup(
-                2 * I, D, s_max, t.gu_waves, t.ch, t.pw, t.pa, t.w_cache, act, limit
+                2 * I,
+                D,
+                s_max,
+                t.gu_waves,
+                t.ch,
+                t.ks,
+                t.pw,
+                t.pa,
+                t.w_cache,
+                act,
+                limit,
             )
             types = (fx.BFloat16, fx.Uint8, fx.BFloat16) + (fx.Int32,) * 3
             types += (fx.Float32,)
@@ -260,7 +285,17 @@ class Gfx942Fp8TokenMid(MoeKernel):
         act, limit = _ACTS[spec.act], _swiglu_limit(spec)
         _launch(
             _gateup(
-                2 * I, D, s_max, t.gu_waves, t.ch, t.pw, t.pa, t.w_cache, act, limit
+                2 * I,
+                D,
+                s_max,
+                t.gu_waves,
+                t.ch,
+                t.ks,
+                t.pw,
+                t.pa,
+                t.w_cache,
+                act,
+                limit,
             ),
             x,
             call.w1,
