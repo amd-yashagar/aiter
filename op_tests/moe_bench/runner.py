@@ -371,6 +371,13 @@ class GroupJob:
             st, det = status, detail
             if (
                 status == "crash"
+                and "LLVM ERROR" in detail
+                and self.meta.get("gfx") != "gfx950"
+            ):
+                st = "unsupported"
+                det = "aiter aborted the process on this arch: " + detail
+            if (
+                status == "crash"
                 and self.phase == "probe"
                 and self.meta.get("gfx") != "gfx950"
                 and c["family"] in UNSUPPORTED_FAMILIES_NON_GFX950

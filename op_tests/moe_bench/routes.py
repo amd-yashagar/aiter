@@ -383,6 +383,9 @@ def dry_route(case, S=None):
         full_descs.append(md)
         return _stub_full_impl(md)
 
+    # get_2stage_cfgs is lru-cached and 1-stage metadata binds fused_moe_1stage at
+    # resolution time: entries made while the launchers are stubbed must not survive.
+    fm.get_2stage_cfgs.cache_clear()
     with RouteRecorder() as rec, _no_launch(fm):
         try:
             fm._fused_moe_impl(
@@ -418,6 +421,7 @@ def dry_route(case, S=None):
                 out["route_key"] = "unsupported:" + out["route_error"][:120]
                 return out
         args, _ = rec.last()
+    fm.get_2stage_cfgs.cache_clear()
     if not full_descs:
         out["route_error"] = "no metadata resolved"
         out["route_key"] = "unsupported:no metadata"
