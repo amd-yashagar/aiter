@@ -52,6 +52,7 @@ def _build_stage2(
     reduce,
     topk,
     blocks=1,
+    nt=False,
 ):
     D = int(model_dim)
     INTER = int(inter_dim)
@@ -185,16 +186,14 @@ def _build_stage2(
                 p0 = w_tile0(b)
                 frags = []
                 for t in range_constexpr(4):
-                    off = (
-                        fx.Int64(e * fx.Int32(D // 16) + p0 + fx.Int32(t))
-                        * fx.Int64(W_TILE_BYTES)
-                        + fx.Int64(ks * W_KSTEP)
-                        + fx.Int64(lane * fx.Int32(16))
+                    base = (e * fx.Int32(D // 16) + p0 + fx.Int32(t)) * fx.Int32(
+                        W_TILE_BYTES // 4
                     )
-                    v = cm.global_vec_load(arg_w, off, 4)
+                    ldw = lane * fx.Int32(4) + fx.Int32(ks * W_KSTEP // 4)
+                    v = cm.buffer_load16(arg_w, base, ldw, nt)
                     if const_expr(w_f8):
                         v = v.shuffle(
-                            cm.global_vec_load(arg_w, off + fx.Int64(1024), 4),
+                            cm.buffer_load16(arg_w, base, ldw + fx.Int32(256), nt),
                             list(range(8)),
                         )
                     f = fx.make_rmem_tensor(W_NDW, fx.Int32)
