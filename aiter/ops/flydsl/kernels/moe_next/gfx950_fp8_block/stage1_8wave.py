@@ -7,8 +7,9 @@
 Same contract as stage1.py (gate/up GEMM, activation, 1x128 fp8 quant of the
 intermediate, one 128-channel block per workgroup), on the pipeline of
 kernels/gemm_a8w8_blockscale_8wave.py with preshuffle_b: raw buffer->LDS DMA of
-the gathered A rows, the shuffle_weight(16, 16) gate and up slabs and the A
-scales into padded LDS ping-pong buffers; B scales by scalar loads; a (4, 2)
+the gathered A rows and the shuffle_weight(16, 16) gate and up slabs into padded
+LDS ping-pong buffers; the tile's A scales gathered once into an LDS table
+(token x K block); B scales by scalar loads; a (4, 2)
 wave grid of 16x16x128 MFMAs, each into a fresh partial folded one MFMA later
 as acc += P * (a_scale[token, g] * w1_scale[block, g]).
 
@@ -30,6 +31,8 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels import buffer_ops
+
 from . import helpers as fxh
 
 # keep fp32 folds as VOP2: v_pk_fma_f32 does not issue under an MFMA
@@ -47,6 +50,9 @@ A_GROUP = 8 * BLOCK_K + 16
 LDS_TILE = (BLOCK_M // 16) * (2 * A_GROUP + 32)
 A_CHUNK = 4 * (2 * A_GROUP + 32)  # LDS distance of 64 rows
 B_TILE_K_BYTES = 16 * BLOCK_K  # one K tile of a 16-row shuffle_weight group
+STAGES = 2  # 3 stages spill in the tail and run slower
+NUM_XCDS = 8
+DMA_PER_TILE = 6  # per wave: 2 B_l + 2 B_r + 2 A buffer->LDS loads
 
 
 def _lds_byte_ptr(ptr, byte_offset):
@@ -73,19 +79,22 @@ def _build_stage1_8wave(*, model_dim, inter_dim, experts, tile_m, act):
     assert act == "silu", act
     # descriptor-relative B offsets span one expert's gate/up slab
     assert 2 * I * K < 2**31
+    # The tile's A scales [128 rows, KB] stay in LDS for the whole K loop, rows padded
+    # so that 16 consecutive rows of one K group fall in distinct banks.
+    SA_STRIDE = KB + 2 * (1 - KB // 2 % 2)
+    SA_PAIRS = KB // 2  # one 8-byte load per lane, 16 lanes per row
+    SA_PASSES = (SA_PAIRS + 15) // 16
 
-    @fx.struct
-    class LDS:
-        a0: fx.Array[elem_t, LDS_TILE, 16]
-        a1: fx.Array[elem_t, LDS_TILE, 16]
-        bl0: fx.Array[elem_t, LDS_TILE, 16]
-        bl1: fx.Array[elem_t, LDS_TILE, 16]
-        br0: fx.Array[elem_t, LDS_TILE, 16]
-        br1: fx.Array[elem_t, LDS_TILE, 16]
-        # 512 lanes DMA the 128 row scales four times over
-        sa0: fx.Array[fx.Float32, 512, 16]
-        sa1: fx.Array[fx.Float32, 512, 16]
-        amax: fx.Array[fx.Float32, 4 * BLOCK_M, 16]
+    # One LDS object per buffer: DMA into one stage must not alias reads of another,
+    # or the backend waits on vmcnt before every LDS read.
+    fields = {}
+    for s in range(STAGES):
+        for name in ("a", "bl", "br"):
+            fields[f"{name}{s}"] = fx.Array[elem_t, LDS_TILE, 16]
+    # two spare floats take the idle lanes' stores
+    fields["sa"] = fx.Array[fx.Float32, BLOCK_M * SA_STRIDE + 2, 16]
+    fields["amax"] = fx.Array[fx.Float32, 4 * BLOCK_M, 16]
+    LDS = fx.struct(type("LDS", (), {"__annotations__": fields}))
 
     def _body(
         arg_inter,
@@ -98,10 +107,10 @@ def _build_stage1_8wave(*, model_dim, inter_dim, experts, tile_m, act):
         arg_expert_ids,
         M,
         rows,
+        blk_n,
+        e_idx,
     ):
         tid = gpu.thread_idx.x
-        blk_n = gpu.block_idx.x
-        e_idx = gpu.block_idx.y
         wave_id = tid // 64
         lane_id = tid % 64
         wave_m = wave_id // 4
@@ -130,7 +139,8 @@ def _build_stage1_8wave(*, model_dim, inter_dim, experts, tile_m, act):
             + (tid % 8) * 16
             for c in range_constexpr(2)
         ]
-        sa_voff = _token(tid % BLOCK_M) * fx.Int32(KB * 4)
+        sa_rows = [r * 32 + tid // 16 for r in range_constexpr(BLOCK_M // 32)]
+        sa_toks = [_token(r) for r in sa_rows]
 
         x_iter = fx.get_iter(arg_x)
         xs_iter = fx.get_iter(arg_x_scale)
@@ -174,13 +184,13 @@ def _build_stage1_8wave(*, model_dim, inter_dim, experts, tile_m, act):
             ((16, BLOCK_N // 16), (16, BLOCK_K // 16)),
             ((16, BLOCK_K * 16), (1, 256)),
         )
-        a_bufs = (lds.a0, lds.a1)
-        bl_bufs = (lds.bl0, lds.bl1)
-        br_bufs = (lds.br0, lds.br1)
-        sa_bufs = (lds.sa0, lds.sa1)
-        ldsA_rd = [fx.make_view(b.ptr, _rd) for b in a_bufs]
-        ldsBl_rd = [fx.make_view(b.ptr, _b_rd) for b in bl_bufs]
-        ldsBr_rd = [fx.make_view(b.ptr, _b_rd) for b in br_bufs]
+        a_bufs = [getattr(lds, f"a{s}").ptr for s in range(STAGES)]
+        bl_bufs = [getattr(lds, f"bl{s}").ptr for s in range(STAGES)]
+        br_bufs = [getattr(lds, f"br{s}").ptr for s in range(STAGES)]
+        sa_view = fx.make_view(lds.sa.ptr, fx.make_layout(BLOCK_M * SA_STRIDE + 2, 1))
+        ldsA_rd = [fx.make_view(p, _rd) for p in a_bufs]
+        ldsBl_rd = [fx.make_view(p, _b_rd) for p in bl_bufs]
+        ldsBr_rd = [fx.make_view(p, _b_rd) for p in br_bufs]
 
         # B-first: weights are MFMA operand A (4 waves on channels), rows operand B
         # (2 waves). Both operands take 32 consecutive K per lane.
@@ -224,19 +234,54 @@ def _build_stage1_8wave(*, model_dim, inter_dim, experts, tile_m, act):
             fx.flat_divide(c_fake, (BLOCK_N, BLOCK_M // M_SLICES))[None, None, 0, 0]
         )
 
-        scale_copy_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+        sa_row_base = (wave_m * 16 + lane_id % 16) * fx.Int32(SA_STRIDE)
 
-        def lds_rd_sa(buf, m_slice):
-            vals = []
-            for m0 in range_constexpr(PHASE_M_REP):
-                off = (m_slice * PHASE_M_REP + m0) * 32 + wave_m * 16 + lane_id % 16
-                src = fx.make_view(
-                    fx.add_offset(sa_bufs[buf].ptr, off), fx.make_layout(1, 1)
+        def lds_rd_sa(ki, m_slice):
+            col = sa_row_base + ki
+            return Vec.from_elements(
+                [
+                    sa_view[
+                        col + fx.Int32((m_slice * PHASE_M_REP + m0) * 32 * SA_STRIDE)
+                    ]
+                    for m0 in range_constexpr(PHASE_M_REP)
+                ],
+                fx.Float32,
+            )
+
+        xs_rsrc = rocdl.get_buffer_rsrc(
+            fx.get_iter(
+                rocdl.make_buffer_tensor(
+                    arg_x_scale, max_size=False, num_records_bytes=xs_bytes
                 )
-                frag = fx.make_fragment_like(src)
-                fx.copy(scale_copy_atom, src, frag)
-                vals.append(Vec(frag.load())[0])
-            return Vec.from_elements(vals, fx.Float32)
+            )
+        )
+
+        def load_sa_table():
+            vals = []
+            for r in range_constexpr(BLOCK_M // 32):
+                for c in range_constexpr(SA_PASSES):
+                    pair = fx.Int32(c * 16) + tid % 16
+                    vals.append(
+                        buffer_ops.buffer_load(
+                            xs_rsrc,
+                            (sa_toks[r] * fx.Int32(KB) + pair * 2).ir_value(),
+                            vec_width=2,
+                            mask=(pair < fx.Int32(SA_PAIRS)).ir_value(),
+                        )
+                    )
+            return vals
+
+        def store_sa_table(vals):
+            for r in range_constexpr(BLOCK_M // 32):
+                for c in range_constexpr(SA_PASSES):
+                    pair = fx.Int32(c * 16) + tid % 16
+                    v = Vec(vals[r * SA_PASSES + c])
+                    idx = (pair < fx.Int32(SA_PAIRS)).select(
+                        sa_rows[r] * fx.Int32(SA_STRIDE) + pair * 2,
+                        fx.Int32(BLOCK_M * SA_STRIDE),
+                    )
+                    sa_view[idx] = v[0]
+                    sa_view[idx + 1] = v[1]
 
         def load_sb(ki):
             # s_buffer_load through inline asm: the intrinsic's lowering adds waits
@@ -273,7 +318,6 @@ def _build_stage1_8wave(*, model_dim, inter_dim, experts, tile_m, act):
             )
         )
         b_wave_off = fx.Int32(rocdl.readfirstlane(T.i32, (wave_id * 1024).ir_value()))
-        sa_wave_off = fx.Int32(rocdl.readfirstlane(T.i32, (tid * 4).ir_value()))
         # [N/16, K/16, 16 n0, 16 k0]: each wave DMAs 1 KiB of a 16-row group
         b_voff = (wave_id // 2) * (16 * K) + (wave_id % 2) * 1024 + lane_id * 16
         b_src = [
@@ -287,7 +331,7 @@ def _build_stage1_8wave(*, model_dim, inter_dim, experts, tile_m, act):
             for c in range_constexpr(2):
                 rocdl.raw_ptr_buffer_load_lds(
                     rsrc,
-                    _lds_byte_ptr(a_bufs[buf].ptr, a_wave_off + c * A_CHUNK),
+                    _lds_byte_ptr(a_bufs[buf], a_wave_off + c * A_CHUNK),
                     fx.Int32(16),
                     a_voff[c],
                     zero,
@@ -295,21 +339,9 @@ def _build_stage1_8wave(*, model_dim, inter_dim, experts, tile_m, act):
                     zero,
                 )
 
-        def dma_SA(buf, ki):
-            rsrc = dma_resource(xs_iter, xs_bytes, ki * fx.Int32(4))
-            rocdl.raw_ptr_buffer_load_lds(
-                rsrc,
-                _lds_byte_ptr(sa_bufs[buf].ptr, sa_wave_off),
-                fx.Int32(4),
-                sa_voff,
-                zero,
-                zero,
-                zero,
-            )
-
         def dma_B(q, buf, ki):
             rsrc = dma_resource(w_iter, w_bytes, ki * fx.Int32(B_TILE_K_BYTES))
-            dst = (bl_bufs, br_bufs)[q][buf].ptr
+            dst = (bl_bufs, br_bufs)[q][buf]
             for c in range_constexpr(2):
                 rocdl.raw_ptr_buffer_load_lds(
                     rsrc,
@@ -368,74 +400,86 @@ def _build_stage1_8wave(*, model_dim, inter_dim, experts, tile_m, act):
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
-        # Per K tile k (buffer t = k % 2), one barrier interval each:
+        # Per K tile k (buffer t = k % STAGES, S = STAGES), one barrier interval each:
         #   I0: LDS A[s0], SA[s0]; SB(k)          P0: gate s0, retire up s1 (k-1)
-        #   I1: LDS B_r; DMA B_l(k+2) -> t        P1: up s0, retire gate s0
-        #   I2: wait B_l(k+1); LDS A[s1], SA[s1]; DMA B_r(k+2) -> t
+        #   I1: LDS B_r; DMA B_l(k+S) -> t        P1: up s0, retire gate s0
+        #   I2: wait B_l(k+1); LDS A[s1], SA[s1]; DMA B_r(k+S) -> t
         #                                         P2: gate s1, retire up s0
-        #   I3: wait A, SA, B_r (k+1); LDS B_l(k+1); DMA A, SA (k+2) -> t
+        #   I3: wait A, B_r (k+1); LDS B_l(k+1); DMA A(k+S) -> t
         #                                         P3: up s1, retire gate s1
+        # SA, the whole tile's A scales, is loaded into LDS once before the loop.
         # Waves 4-7 trail by one interval, so a buffer is rewritten two intervals
-        # after its last read and read two intervals after its wait.
+        # after its last read and read two intervals after its wait. Prefetches past
+        # the last tile reload it, so every tile issues and waits the same.
+        last = fx.Int32(KB - 1)
+
+        def _clamp(kt):
+            return (kt < fx.Int32(KB)).select(kt, last)
+
+        sa_vals = load_sa_table()
         rocdl.sched_barrier(0)
-        for kt in range_constexpr(2):
-            dma_B(0, kt, fx.Int32(kt))
-            dma_B(1, kt, fx.Int32(kt))
-            dma_A(kt, fx.Int32(kt))
-            dma_SA(kt, fx.Int32(kt))
+        for kt in range_constexpr(STAGES):
+            kc = _clamp(fx.Int32(kt))
+            dma_B(0, kt, kc)
+            dma_B(1, kt, kc)
+            dma_A(kt, kc)
         rocdl.sched_barrier(0)
+        store_sa_table(sa_vals)
         if wave_id >= 4:
             rocdl.s_barrier()
         frag_Cg.fill(0)
         frag_Cu.fill(0)
         frag_P.fill(0)
-        rocdl.s_waitcnt(vmcnt=7)
+        rocdl.s_waitcnt(vmcnt=DMA_PER_TILE * (STAGES - 1), lgkmcnt=0)
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
         lds_rd_Bl(0)
 
+        def k_tile(ki, t, fifo_sa1, fifo_sbu):
+            kn = _clamp(ki + fx.Int32(STAGES))
+
+            lds_rd_A(t, 0)
+            sa0 = lds_rd_sa(ki, 0)
+            sbg, sbu = load_sb(ki)
+            begin_compute_phase()
+            do_gemm(frag_Cu, frag_Bl, fifo_sa1, fifo_sbu, 1)
+            end_compute_phase()
+
+            lds_rd_Br(t)
+            dma_B(0, t, kn)
+            begin_compute_phase()
+            do_gemm(frag_Cg, frag_Br, sa0, sbg, 0)
+            end_compute_phase()
+
+            # B_r(k+1), A(k+1), the tiles between and B_l(k+S) may still be in flight
+            rocdl.s_waitcnt(vmcnt=DMA_PER_TILE * (STAGES - 1))
+            lds_rd_A(t, 1)
+            sa1 = lds_rd_sa(ki, 1)
+            dma_B(1, t, kn)
+            begin_compute_phase()
+            do_gemm(frag_Cu, frag_Bl, sa0, sbu, 0)
+            end_compute_phase()
+
+            rocdl.s_waitcnt(vmcnt=DMA_PER_TILE * (STAGES - 2) + 4)
+            lds_rd_Bl((t + 1) % STAGES)
+            dma_A(t, kn)
+            begin_compute_phase()
+            do_gemm(frag_Cg, frag_Br, sa1, sbg, 1)
+            end_compute_phase()
+            return sa1, sbu
+
         fifo_sa1 = Vec.filled(PHASE_M_REP, 0.0, fx.Float32)
         fifo_sbu = fx.Float32(0)
-        last = fx.Int32(KB - 1)
-        for kidx in range(0, KB, 2):
-            for u in range_constexpr(2):
-                ki = fx.Int32(kidx) + fx.Int32(u)
-                kn = ki + fx.Int32(2)
-                kn = (kn < fx.Int32(KB)).select(kn, last)
-
-                lds_rd_A(u, 0)
-                sa0 = lds_rd_sa(u, 0)
-                sbg, sbu = load_sb(ki)
-                begin_compute_phase()
-                do_gemm(frag_Cu, frag_Bl, fifo_sa1, fifo_sbu, 1)
-                end_compute_phase()
-
-                lds_rd_Br(u)
-                dma_B(0, u, kn)
-                begin_compute_phase()
-                do_gemm(frag_Cg, frag_Br, sa0, sbg, 0)
-                end_compute_phase()
-
-                rocdl.s_waitcnt(vmcnt=7)
-                lds_rd_A(u, 1)
-                sa1 = lds_rd_sa(u, 1)
-                dma_B(1, u, kn)
-                begin_compute_phase()
-                do_gemm(frag_Cu, frag_Bl, sa0, sbu, 0)
-                end_compute_phase()
-
-                rocdl.s_waitcnt(vmcnt=4)
-                lds_rd_Bl(1 - u)
-                dma_A(u, kn)
-                dma_SA(u, kn)
-                begin_compute_phase()
-                do_gemm(frag_Cg, frag_Br, sa1, sbg, 1)
-                end_compute_phase()
-
-                fifo_sa1 = sa1
-                fifo_sbu = sbu
+        k_main = KB - KB % STAGES
+        for kidx in range(0, k_main, STAGES):
+            for u in range_constexpr(STAGES):
+                fifo_sa1, fifo_sbu = k_tile(
+                    fx.Int32(kidx) + fx.Int32(u), u, fifo_sa1, fifo_sbu
+                )
+        for u in range_constexpr(KB % STAGES):
+            fifo_sa1, fifo_sbu = k_tile(fx.Int32(k_main + u), u, fifo_sa1, fifo_sbu)
 
         for m0 in range_constexpr(PHASE_M_REP):
             dq = Vec(fifo_sa1)[m0] * fifo_sbu
@@ -569,9 +613,24 @@ def _build_stage1_8wave(*, model_dim, inter_dim, experts, tile_m, act):
         i32_tokens: fx.Int32,
         i32_rows: fx.Int32,
     ):
-        e_idx = gpu.block_idx.y
-        num_valid = _view_i32(arg_num_valid_ids)[0]
-        if e_idx * fx.Int32(BLOCK_M) < num_valid:
+        num_valid = fx.Int32(
+            rocdl.readfirstlane(T.i32, _view_i32(arg_num_valid_ids)[0].ir_value())
+        )
+        # Workgroup pid runs on XCD pid % 8. Renumber the live ones so each XCD takes
+        # a contiguous run of (tile, block) pairs: the IB blocks of a tile share its A
+        # rows, and an expert's consecutive tiles its weights, in one L2.
+        pid = gpu.block_idx.x + gpu.block_idx.y * fx.Int32(IB)
+        live = (num_valid + fx.Int32(BLOCK_M - 1)) // fx.Int32(BLOCK_M) * fx.Int32(IB)
+        if pid < live:
+            per_xcd = (live + fx.Int32(NUM_XCDS - 1)) // fx.Int32(NUM_XCDS)
+            tall = live % fx.Int32(NUM_XCDS)
+            tall = (tall == fx.Int32(0)).select(fx.Int32(NUM_XCDS), tall)
+            xcd = pid % fx.Int32(NUM_XCDS)
+            local = pid // fx.Int32(NUM_XCDS)
+            v = (xcd < tall).select(
+                xcd * per_xcd + local,
+                tall * per_xcd + (xcd - tall) * (per_xcd - fx.Int32(1)) + local,
+            )
             _body(
                 arg_inter,
                 arg_inter_scale,
@@ -583,6 +642,8 @@ def _build_stage1_8wave(*, model_dim, inter_dim, experts, tile_m, act):
                 arg_expert_ids,
                 i32_tokens,
                 i32_rows,
+                v % fx.Int32(IB),
+                v // fx.Int32(IB),
             )
 
     @flyc.jit
