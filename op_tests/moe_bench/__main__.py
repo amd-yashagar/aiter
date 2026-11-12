@@ -132,7 +132,27 @@ def main(argv=None):
     p.add_argument("--cases", required=True)
     p.add_argument("--filter")
     p.add_argument("--modes", default="warm,cold")
-    p.add_argument("--out", required=True)
+    p.add_argument("--out", help="result CSV (dispatch mode)")
+    p.add_argument(
+        "--mode",
+        choices=("dispatch", "bar", "new"),
+        default="dispatch",
+        help="dispatch: fused_moe as dispatched; bar: best of every existing candidate; "
+        "new: the new entry point (MOE_BENCH_NEW_ENTRY)",
+    )
+    p.add_argument(
+        "--out-dir", help="bar/new modes: baseline folder for bar-<tier>.csv etc."
+    )
+    p.add_argument(
+        "--tier-name", help="bar/new modes: file suffix, default: cases file name"
+    )
+    p.add_argument(
+        "--dispatch-results", help="bar/new modes: dispatch results of the tier"
+    )
+    p.add_argument("--sources", help="bar mode: comma list of candidate sources")
+    p.add_argument(
+        "--source-module", action="append", help="module that registers sources"
+    )
     p.add_argument("--resume", action="store_true")
     p.add_argument("--shard", help="i/n")
     p.add_argument(
@@ -164,6 +184,14 @@ def main(argv=None):
     p.add_argument("new")
     p.add_argument("--out")
     p.add_argument("--drift", help="drift.json written by run")
+    p.add_argument(
+        "--bar", help="bar-<tier>.csv: also report against bar_us and roofline"
+    )
+    p.add_argument("--bar-out", help="write the per-case bar/gap/roofline table here")
+    p.add_argument("--queue-dir", help="rebuild <dir>/<gpu>.csv, cases not yet won")
+    p.add_argument(
+        "--weights", help="model-weights.csv (model, weight); unlisted = 1.0"
+    )
     p.add_argument("--ab", action="store_true")
     p.add_argument("--ab-base-tree")
     p.add_argument("--ab-new-tree")
@@ -196,6 +224,15 @@ def main(argv=None):
 
         return routes_cmd.cmd_coverage(a)
     if a.fn == "run":
+        if a.mode != "dispatch":
+            from . import bar_runner
+
+            if not a.out_dir:
+                ap.error("--out-dir is required for bar and new modes")
+            a.kind = a.mode
+            return bar_runner.cmd_bar(a)
+        if not a.out:
+            ap.error("--out is required for dispatch mode")
         from . import runner
 
         return runner.cmd_run(a)

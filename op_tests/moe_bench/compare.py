@@ -34,7 +34,19 @@ def load(path):
     if os.path.isdir(path):
         path = os.path.join(path, "tier1.csv")
     with open(path, newline="") as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        # new-<tier>.csv rows carry new_us/new_id; read them like dispatch rows
+        if "new_us" in r and not r.get("median_us"):
+            r["median_us"] = r["new_us"]
+            r.setdefault("ref_pass", "")
+            if r["status"] == "no-correct-candidate":
+                r["status"] = "fail"
+    return rows
+
+
+def load_csv(path):
+    return schema.read_csv(path)
 
 
 def key(r):
@@ -199,6 +211,140 @@ def ab_confirm(cands, args):
     return ratios
 
 
+def read_weights(path):
+    """model-weights.csv: first column model, second column weight; absent -> 1.0."""
+    w = {}
+    if path and os.path.exists(path):
+        with open(path, newline="") as f:
+            for r in csv.reader(f):
+                if len(r) >= 2 and _f(r[1]) is not None:
+                    w[r[0].strip()] = float(r[1])
+    return w
+
+
+def model_weight(model, weights):
+    names = [m.strip() for m in (model or "").replace("?", "").split("|") if m.strip()]
+    hits = [weights[m] for m in names if m in weights]
+    return max(hits) if hits else 1.0
+
+
+def gpu_key(name):
+    from . import roofline
+
+    return roofline.sku_of(name) or (name or "unknown").replace(" ", "_")
+
+
+def bar_view(rows, bar_rows, new_rows, weights):
+    """Per case and mode: dispatch, bar, roofline, new, gap and roofline efficiency.
+
+    gap = new_us / bar_us - 1; roofline_eff = roofline_us / new_us. A case is won
+    only when gap < -max(2%, 3x noise) in every mode it runs (cold and warm).
+    """
+    bars = {key(r): r for r in bar_rows}
+    news = {key(r): r for r in new_rows}
+    base_by = {key(r): r for r in rows}
+    out = []
+    for k, b in bars.items():
+        n = news.get(k)
+        d = base_by.get(k)
+        bar_us = _f(b.get("bar_us"))
+        roof = _f(b.get("roofline_us"))
+        new_us = _f(n.get("median_us")) if n and n.get("status") == "ok" else None
+        band_v = band(d)[0] if d else 0.02
+        gap = new_us / bar_us - 1 if (new_us and bar_us) else None
+        out.append(
+            {
+                "case_id": b["case_id"],
+                "sig": b["sig"],
+                "family": b["family"],
+                "model": b["model"],
+                "token": b["token"],
+                "mode": b["mode"],
+                "gpu": b.get("gpu", ""),
+                "dispatch_us": _f(b.get("dispatch_us")) or "",
+                "bar_us": bar_us or "",
+                "bar_source": b.get("bar_source", ""),
+                "bar_kernels": b.get("bar_kernels", ""),
+                "roofline_us": roof or "",
+                "bound": b.get("bound", ""),
+                "new_us": new_us or "",
+                "new_id": (
+                    (n.get("new_id") or f"tree:{n.get('aiter_sha', '')}") if n else ""
+                ),
+                "gap": gap if gap is not None else "",
+                "roofline_eff": roof / new_us if (roof and new_us) else "",
+                "band": band_v,
+                "won_mode": bool(gap is not None and gap < -band_v),
+                "weight": model_weight(b["model"], weights),
+            }
+        )
+    return out
+
+
+def case_won(rows):
+    """sig -> True when every mode of the case is won."""
+    acc = {}
+    for r in rows:
+        acc.setdefault(r["sig"], []).append(r["won_mode"])
+    return {sig: all(v) for sig, v in acc.items()}
+
+
+def write_queue(view, queue_dir):
+    """Rebuild queue/<gpu>.csv: every case not yet won, ranked by gap x model weight."""
+    won = case_won(view)
+    by_gpu = collections.defaultdict(dict)
+    for r in view:
+        if won.get(r["sig"]):
+            continue
+        cur = by_gpu[gpu_key(r["gpu"])].get(r["sig"])
+        score_gap = (
+            r["gap"]
+            if r["gap"] != ""
+            else (
+                (r["bar_us"] / r["roofline_us"] - 1)
+                if (r["bar_us"] and r["roofline_us"])
+                else 0.0
+            )
+        )
+        score = score_gap * r["weight"]
+        if cur is None or score > cur["score"]:
+            by_gpu[gpu_key(r["gpu"])][r["sig"]] = dict(
+                r,
+                score=score,
+                ranked_by="gap" if r["gap"] != "" else "bar_us/roofline_us",
+            )
+    os.makedirs(queue_dir, exist_ok=True)
+    cols = [
+        "rank",
+        "gpu",
+        "case_id",
+        "family",
+        "model",
+        "token",
+        "mode",
+        "weight",
+        "score",
+        "ranked_by",
+        "dispatch_us",
+        "bar_us",
+        "bar_source",
+        "roofline_us",
+        "bound",
+        "new_us",
+        "new_id",
+        "gap",
+        "roofline_eff",
+    ]
+    for gpu, cases in by_gpu.items():
+        ordered = sorted(cases.values(), key=lambda r: -r["score"])
+        with open(os.path.join(queue_dir, f"{gpu}.csv"), "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            w.writeheader()
+            for i, r in enumerate(ordered, 1):
+                w.writerow(dict(r, rank=i, gpu=gpu))
+    return {g: len(c) for g, c in by_gpu.items()}
+
+
 def cmd_compare(args):
     base_rows, new_rows = load(args.base), load(args.new)
     rows = compare_rows(base_rows, new_rows)
@@ -222,6 +368,21 @@ def cmd_compare(args):
         else:
             for r in cands:
                 r["verdict"] = "regression-unconfirmed"
+    if getattr(args, "bar", None):
+        view = bar_view(
+            base_rows, load_csv(args.bar), new_rows, read_weights(args.weights)
+        )
+        if args.bar_out:
+            with open(args.bar_out, "w", newline="") as f:
+                w = csv.DictWriter(
+                    f, fieldnames=list(view[0].keys()) if view else ["case_id"]
+                )
+                w.writeheader()
+                w.writerows(view)
+        won = case_won(view)
+        print(f"vs bar: {sum(won.values())} of {len(won)} cases won in every mode")
+        if args.queue_dir:
+            print("queue rebuilt:", write_queue(view, args.queue_dir))
     if args.out:
         with open(args.out, "w", newline="") as f:
             w = csv.DictWriter(

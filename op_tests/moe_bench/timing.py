@@ -83,8 +83,24 @@ class Timer:
         torch.cuda.synchronize()
         return [s.elapsed_time(e) * 1000.0 for s, e in zip(starts, ends)]
 
-    def time(self, cold=False):
-        """Warm up until stable, then time. Returns a dict of stats in microseconds."""
+    def time(self, cold=False, quick=False):
+        """Warm up until stable, then time. Returns a dict of stats in microseconds.
+
+        ``quick`` is for screening candidates: fewer iterations, same events and graph.
+        """
+        if quick:
+            self._measure(3, cold)
+            ts = sorted(self._measure(15, cold))
+            n = max(15, min(300, math.ceil(20_000.0 / max(ts[len(ts) // 2], 1e-3))))
+            ts = sorted(self._measure(n, cold))
+            return {
+                "median_us": statistics.median(ts),
+                "p10_us": ts[int(0.1 * (len(ts) - 1))],
+                "p90_us": ts[int(0.9 * (len(ts) - 1))],
+                "std_us": statistics.pstdev(ts) if len(ts) > 1 else 0.0,
+                "iters": n,
+                "warm_iters": 18,
+            }
         warm_total_ms = 0.0
         iters = 0
         prev = None

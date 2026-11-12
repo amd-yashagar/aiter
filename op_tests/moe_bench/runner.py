@@ -258,6 +258,8 @@ def parse_shard(s):
 class GroupJob:
     """One weight group on one worker process, with restarts after crash or hang."""
 
+    worker_module = "op_tests.moe_bench.worker"
+
     def __init__(self, key, cases, modes, tree, tmpdir, launcher, results, meta, opts):
         self.key, self.cases, self.modes = key, list(cases), modes
         self.tree, self.tmpdir, self.launcher = tree, tmpdir, launcher
@@ -275,6 +277,7 @@ class GroupJob:
     def _spawn(self):
         todo = [c for c in self.cases if c.id in self.pending]
         spec = {"cases": [c.row for c in todo], "modes": self.modes}
+        spec.update(self.extra_spec())
         fd, gpath = tempfile.mkstemp(suffix=".json", dir=self.tmpdir)
         with os.fdopen(fd, "w") as f:
             json.dump(spec, f)
@@ -285,7 +288,7 @@ class GroupJob:
         cmd = [
             sys.executable,
             "-m",
-            "op_tests.moe_bench.worker",
+            self.worker_module,
             "--group",
             gpath,
             "--out",
@@ -307,6 +310,15 @@ class GroupJob:
         )
         self.last_event = time.time()
         return True
+
+    def extra_spec(self):
+        return {}
+
+    def handle_row(self, c, ev):
+        self.results.add(make_row(c, ev, self.meta))
+
+    def handle_other(self, ev):
+        pass
 
     def _release(self):
         if self.gpu is not None:
@@ -335,8 +347,10 @@ class GroupJob:
                 c = next((x for x in self.cases if x.id == ev["case_id"]), None)
                 if c is None:
                     continue
-                self.results.add(make_row(c, ev, self.meta))
+                self.handle_row(c, ev)
                 self._maybe_done(c)
+            else:
+                self.handle_other(ev)
 
     def _maybe_done(self, c):
         wanted = [m for m in c.modes if m in self.modes]
