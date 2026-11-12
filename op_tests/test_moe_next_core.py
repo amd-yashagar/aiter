@@ -150,12 +150,17 @@ QUANT_TYPES = {
 }
 
 
-def _quant_input(token, K, seed):
+def _quant_input(token, K, seed, specials=False):
+    """Random rows, an outlier, an all-zero token 1, and with ``specials`` a NaN
+    (group 1 of token 2) and an inf (group 2 of token 3)."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn((token, K), dtype=dtypes.bf16, generator=g) * 3
     x[0, 5] = 400.0
     if token > 2:
         x[1].zero_()
+    if specials and token > 3:
+        x[2, 40] = float("nan")
+        x[3, 70] = float("inf")
     return x
 
 
@@ -220,6 +225,78 @@ def _check_quant(tm, x, mode, local):
     return bad
 
 
+def _mx_e8m0_model(x, fp4, fp8_max=448.0):
+    """aiter's per_1x32_mx_quant_hip scales: amax over 32 columns from
+    kAmaxFloor with NaN skipped, RoundUp e8m0 of amax * float(1 / max_pos),
+    fp8 capped at 254 (mxfp8_cap_scale). max_pos is 6 for fp4 and the fp8
+    max (448 on gfx950; aiter's gfx942 build uses 240)."""
+    a = x.float().abs().view(x.shape[0], -1, 32)
+    a = torch.where(a.isnan(), torch.zeros_like(a), a).amax(-1).clamp_min(1e-10)
+    inv = torch.tensor(1.0 / (6.0 if fp4 else fp8_max), dtype=torch.float32)
+    u = (a * inv.to(a.device)).view(torch.int32) & 0x7FFFFFFF
+    e = ((u + 0x7FFFFF) >> 23).clamp(max=255 if fp4 else 254)
+    return e.to(torch.uint8)
+
+
+def test_mx_index():
+    """The MX pass's addressing on any arch: the index-debug modes write each
+    output dword as t*4096 + g*16 + j and the real e8m0 scales, checked against
+    a torch model of the lane-native layout, the padding groups and the
+    num_local_tokens bound (rows past it must stay untouched)."""
+    from aiter.ops.flydsl.kernels.moe_next.core.quant import mx_offsets, mx_scale_cols
+
+    rows_out = []
+    for fp4 in (True, False):
+        mode = f"mx_fp{4 if fp4 else 8}_index_debug"
+        for token, E, topk, K, local in [
+            (8, 256, 8, 7168, None),
+            (200, 128, 8, 4096, 150),
+            (3000, 256, 8, 7168, None),
+            (2050, 385, 7, 2048, 2000),
+            (8, 128, 4, 2880, None),
+            (300, 128, 4, 2880, 250),
+            (1, 64, 2, 2880, None),
+        ]:
+            ti, tw, _ = routing(token, E, topk)
+            x = _quant_input(token, K, token, specials=True)
+            nl = torch.tensor([local], dtype=torch.int32) if local is not None else None
+            tm = route_to_tiles(
+                ti,
+                tw,
+                num_experts=E,
+                tile_m=32,
+                num_local_tokens=nl,
+                quant_input=x,
+                quant_mode=mode,
+            )
+            rows = token if local is None else local
+            groups, gp = K // 32, mx_scale_cols(K)
+            per = 4 if fp4 else 8
+            u = torch.arange(rows * gp, device=x.device)
+            t, g, _, q, sb = mx_offsets(u, K, fp4, int)
+            ok = g < groups
+            want_s = torch.zeros(rows * gp, dtype=torch.uint8, device=x.device)
+            want_s[sb[ok]] = _mx_e8m0_model(x[:rows], fp4).flatten()
+            want_q = torch.full((rows * K // 32 * per,), -1, dtype=torch.int32)
+            want_q = want_q.to(x.device)
+            j = torch.arange(per, device=x.device)
+            want_q[(q[ok, None] + j).flatten()] = (
+                ((t[ok] * 4096 + g[ok] * 16)[:, None] + j).flatten().int()
+            )
+            bad = []
+            if (want_q < 0).any() or (want_s.numel() != rows * gp):
+                bad.append("model coverage")
+            if not torch.equal(tm.a_q[:rows].flatten(), want_q):
+                bad.append("a_q placement")
+            if not torch.equal(tm.a_scale[:rows].view(torch.uint8).flatten(), want_s):
+                bad.append("a_scale")
+            assert not bad, f"{mode} M={token} K={K} local={local}: {bad}"
+            rows_out.append(
+                {"mode": mode, "token": token, "K": K, "local": local, "exact": True}
+            )
+    return rows_out
+
+
 def test_fused_quant():
     """Activation quant fused into the sort launch, bit-exact with aiter's
     quant op for each mode, on the one-shot and two-launch paths, and with the
@@ -238,7 +315,7 @@ def test_fused_quant():
             cases += [(8, 128, 4, 2880, None), (300, 128, 4, 2880, 250)]
         for token, E, topk, K, local in cases:
             ti, tw, _ = routing(token, E, topk)
-            x = _quant_input(token, K, token)
+            x = _quant_input(token, K, token, specials=mode in MX_TYPES)
             nl = torch.tensor([local], dtype=torch.int32) if local is not None else None
             out_a = torch.full((token, 1024), 3.0, dtype=dtypes.bf16)
             out_b = out_a.clone()
@@ -461,6 +538,9 @@ def main():
     )
     aiter.logger.info(
         "fused quant:\n%s", pd.DataFrame(test_fused_quant()).to_markdown(index=False)
+    )
+    aiter.logger.info(
+        "MX addressing:\n%s", pd.DataFrame(test_mx_index()).to_markdown(index=False)
     )
     aiter.logger.info(
         "eager host time:\n%s", pd.DataFrame(test_host_time()).to_markdown(index=False)

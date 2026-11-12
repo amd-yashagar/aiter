@@ -64,6 +64,9 @@ QUANT_MODES = {
     "per_1x128_fp8": (128, None),
     "mx_fp4_round_up": (32, ("gfx950",)),
     "mx_fp8_round_up": (32, ("gfx950",)),
+    # tests only: MX addressing with tagged output dwords in place of values
+    "mx_fp4_index_debug": (32, None),
+    "mx_fp8_index_debug": (32, None),
 }
 
 
@@ -74,7 +77,12 @@ def _quant_buffers(mode, m, k, dev):
     from aiter.ops.flydsl.kernels.moe_next.core.quant import mx_scale_cols
 
     if mode.startswith("mx_"):
-        if mode.startswith("mx_fp4"):
+        fp4 = mode.startswith("mx_fp4")
+        if mode.endswith("_index_debug"):
+            a_q = torch.empty(
+                (m, k // (8 if fp4 else 4)), dtype=torch.int32, device=dev
+            )
+        elif fp4:
             a_q = torch.empty((m, k // 2), dtype=dtypes.fp4x2, device=dev)
         else:
             a_q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=dev)

@@ -693,7 +693,7 @@ def build(
                 _it(qx), _it(qq), _it(qs), blk, rows * fx.Int32(cols // 128), fp8_max
             )
         elif mode in MX_MODES:
-            quant_mx_block(_it(qx), _it(qq), _it(qs), blk, rows, cols, MX_MODES[mode])
+            quant_mx_block(_it(qx), _it(qq), _it(qs), blk, rows, cols, *MX_MODES[mode])
         else:
             quant_token_block(
                 _it(qx), _it(qq), _it(qs), lds.red.ptr, blk, rows, cols, fp8_max

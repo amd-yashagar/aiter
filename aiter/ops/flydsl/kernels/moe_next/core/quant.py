@@ -158,22 +158,6 @@ def quant_token_block(x_it, q_it, s_it, red, row, n_rows, cols, fp8_max):
     fx.ptr_store(scale, s_it + fx.Int64(s))
 
 
-def _pkmax_u16(a, b):
-    va = fx.Vector.from_elements([a], fx.Int32).bitcast(fx.Uint16)
-    vb = fx.Vector.from_elements([b], fx.Int32).bitcast(fx.Uint16)
-    return fx.max(va, vb).bitcast(fx.Int32)[0]
-
-
-def _bf16_amax(dwords):
-    """max |x| of the bf16 pairs in ``dwords``, as an f32 (exact)."""
-    m = dwords[0] & fx.Int32(0x7FFF7FFF)
-    for d in dwords[1:]:
-        m = _pkmax_u16(m, d & fx.Int32(0x7FFF7FFF))
-    lo, hi = m & fx.Int32(0xFFFF), m.shrui(fx.Int32(16))
-    big = (fx.Uint32(lo) > fx.Uint32(hi)).select(lo, hi)
-    return (big << fx.Int32(16)).bitcast(fx.Float32)
-
-
 def _e8m0_round_up(amax, max_pos):
     """aiter's MxScaleRoundMode RoundUp: the biased exponent of
     ceil_pow2(amax / max_pos); 0xFF for inf and nan."""
@@ -213,47 +197,71 @@ def mx_scale_cols(cols):
     return -(-(cols // 32) // 16) * 16
 
 
+def mx_offsets(u, cols, fp4, c):
+    """Unit ``u`` of an MX pass -> (token, group, first bf16 element, first
+    output dword, scale byte). Plain arithmetic, so the kernel (``c`` =
+    fx.Int32) and host checks (``c`` = int, or tensors) share it."""
+    gp = mx_scale_cols(cols)
+    t = u // c(gp)
+    g = u - t * c(gp)
+    src = t * c(cols) + g * c(32)
+    q = t * c(cols // 8) + g * c(4) if fp4 else t * c(cols // 4) + g * c(8)
+    s = t * c(gp) + (g & c(3)) * c(gp // 4) + (g >> c(2))
+    return t, g, src, q, s
+
+
 @flyc.jit
-def quant_mx_block(x_it, q_it, s_it, blk, n_rows, cols, fp4):
+def quant_mx_block(x_it, q_it, s_it, blk, n_rows, cols, fp4, index_debug):
     """MX quant, one (token, 32-column group) per thread, from unit blk * 256;
     units run over n_rows x mx_scale_cols(cols), and the padding groups get a
-    0 scale. RoundUp e8m0 scales (aiter's per_1x32_mx_quant_hip), stored
+    0 scale. As aiter's per_1x32_mx_quant_hip: amax from kAmaxFloor, NaN
+    skipped, RoundUp e8m0 (fp8: capped at 254 = 2^127), values by the hardware scaled conversion. Scales
     lane-native: token t, group g at byte t*Gp + (g%4)*(Gp/4) + g/4. ``q_it``
-    iterates the output as int32, ``s_it`` the scales as int8. gfx950 only."""
-    groups, gp = cols // 32, mx_scale_cols(cols)
-    tid = gpu.thread_idx.x
-    u = blk * fx.Int32(BLOCK) + tid
-    t = u // fx.Int32(gp)
-    g = u - t * fx.Int32(gp)
+    iterates the output as int32, ``s_it`` the scales as int8. gfx950 only,
+    except with ``index_debug``: each output dword is then t*4096 + g*16 + j
+    in place of the converted values (any arch), to check the addressing.
+    Stores are branched, not sent to an out-of-range offset: the buffer
+    descriptor spans 2^32 bytes, so no byte offset of an int8 store is out of
+    range."""
+    u = blk * fx.Int32(BLOCK) + gpu.thread_idx.x
+    t, g, src, q, s = mx_offsets(u, cols, fp4, fx.Int32)
     live = t < n_rows
-    val = live & (g < fx.Int32(groups))
-    src = val.select(t * fx.Int32(cols) + g * fx.Int32(32), fx.Int32(0))
+    val = live & (g < fx.Int32(cols // 32))
+    src = val.select(src, fx.Int32(0))
     dw = []
     for i in range_constexpr(4):
         dw.extend(_load8(x_it, src + fx.Int32(8 * i)))
-    e = _e8m0_round_up(_bf16_amax(dw), 6.0 if fp4 else 448.0)
+    amax = _absmax(_bf16x8_f32(dw[0:8]) + _bf16x8_f32(dw[8:16]), fx.Float32(AMAX_FLOOR))
+    e = _e8m0_round_up(amax, 6.0 if fp4 else 448.0)
+    if const_expr(not fp4):
+        e = (e < fx.Int32(254)).select(e, fx.Int32(254))  # aiter's mxfp8_cap_scale
     qs = (e << fx.Int32(23)).bitcast(fx.Float32)
-    if const_expr(fp4):
+    if const_expr(index_debug):
+        tag = t * fx.Int32(4096) + g * fx.Int32(16)
+        out = [tag + fx.Int32(j) for j in range_constexpr(4 if fp4 else 8)]
+    elif const_expr(fp4):
         out = [_mx_fp4(dw[4 * i : 4 * i + 4], qs) for i in range_constexpr(4)]
-        q = val.select(t * fx.Int32(cols // 8) + g * fx.Int32(4), fx.Int32(OOB))
-        fx.ptr_store(fx.Vector.from_elements(out, fx.Int32), q_it + fx.Int64(q))
     else:
         out = []
         for i in range_constexpr(4):
             out.extend(_mx_fp8(dw[4 * i : 4 * i + 4], qs))
-        q = t * fx.Int32(cols // 4) + g * fx.Int32(8)
-        for h in range_constexpr(2):
-            qh = val.select(q + fx.Int32(4 * h), fx.Int32(OOB))
+    if val:
+        for h in range_constexpr(len(out) // 4):
             fx.ptr_store(
                 fx.Vector.from_elements(out[4 * h : 4 * h + 4], fx.Int32),
-                q_it + fx.Int64(qh),
+                q_it + fx.Int64(q + fx.Int32(4 * h)),
             )
-    s = t * fx.Int32(gp) + (g & fx.Int32(3)) * fx.Int32(gp // 4) + (g >> fx.Int32(2))
-    e = val.select(e, fx.Int32(0))
-    fx.ptr_store(fx.Int8(e), s_it + fx.Int64(live.select(s, fx.Int32(OOB))))
+    if live:
+        fx.ptr_store(fx.Int8(val.select(e, fx.Int32(0))), s_it + fx.Int64(s))
 
 
-MX_MODES = {"mx_fp4_round_up": True, "mx_fp8_round_up": False}
+# mode -> (fp4, index_debug)
+MX_MODES = {
+    "mx_fp4_round_up": (True, False),
+    "mx_fp8_round_up": (False, False),
+    "mx_fp4_index_debug": (True, True),
+    "mx_fp8_index_debug": (False, True),
+}
 
 
 @functools.lru_cache(maxsize=64)
@@ -279,7 +287,7 @@ def build_standalone(mode, cols, fp8_max, has_local):
                 _it(x), _it(q), _it(s), bid, rows * fx.Int32(cols // 128), fp8_max
             )
         elif mode in MX_MODES:
-            quant_mx_block(_it(x), _it(q), _it(s), bid, rows, cols, MX_MODES[mode])
+            quant_mx_block(_it(x), _it(q), _it(s), bid, rows, cols, *MX_MODES[mode])
         else:
             quant_token_block(
                 _it(x), _it(q), _it(s), lds.red.ptr, bid, rows, cols, fp8_max
