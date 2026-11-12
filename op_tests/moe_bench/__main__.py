@@ -110,6 +110,11 @@ def _guard_builds(a, runner):
 
 
 def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["pipeline"]:
+        from . import pipeline
+
+        return pipeline.main(args[1:])
     ap = argparse.ArgumentParser(prog="moe_bench", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
