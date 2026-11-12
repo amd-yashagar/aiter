@@ -63,7 +63,7 @@ def cmd_routes(args):
     cmd = [
         sys.executable,
         "-m",
-        "op_tests.moe_bench",
+        "moe_bench_shim",
         "routes-worker",
         "--cases",
         args.cases,
@@ -72,7 +72,7 @@ def cmd_routes(args):
     ]
     if args.filter:
         cmd += ["--filter", args.filter]
-    env = runner.worker_env(tree, tmpdir)
+    env = runner.worker_env(tree, tmpdir, extra_path=runner.make_shim(tmpdir))
     if args.launcher == "gpuq":
         cmd = ["gpuq", "--num-gpus=1", *cmd]
         rc = subprocess.run(cmd, env=env, cwd=tree, check=False).returncode
