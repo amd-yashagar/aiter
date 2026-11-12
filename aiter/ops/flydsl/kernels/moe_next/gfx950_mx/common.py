@@ -63,11 +63,12 @@ def global_vec_store(vec, base_i64, byte_off, n_i32):
     fx.ptr_store(vec, p)
 
 
-def e8m0_ceil(amax_f32, maxpos):
-    """aiter RoundUp: biased exponent of ceil_pow2(amax / maxpos), 0xFF kept for inf/nan."""
+def e8m0_ceil(amax_f32, maxpos, cap=0xFF):
+    """aiter RoundUp: biased exponent of ceil_pow2(amax / maxpos), at most cap
+    (0xFF keeps inf/nan; MXFP8 activations cap at 254 = 2^127 as aiter does)."""
     u = (amax_f32 * fx.Float32(1.0 / maxpos)).bitcast(fx.Int32) & fx.Int32(0x7FFFFFFF)
     e = (u + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23))
-    return (fx.Uint32(e) < fx.Uint32(0xFF)).select(e, fx.Int32(0xFF))
+    return (fx.Uint32(e) < fx.Uint32(cap)).select(e, fx.Int32(cap))
 
 
 def umax_i32(a, b):
@@ -78,20 +79,18 @@ def bf16x2(dw):
     return fx.Vector.from_elements([dw], fx.Int32).bitcast(fx.BFloat16)
 
 
+AMAX_FLOOR = 1e-10  # csrc/include/quant_amax_floor.h kAmaxFloor
+
+
 def bf16_group_amax(dwords):
-    """|max| of the bf16 pairs in `dwords` as an f32 (bf16 bits in the high half)."""
-    m = dwords[0] & fx.Int32(0x7FFF7FFF)
-    for d in dwords[1:]:
-        m = _pkmax_u16(m, d & fx.Int32(0x7FFF7FFF))
-    lo = m & fx.Int32(0xFFFF)
-    hi = m.shrui(fx.Int32(16))
-    return (umax_i32(lo, hi) << fx.Int32(16)).bitcast(fx.Float32)
-
-
-def _pkmax_u16(a, b):
-    va = fx.Vector.from_elements([a], fx.Int32).bitcast(fx.Uint16)
-    vb = fx.Vector.from_elements([b], fx.Int32).bitcast(fx.Uint16)
-    return fx.max(va, vb).bitcast(fx.Int32)[0]
+    """aiter's group amax of the bf16 pairs in `dwords`, as an f32: NaN skipped,
+    floored at kAmaxFloor."""
+    m = fx.Int32(0)
+    for d in dwords:
+        for h in (d & fx.Int32(0x7FFF), d.shrui(fx.Int32(16)) & fx.Int32(0x7FFF)):
+            m = umax_i32(m, (h <= fx.Int32(0x7F80)).select(h, fx.Int32(0)))
+    amax = (m << fx.Int32(16)).bitcast(fx.Float32)
+    return amax.maximumf(fx.Float32(AMAX_FLOOR))
 
 
 def quant_bf16_fp4(dwords, qscale):

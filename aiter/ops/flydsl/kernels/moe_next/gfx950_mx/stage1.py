@@ -93,6 +93,7 @@ def _build_stage1(
     KT = K // 256
     MT = BM // 16
     a_f8 = a_dtype == "fp8"
+    a_scale_cap = 254 if a_f8 else 0xFF
     w_f8 = w_dtype == "fp8"
     o_f8 = out_dtype == "fp8"
     A_ROW = K if a_f8 else K // 2
@@ -304,7 +305,7 @@ def _build_stage1(
                 v = cm.global_vec_load(arg_hidden, src + fx.Int32(16 * k), 4)
                 dw.extend([v[j] for j in range_constexpr(4)])
             amax = cm.bf16_group_amax(dw)
-            e8 = cm.e8m0_ceil(amax, maxpos)
+            e8 = cm.e8m0_ceil(amax, maxpos, a_scale_cap)
             qs = (e8 << fx.Int32(23)).bitcast(fx.Float32)
             kt = g // fx.Int32(8)
             gi = g & fx.Int32(7)

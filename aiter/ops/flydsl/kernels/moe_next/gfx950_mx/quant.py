@@ -27,6 +27,7 @@ def _build_quant(*, model_dim, a_dtype):
     GQ = GP // 4
     row_bytes = K // 2 if a_dtype == "fp4" else K
     maxpos = cm.max_pos(a_dtype)
+    scale_cap = 254 if a_dtype == "fp8" else 0xFF
     assert K % 32 == 0, f"model_dim={K} must be a multiple of 32"
 
     @flyc.kernel
@@ -47,7 +48,7 @@ def _build_quant(*, model_dim, a_dtype):
                 v = cm.global_vec_load(arg_x, src + fx.Int32(16 * i), 4)
                 dw.extend([v[j] for j in range(4)])
             amax = cm.bf16_group_amax(dw)
-            e = cm.e8m0_ceil(amax, maxpos)
+            e = cm.e8m0_ceil(amax, maxpos, scale_cap)
             qs = (e << fx.Int32(23)).bitcast(fx.Float32)
             if const_expr(a_dtype == "fp4"):
                 out = [cm.quant_bf16_fp4(dw[4 * i : 4 * i + 4], qs) for i in range(4)]
