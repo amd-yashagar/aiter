@@ -151,10 +151,28 @@ def main(argv=None):
     )
     p.add_argument("--sources", help="bar mode: comma list of candidate sources")
     p.add_argument(
+        "--main-failures",
+        help="known main failures CSV (default: next to the cases file)",
+    )
+    p.add_argument(
+        "--new-aiter",
+        help="new mode: tree with the new entry point (workers import aiter from it)",
+    )
+    p.add_argument(
+        "--new-entry", help="new mode: pkg.module (prepare/forward) or pkg.module:fn"
+    )
+    p.add_argument(
         "--source-module", action="append", help="module that registers sources"
     )
     p.add_argument("--resume", action="store_true")
     p.add_argument("--shard", help="i/n")
+    p.add_argument(
+        "--batches",
+        type=int,
+        default=1,
+        help="gpuq launcher: split the groups into this many batches, one lease each",
+    )
+    p.add_argument("--inner", action="store_true", help=argparse.SUPPRESS)
     p.add_argument(
         "--jobs", type=int, default=1, help="concurrent workers, one GPU each"
     )
@@ -224,6 +242,10 @@ def main(argv=None):
 
         return routes_cmd.cmd_coverage(a)
     if a.fn == "run":
+        if a.launcher == "gpuq" and not a.inner:
+            from . import batch
+
+            return batch.run_batched(a, list(sys.argv[1:] if argv is None else argv))
         if a.mode != "dispatch":
             from . import bar_runner
 

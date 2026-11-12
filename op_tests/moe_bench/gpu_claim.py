@@ -30,6 +30,9 @@ CLAIM_DIR = os.environ.get("MOE_BENCH_CLAIM_DIR", "/tmp/gm123-gpu-claims")
 MAX_VRAM_GB = 1.0
 MAX_UTIL_PCT = 5
 WORKER = os.environ.get("MOE_BENCH_WORKER", "meta-harness")
+# Other GM-123 workers share the node: this harness never holds more than this many
+# GPUs at once (a sharded tier-3 run raises it with MOE_BENCH_MAX_GPUS).
+MAX_OWN_GPUS = int(os.environ.get("MOE_BENCH_MAX_GPUS", "2"))
 
 
 def _smi(*args):
@@ -207,10 +210,27 @@ def release_claim(gpu, pid=None):
         pass
 
 
+def own_live_claims(worker=WORKER):
+    return sum(
+        1 for c in read_claims().values() if c.get("worker") == worker and c["alive"]
+    )
+
+
 def acquire(n, cmd, wait=0, prefer=None, worker=WORKER):
-    """Claim up to n idle GPUs (at least one); returns the claimed HIP indexes."""
+    """Claim up to n idle GPUs (at least one); returns the claimed HIP indexes.
+
+    Never takes a claimed GPU and never lets this worker hold more than
+    MAX_OWN_GPUS claims.
+    """
     deadline = time.time() + wait
     while True:
+        room = MAX_OWN_GPUS - own_live_claims(worker)
+        if room <= 0:
+            if time.time() >= deadline:
+                return []
+            time.sleep(10)
+            continue
+        n = min(n, room)
         idle, _, _ = idle_gpus()
         if prefer is not None:
             idle = [g for g in idle if g in prefer]

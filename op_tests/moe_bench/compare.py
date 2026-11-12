@@ -252,6 +252,8 @@ def bar_view(rows, bar_rows, new_rows, weights):
         new_us = _f(n.get("median_us")) if n and n.get("status") == "ok" else None
         band_v = band(d)[0] if d else 0.02
         gap = new_us / bar_us - 1 if (new_us and bar_us) else None
+        if new_us and not bar_us and b.get("status") == "no-bar":
+            gap = -1.0  # no existing backend computes it: any correct kernel wins
         out.append(
             {
                 "case_id": b["case_id"],

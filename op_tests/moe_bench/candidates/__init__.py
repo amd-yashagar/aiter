@@ -33,6 +33,8 @@ class Ctx:
         self.layouts = {}  # layout name -> prepared weights (untimed, once per group)
         self.dispatch_args = None  # get_2stage_cfgs arguments of the dispatch call
         self.dispatch_md = None
+        self.group_cache = {}  # shared by every case of the weight group
+        self.ref_weights = None  # unshuffled quantized weights and scales (new mode)
 
 
 class Candidate:

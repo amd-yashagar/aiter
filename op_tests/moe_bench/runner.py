@@ -109,9 +109,24 @@ def harness_sha():
     return (sha[:12] if sha else "none") + ("+dirty" if dirty else "")
 
 
-def worker_env(tree, tmpdir, extra=None):
+def make_shim(tmpdir):
+    """A directory holding this harness under the package name ``moe_bench_shim``.
+
+    Lets a worker import aiter from one tree and the harness from another: put the
+    aiter tree first on PYTHONPATH and the shim directory after it.
+    """
+    shim = os.path.join(tmpdir, "shim")
+    os.makedirs(shim, exist_ok=True)
+    link = os.path.join(shim, "moe_bench_shim")
+    if not os.path.islink(link):
+        os.symlink(HERE, link)
+    return shim
+
+
+def worker_env(tree, tmpdir, extra=None, extra_path=None):
     env = dict(os.environ)
-    env["PYTHONPATH"] = tree + os.pathsep + env.get("PYTHONPATH", "")
+    paths = [tree] + ([extra_path] if extra_path else [])
+    env["PYTHONPATH"] = os.pathsep.join(paths) + os.pathsep + env.get("PYTHONPATH", "")
     env["TMPDIR"] = tmpdir
     env.update(extra or {})
     return env
@@ -258,7 +273,9 @@ def parse_shard(s):
 class GroupJob:
     """One weight group on one worker process, with restarts after crash or hang."""
 
-    worker_module = "op_tests.moe_bench.worker"
+    worker_name = "worker"
+    pkg = __package__
+    extra_path = None
 
     def __init__(self, key, cases, modes, tree, tmpdir, launcher, results, meta, opts):
         self.key, self.cases, self.modes = key, list(cases), modes
@@ -288,13 +305,13 @@ class GroupJob:
         cmd = [
             sys.executable,
             "-m",
-            self.worker_module,
+            f"{self.pkg}.{self.worker_name}",
             "--group",
             gpath,
             "--out",
             self.outfile,
         ]
-        env = worker_env(self.tree, self.tmpdir)
+        env = worker_env(self.tree, self.tmpdir, extra_path=self.extra_path)
         if self.launcher == "gpuq":
             env["GPUQ_USER"] = env.get("GPUQ_USER", "yashagar")
             cmd = ["gpuq", "--num-gpus=1", *cmd]
@@ -591,6 +608,8 @@ def cmd_run(args):
     if "first" in modes_req:
         run_first(cases, tree, tmpdir, args.launcher, res, meta, ["warm", "empty"])
     res.close()
+    if getattr(args, "inner", False):
+        Path(args.out + ".done").touch()
     print(f"run finished in {time.time() - t0:.0f}s -> {args.out}", flush=True)
     if args.baseline_tree and args.baseline_results:
         base_rows = schema.read_csv(args.baseline_results)

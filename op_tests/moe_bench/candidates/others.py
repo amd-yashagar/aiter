@@ -63,26 +63,74 @@ class MultiGpu(_Skipped):
 
 
 class NewCandidate(Candidate):
+    """The new entry point, timed over the same region as every other candidate.
+
+    ``MOE_BENCH_NEW_ENTRY=pkg.module`` names a module with
+
+        prepare(w1, w2, w1_scale, w2_scale, *, ref_weights, meta) -> handle
+        forward(handle, hidden_states, topk_weight, topk_ids, **kwargs) -> output
+
+    ``prepare`` runs once per weight group, untimed. ``forward`` is the timed call:
+    ``kwargs`` are fused_moe's keyword arguments for the case (activation, quant_type,
+    expert_mask, bias, swiglu_limit, output, ...). ``ref_weights`` are the unshuffled
+    quantized weights and scales the reference uses. ``pkg.module:fn`` instead names a
+    function with fused_moe's own signature. ``forward`` may raise NotImplementedError
+    for cases it does not cover (recorded as unsupported).
+    """
+
     source = "new"
     entry = "MOE_BENCH_NEW_ENTRY"
 
-    def __init__(self, fn):
-        super().__init__(
-            f"new|{getattr(fn, 'kernel_id', fn.__name__)}",
-            getattr(fn, "kernel_id", fn.__name__),
+    def __init__(self, mod, fn=None):
+        kid = getattr(mod, "kernel_id", None) or getattr(fn or mod, "__name__", "new")
+        super().__init__(f"new|{kid}", str(kid))
+        self.mod, self.fn = mod, fn
+
+    def prepare(self, ctx):
+        if self.fn is not None or "new" in ctx.group_cache:
+            return
+        S = ctx.S
+        meta = {
+            "model_dim": S.D,
+            "inter_dim": S.I,
+            "experts": S.E_local,
+            "topk": S.topk,
+            "dtype": S.dtype,
+            "quant_type": S.qtype,
+            "activation": S.act,
+            "g1u1": S.g1u1,
+            "gate_mode": S.gate_mode,
+        }
+        ctx.group_cache["new"] = self.mod.prepare(
+            ctx.aw["w1"],
+            ctx.aw["w2"],
+            ctx.aw.get("w1_scale"),
+            ctx.aw.get("w2_scale"),
+            ref_weights=ctx.ref_weights,
+            meta=meta,
         )
-        self.fn = fn
 
     def call(self, ctx):
+        kw = dict(ctx.kwargs)
+        if self.fn is not None:
+
+            def run():
+                return self.fn(
+                    ctx.hidden_static,
+                    ctx.aw["w1"],
+                    ctx.aw["w2"],
+                    ctx.tw,
+                    ctx.ti,
+                    output=ctx.outbuf,
+                    **kw,
+                )
+
+            return run
+        handle = ctx.group_cache["new"]
+
         def run():
-            return self.fn(
-                ctx.hidden_static,
-                ctx.aw["w1"],
-                ctx.aw["w2"],
-                ctx.tw,
-                ctx.ti,
-                output=ctx.outbuf,
-                **ctx.kwargs,
+            return self.mod.forward(
+                handle, ctx.hidden_static, ctx.tw, ctx.ti, output=ctx.outbuf, **kw
             )
 
         return run
@@ -90,20 +138,17 @@ class NewCandidate(Candidate):
 
 @register
 class NewEntry(Source):
-    """The new entry point. ``MOE_BENCH_NEW_ENTRY=pkg.module:function`` plugs it in.
-
-    The function takes ``fused_moe``'s signature (hidden, w1, w2, topk_weight, topk_ids,
-    keyword arguments), may carry a ``kernel_id`` attribute, and may raise
-    ``NotImplementedError`` for cases it does not cover.
-    """
+    """The new entry point, plugged in with ``MOE_BENCH_NEW_ENTRY``."""
 
     name = "new"
 
     def skip_reason(self, ctx):
         if not os.environ.get("MOE_BENCH_NEW_ENTRY"):
-            return "no new entry point configured (set MOE_BENCH_NEW_ENTRY=pkg.mod:fn)"
+            return "no new entry point configured (set MOE_BENCH_NEW_ENTRY=pkg.mod)"
         return None
 
     def enumerate(self, ctx):
-        mod, _, fn = os.environ["MOE_BENCH_NEW_ENTRY"].partition(":")
-        return [NewCandidate(getattr(importlib.import_module(mod), fn))]
+        spec = os.environ["MOE_BENCH_NEW_ENTRY"]
+        modname, _, fn = spec.partition(":")
+        mod = importlib.import_module(modname)
+        return [NewCandidate(mod, getattr(mod, fn) if fn else None)]

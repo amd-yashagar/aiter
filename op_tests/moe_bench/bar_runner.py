@@ -55,6 +55,7 @@ BAR_COLS = (
         "n_candidates",
         "n_correct",
         "skipped_sources",
+        "main_failure",
         "new_us",
         "new_id",
         "roofline_us",
@@ -143,7 +144,7 @@ def _row(case, ev, meta, cols):
 
 
 class BarGroupJob(runner.GroupJob):
-    worker_module = "op_tests.moe_bench.bar_worker"
+    worker_name = "bar_worker"
 
     def __init__(
         self,
@@ -162,6 +163,7 @@ class BarGroupJob(runner.GroupJob):
         self.sources = sources
         self.source_modules = list(source_modules)
         self.bad = {}
+        self.main_failures = {}
 
     def extra_spec(self):
         return {
@@ -170,6 +172,11 @@ class BarGroupJob(runner.GroupJob):
                 c.id: self.dispatch_status.get(c.id) for c in self.cases
             },
             "bad_cands": {k: sorted(v) for k, v in self.bad.items()},
+            "main_failures": {
+                c.id: self.main_failures[c.id]
+                for c in self.cases
+                if c.id in self.main_failures
+            },
             "sources": self.sources,
             "source_modules": self.source_modules,
             "tmpdir": self.tmpdir,
@@ -232,6 +239,25 @@ class BarGroupJob(runner.GroupJob):
                     )
 
 
+def read_main_failures(args, cases_arg):
+    """Cases known to fail on main (tiers/main-failures.csv): {case_id: reason}."""
+    path = getattr(args, "main_failures", None) or os.path.join(
+        os.path.dirname(os.path.abspath(cases_arg.split(",")[0])), "main-failures.csv"
+    )
+    out = {}
+    if os.path.exists(path):
+        for r in schema.read_csv(path):
+            cid = r.get("case_id")
+            if cid:
+                out[cid] = (
+                    r.get("reason")
+                    or r.get("detail")
+                    or r.get("status")
+                    or "known failure"
+                )[:200]
+    return out
+
+
 def tier_name(cases_arg):
     return os.path.splitext(os.path.basename(cases_arg.split(",")[0]))[0]
 
@@ -241,7 +267,11 @@ def cmd_bar(args):
     tmpdir = args.tmpdir or os.path.join(tempfile.gettempdir(), "moe-bench-tmp")
     os.makedirs(tmpdir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
-    tree = os.path.abspath(args.aiter)
+    tree = os.path.abspath(
+        args.new_aiter if args.kind == "new" and args.new_aiter else args.aiter
+    )
+    if args.new_entry:
+        os.environ["MOE_BENCH_NEW_ENTRY"] = args.new_entry
     tier = args.tier_name or tier_name(args.cases)
     cases = runner.select_cases(args.cases.split(","), args.filter)
     if getattr(args, "ids", None):
@@ -257,6 +287,7 @@ def cmd_bar(args):
             if prev is None or r["status"] == "ok":
                 dispatch_status[r["case_id"]] = r["status"]
     kind = args.kind
+    main_failures = read_main_failures(args, args.cases)
     prefix = "new" if kind == "new" else "bar"
     bar = Table(
         os.path.join(args.out_dir, f"{prefix}-{tier}.csv"), BAR_COLS, args.resume
@@ -311,13 +342,22 @@ def cmd_bar(args):
         )
         for k, cs in groups
     ]
+    for j in jobs:
+        j.main_failures = main_failures
     print(
         f"{prefix}: {sum(len(cs) for _, cs in groups)} cases in {len(jobs)} groups, modes {modes_req}",
         flush=True,
     )
     t0 = time.time()
+    if kind == "new" and tree != os.path.abspath(args.aiter):
+        shim = runner.make_shim(tmpdir)
+        for j in jobs:
+            j.pkg = "moe_bench_shim"
+            j.extra_path = shim
     runner.run_jobs(jobs, args.jobs)
     bar.close()
     cand.close()
+    if getattr(args, "inner", False):
+        open(os.path.join(args.out_dir, ".done"), "w").close()
     print(f"{prefix} finished in {time.time() - t0:.0f}s -> {args.out_dir}", flush=True)
     return 0

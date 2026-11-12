@@ -193,6 +193,7 @@ def run_bar_group(cases, spec, fh):
     mode_kind = spec.get("kind", "bar")
     dispatch_status = spec.get("dispatch_status", {})
     bad = spec.get("bad_cands", {})
+    main_failures = spec.get("main_failures", {})
     ident = _gpu_identity()
     specs = {c.id: workload.resolve(c) for c in cases}
     live = []
@@ -266,8 +267,10 @@ def run_bar_group(cases, spec, fh):
         except Exception as e:  # noqa: BLE001
             refs[c.id] = (None, f"reference error: {_err(e)}")
         torch.cuda.empty_cache()
+    ref_weights = rw if mode_kind == "new" else None
     rw = None
     torch.cuda.empty_cache()
+    group_cache = {}
 
     sources = candidates.load_sources(
         spec.get("sources"), spec.get("source_modules", ())
@@ -290,6 +293,8 @@ def run_bar_group(cases, spec, fh):
             c, S, aw, bias, mask, hidden, tw, ti, nlt, n_valid, kw, tmpdir
         )
         ctx.dispatch_meta = ident
+        ctx.group_cache = group_cache
+        ctx.ref_weights = ref_weights
         ctx.hidden_static = hidden.clone()
         ctx.outbuf = (
             torch.empty((M, S.D), dtype=S.dtype, device="cuda")
@@ -308,6 +313,8 @@ def run_bar_group(cases, spec, fh):
             d = meas.measure(DispatchCandidate(), quick=False, modes=modes)
             results["dispatch"] = d
         for src in sources:
+            if (mode_kind == "new") != (src.name == "new"):
+                continue
             reason = src.skip_reason(ctx)
             if reason:
                 skipped.append((src.name, reason))
@@ -373,7 +380,9 @@ def run_bar_group(cases, spec, fh):
             for cand in keep:
                 results[cand.id] = meas.measure(cand, quick=False, modes=modes)
         for m in modes:
-            _emit_summary(fh, c, S, m, results, ident, skipped, mode_kind)
+            _emit_summary(
+                fh, c, S, m, results, ident, skipped, mode_kind, main_failures.get(c.id)
+            )
         from .candidates.fused_cfg import unforce
 
         unforce()
@@ -391,7 +400,7 @@ class _Screener:
         return self.meas.measure(cand, quick=quick, modes=("warm",))
 
 
-def _emit_summary(fh, c, S, mode, results, ident, skipped, kind):
+def _emit_summary(fh, c, S, mode, results, ident, skipped, kind, main_failure=None):
     from . import roofline
 
     ok = {
@@ -407,6 +416,7 @@ def _emit_summary(fh, c, S, mode, results, ident, skipped, kind):
         "n_correct": len(ok),
         "skipped_sources": "; ".join(n for n, _ in skipped),
         "gpu": ident["gpu"],
+        "main_failure": main_failure or "",
     }
     disp = results.get("dispatch")
     if disp is not None:
@@ -436,7 +446,8 @@ def _emit_summary(fh, c, S, mode, results, ident, skipped, kind):
             bar_timing_mode=best.get("timing_mode", ""),
         )
     else:
-        row["status"] = "no-correct-candidate"
+        # a case no existing backend computes correctly has no bar
+        row["status"] = "no-bar"
     if ident["sku"] and S.kind == "fused":
         rf = roofline.model(_roof_case(c, S), ident["sku"], ident["gfx"], mode)
         row.update(
