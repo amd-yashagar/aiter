@@ -213,6 +213,43 @@ def test_router():
     return results
 
 
+def test_family_import():
+    """Each gfx*_* family module imports on its own; a broken one is logged."""
+    import sys
+
+    import aiter.ops.flydsl.moe_next as pkg
+
+    d = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+    with open(os.path.join(d, "gfx000_ok.py"), "w") as f:
+        f.write(
+            "from aiter import moe\n"
+            "class K(moe.MoeKernel):\n"
+            "    id = 'test.family_ok'\n"
+            "    def supports(self, spec, m, topk, call=None):\n"
+            "        return 'test only'\n"
+            "moe.register_kernel(K)\n"
+        )
+    with open(os.path.join(d, "gfx000_broken.py"), "w") as f:
+        f.write("raise RuntimeError('broken family')\n")
+    old = list(pkg.__path__)
+    pkg.__path__[:] = [d]
+    try:
+        pkg._import_families()
+        assert moe.get_kernel("test.family_ok") is not None, "ok family registered"
+        with env(AITER_MOE_STRICT="1"):
+            try:
+                pkg._import_families()
+                raise AssertionError("strict must raise a family import error")
+            except RuntimeError:
+                pass
+    finally:
+        pkg.__path__[:] = old
+        moe.unregister_kernel("test.family_ok")
+        for name in ("gfx000_ok", "gfx000_broken"):
+            sys.modules.pop(f"{pkg.__name__}.{name}", None)
+    return [{"check": "family auto-import, isolated failures, strict raises"}]
+
+
 def test_fallback_args():
     """The fallback hands fused_moe the caller's own tensors and arguments."""
     hidden, w1, w2, tw, ti = _small_case()
@@ -400,6 +437,7 @@ def main():
         return
     checks = (
         test_router()
+        + test_family_import()
         + test_fallback_args()
         + test_graph_capture()
         + test_torch_compile()

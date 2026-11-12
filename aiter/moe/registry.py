@@ -5,6 +5,7 @@
 
 import functools
 import importlib
+import os
 
 from aiter import logger
 
@@ -36,7 +37,9 @@ def _load_packages() -> None:
     for name in KERNEL_PACKAGES:
         try:
             importlib.import_module(name)
-        except Exception:  # noqa: BLE001 - a broken family must not break the entry
+        except Exception:
+            if os.getenv("AITER_MOE_STRICT", "0") == "1":
+                raise
             logger.warning("aiter.moe: cannot import %s", name, exc_info=True)
 
 
