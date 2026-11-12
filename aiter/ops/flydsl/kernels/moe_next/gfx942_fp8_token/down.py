@@ -32,8 +32,7 @@ def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True):
     BLOCK_N = 64
     BLOCK_K = 64
     KT = K // BLOCK_K
-    THR_PER_ROW = BLOCK_N // 8
-    ROWS_PER_PASS = 256 // THR_PER_ROW
+    A_ROWS_PER_PASS = 256 // (BLOCK_N // 2)
     flyobj = fxh.FlyObjCache()
 
     @flyc.kernel
@@ -233,8 +232,8 @@ def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True):
                 fx.copy(copy_atom_, fragC_bf16r, thrv_ldsCt[None, None, None, ldsc_idx])
 
             out_bf16 = fxh._as_ptr(p_output, fx.BFloat16)
-            t_row = tid // THR_PER_ROW
-            t_col = (tid % THR_PER_ROW) * 8
+            a_row = tid // (BLOCK_N // 2)
+            a_col = (tid % (BLOCK_N // 2)) * 2
 
             if const_expr(not ATOMIC):
                 rows_out = fx.rocdl.make_buffer_tensor(
@@ -254,15 +253,17 @@ def compile_down(*, N, K, TOPK, BLOCK_M, PER_TENSOR=False, ATOMIC=True):
                     fx.copy(cp_ldsc, thrv_ldsC[None, None, None, ldsc_idx], fragOut)
                     fx.copy(cp_atom_out_128b, fragOut, thrv_out[None, None, None, 0, n])
                 else:
-                    for p in range_constexpr(BLOCK_M // ROWS_PER_PASS):
-                        r = t_row + p * ROWS_PER_PASS
+                    # 32 consecutive lanes add one row's 32 consecutive dwords, so
+                    # each atomic instruction covers two whole 128-byte row tiles.
+                    for p in range_constexpr(BLOCK_M // A_ROWS_PER_PASS):
+                        r = a_row + p * A_ROWS_PER_PASS
                         v = fxh.atom_tensor(
-                            ldsC[None, None, ldsc_idx], (r, t_col), 128
+                            ldsC[None, None, ldsc_idx], (r, a_col), 32
                         ).load()
                         sid = row_sid[r]
                         if sid >= 0:
                             tok = fx.Int32(sid.bitcast(fx.Uint32) & 0xFFFFFF)
-                            dst = out_bf16 + (fx.Int64(tok) * N + n * BLOCK_N + t_col)
+                            dst = out_bf16 + (fx.Int64(tok) * N + n * BLOCK_N + a_col)
                             fxh.atomic_add_bf16(dst, v)
 
             frag_weights = [None, None]
