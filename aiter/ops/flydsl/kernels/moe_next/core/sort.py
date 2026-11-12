@@ -88,28 +88,54 @@ def _lane_value(v, src):
     return fx.Int32(rocdl.ds_bpermute(T.i32, _raw(src * fx.Int32(4)), _raw(v)))
 
 
-def _check(e, inb, mask_lds, num_experts, has_mask, halo=None, i=None, topk=1):
-    """(expert or 0, valid): in range, a real expert, local under EP, and not
-    repeated in a later slot of the same token (aiter's sorts keep only the
-    last slot of a repeated expert). Later slots of the token are lanes
-    ``lane + j`` of this wave, or of ``halo`` past the wave's end, read with
-    ds_bpermute; every lane must take part."""
-    valid = inb & (e >= fx.Int32(0)) & (e < fx.Int32(num_experts))
-    es = valid.select(e, fx.Int32(0))
+def _low_mask(n):
+    """Lane bits [0, n) of a 64-lane mask, for 0 <= n <= 64."""
+    full = n >= fx.Int32(WAVE)
+    sh = full.select(fx.Int32(0), n)
+    return full.select(
+        fx.Uint64(0xFFFFFFFFFFFFFFFF), (fx.Uint64(1) << fx.Uint64(sh)) - fx.Uint64(1)
+    )
+
+
+def _check(e, inb, mask_lds, num_experts, has_mask, halo, i, topk, key_bits):
+    """(expert or 0, valid, below, count) of a route slot.
+
+    valid: in range, a real expert, local under EP, and not repeated in a later
+    slot of the same token (aiter's sorts keep only the last slot of a repeated
+    expert). below/count: valid routes of the same expert in lower lanes / in
+    the wave. A token's slots are consecutive lanes, so a repeat inside the
+    wave is a same-expert lane in (lane, lane + topk - 1 - slot]; a token that
+    runs past lane 63 also reads the next wave's first lanes through ``halo``.
+    Every lane of the wave must take part."""
+    c0 = fx.Int32(0)
+    base = inb & (e >= c0) & (e < fx.Int32(num_experts))
+    es = base.select(e, c0)
     if has_mask:
-        valid = valid & (_lds(mask_lds, es) != fx.Int32(0))
+        base = base & (_lds(mask_lds, es) != c0)
+    peers = fx.Uint64(rocdl.ballot(T.i64, base))
+    for b in range_constexpr(key_bits):
+        bit = ((e >> fx.Int32(b)) & fx.Int32(1)) != c0
+        votes = fx.Uint64(rocdl.ballot(T.i64, bit))
+        peers = peers & bit.select(votes, ~votes)
+    valid = base
     if topk > 1:
         lane = i % fx.Int32(WAVE)
         slot = i - i // fx.Int32(topk) * fx.Int32(topk)
-        for j in range_constexpr(1, topk):
-            src = lane + fx.Int32(j)
-            inside = src < fx.Int32(WAVE)
-            mine = _lane_value(e, inside.select(src, fx.Int32(0)))
-            ahead = _lane_value(halo, inside.select(fx.Int32(0), src - fx.Int32(WAVE)))
-            other = inside.select(mine, ahead)
-            later = slot + fx.Int32(j) < fx.Int32(topk)
-            valid = valid & ~(later & (other == e))
-    return valid.select(e, fx.Int32(0)), valid
+        reach = lane + fx.Int32(topk - 1) - slot
+        later = _low_mask(reach + fx.Int32(1)) & ~_low_mask(lane + fx.Int32(1))
+        dup = (peers & later) != fx.Uint64(0)
+        for x in range_constexpr(topk - 1):
+            hv = fx.Int32(rocdl.readlane(T.i32, _raw(halo), _raw(fx.Int32(x))))
+            dup = dup | ((reach >= fx.Int32(WAVE + x)) & (hv == e))
+        valid = base & ~dup
+        peers = peers & fx.Uint64(rocdl.ballot(T.i64, valid))
+    lo = fx.Uint32(peers)
+    hi = fx.Uint32(peers >> fx.Uint64(32))
+    below = rocdl.mbcnt_hi(
+        T.i32, _raw(hi), _raw(rocdl.mbcnt_lo(T.i32, _raw(lo), _raw(c0)))
+    )
+    count = fx.Int32(fx.math.ctpop(lo)) + fx.Int32(fx.math.ctpop(hi))
+    return valid.select(e, c0), valid, fx.Int32(below), count
 
 
 def _load_mask(mask_lds, mask_it, tid, num_experts, e_cap):
@@ -166,7 +192,17 @@ def _zero_fill(z_it, first, stride, n_v4):
 
 @flyc.jit
 def _histogram(
-    hist, mask_lds, tid, ids_it, begin, end, n_total, num_experts, topk, has_mask
+    hist,
+    mask_lds,
+    tid,
+    ids_it,
+    begin,
+    end,
+    n_total,
+    num_experts,
+    topk,
+    has_mask,
+    key_bits,
 ):
     """hist[e] += routes of expert e in [begin, end); loads are issued a stage
     (STAGE_ROUNDS rounds) at a time."""
@@ -189,11 +225,12 @@ def _histogram(
                 raw[k][3],
                 i0 + fx.Int32(k * BLOCK),
                 topk,
+                key_bits,
             )
             for k in range_constexpr(STAGE_ROUNDS)
         ]
         for k in range_constexpr(STAGE_ROUNDS):
-            e, valid = routes[k]
+            e, valid = routes[k][0], routes[k][1]
             if valid:
                 fx.atomic_add(hist + fx.Int64(e), fx.Int32(1), syncscope="workgroup")
     gpu.barrier()
@@ -354,12 +391,13 @@ def _rank_round(
     k,
     e,
     valid,
+    below,
+    cnt,
     w,
     i,
     sids_it,
     sw_it,
     topk,
-    key_bits,
     e_cap,
     loc_it,
     end,
@@ -369,7 +407,6 @@ def _rank_round(
     With ``with_loc``, loc_ids[i] gets the route's sorted row (-1 if dropped)."""
     c0, cK = fx.Int32(0), fx.Int32(topk)
     half = fx.Int32((k % 2) * WAVES * e_cap)
-    below, cnt = _peer_rank(e, valid, key_bits)
     lead = valid & (below == c0)
     slot = half + wave * fx.Int32(e_cap) + e
     _lds_st(tbl, lead.select(cnt, c0), lead.select(slot, fx.Int32(2 * WAVES * e_cap)))
@@ -438,12 +475,13 @@ def _rank_and_scatter(
                 raw[k][3],
                 base + fx.Int32(k * BLOCK) + tid,
                 topk,
+                key_bits,
             )
             for k in range_constexpr(STAGE_ROUNDS)
         ]
         for k in range_constexpr(STAGE_ROUNDS):
             if base + fx.Int32(k * BLOCK) < end:
-                e, valid = routes[k]
+                e, valid, below, cnt = routes[k]
                 _rank_round(
                     run,
                     tbl,
@@ -451,12 +489,13 @@ def _rank_and_scatter(
                     k,
                     e,
                     valid,
+                    below,
+                    cnt,
                     raw[k][2],
                     base + fx.Int32(k * BLOCK) + tid,
                     sids_it,
                     sw_it,
                     topk,
-                    key_bits,
                     e_cap,
                     loc_it,
                     end,
@@ -520,6 +559,7 @@ def _oneshot_body(
             raw[k][3],
             fx.Int32(k * BLOCK) + tid,
             topk,
+            key_bits,
         )
         for k in range_constexpr(rounds)
     ]
@@ -562,12 +602,13 @@ def _oneshot_body(
                 k,
                 routes[k][0],
                 routes[k][1],
+                routes[k][2],
+                routes[k][3],
                 raw[k][2],
                 fx.Int32(k * BLOCK) + tid,
                 sids_it,
                 sw_it,
                 topk,
-                key_bits,
                 e_cap,
                 loc_it,
                 n,
@@ -732,7 +773,17 @@ def build(
             _clear(hist, e_cap, tid)
             gpu.barrier()
             _histogram(
-                hist, lds.mask.ptr, tid, _it(ids), begin, end, n, E, topk, has_mask
+                hist,
+                lds.mask.ptr,
+                tid,
+                _it(ids),
+                begin,
+                end,
+                n,
+                E,
+                topk,
+                has_mask,
+                key_bits,
             )
             _store_counts(hist, _it(counts), tid, bid, E, e_cap)
         if row_v4 > fx.Int32(0):
