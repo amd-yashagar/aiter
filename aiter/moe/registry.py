@@ -9,7 +9,7 @@ import os
 
 from aiter import logger
 
-from .kernel import MoeKernel
+from .kernel import MoeKernel, check_numerics
 
 # Imported on the first lookup, so `import aiter.moe` does not pull in FlyDSL.
 KERNEL_PACKAGES = ("aiter.ops.flydsl.moe_next",)
@@ -22,6 +22,7 @@ def register_kernel(kernel):
     inst = kernel() if isinstance(kernel, type) else kernel
     if not inst.id:
         raise ValueError(f"{kernel!r} has no id")
+    check_numerics(inst.numerics)
     if inst.id in _KERNELS and type(_KERNELS[inst.id]) is not type(inst):
         raise ValueError(f"kernel id {inst.id!r} registered twice")
     _KERNELS[inst.id] = inst
@@ -52,8 +53,9 @@ SAME_AS_AITER = {"same_as": "aiter dispatched path"}
 
 
 def numerics(kernel_id: str) -> dict | None:
-    """The kernel's declared rounding points (``MoeKernel.numerics``); a kernel
-    that declares none is "same as aiter's dispatched path" (logged once)."""
+    """The kernel's declared rounding points (``MoeKernel.numerics``), with
+    inter_quant defaulting to act_quant; a kernel that declares none is "same
+    as aiter's dispatched path" (logged once)."""
     kernel = get_kernel(kernel_id)
     if kernel is None:
         return None
@@ -64,7 +66,10 @@ def numerics(kernel_id: str) -> dict | None:
             f"aiter.moe: {kernel_id} declares no numerics; assuming {SAME_AS_AITER}"
         )
         return dict(SAME_AS_AITER)
-    return dict(kernel.numerics)
+    out = dict(kernel.numerics)
+    if "act_quant" in out:
+        out.setdefault("inter_quant", out["act_quant"])
+    return out
 
 
 def kernels() -> dict[str, MoeKernel]:

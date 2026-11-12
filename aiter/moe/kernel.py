@@ -56,6 +56,44 @@ class MoeCall:
         return self.weights.spec
 
 
+# The numerics vocabulary (docs/aiter-moe-api.md section 5). MX scales name
+# aiter's MxScaleRoundMode: round_up is ceil_pow2(amax / max_pos) (the HIP
+# per_1x32 quant, aiter's default), even is the Triton fused MoE sort quant's.
+QUANTS = (
+    "none",
+    "per_token_fp8",
+    "per_tensor_fp8",
+    "per_1x128_fp8",
+    "mx_fp4_round_up",
+    "mx_fp4_even",
+    "mx_fp8_round_up",
+    "mx_fp8_even",
+)
+COMBINES = ("bf16_atomic", "fp32_atomic", "bf16_rows_fp32_sum", "fp32_reduce")
+
+
+def check_numerics(numerics: dict | None) -> None:
+    """Raise on a value outside the vocabulary (bare mx_fp4 / mx_fp8 included)."""
+    if numerics is None:
+        return
+    unknown = set(numerics) - {"act_quant", "inter", "inter_quant", "combine"}
+    if unknown:
+        raise ValueError(f"unknown numerics keys {sorted(unknown)}")
+    for key in ("act_quant", "inter_quant"):
+        if key in numerics and numerics[key] not in QUANTS:
+            raise ValueError(f"numerics[{key!r}]={numerics[key]!r} not in {QUANTS}")
+    inter = numerics.get("inter")
+    inters = ("bf16", "fp32_direct", *(f"bf16_then_{q}" for q in QUANTS))
+    if inter is not None and inter not in inters:
+        raise ValueError(
+            f"numerics['inter']={inter!r}: bf16, fp32_direct or bf16_then_<quant>"
+        )
+    if "combine" in numerics and numerics["combine"] not in COMBINES:
+        raise ValueError(
+            f"numerics['combine']={numerics['combine']!r} not in {COMBINES}"
+        )
+
+
 @contextlib.contextmanager
 def compile_only():
     """Compile FlyDSL kernels without launching them (``COMPILE_ONLY=1``): under
@@ -91,9 +129,9 @@ class MoeKernel:
     epilogue: ClassVar[str] = "atomic"
     # Rounding points, e.g. {"act_quant": "per_1x128_fp8", "inter":
     # "bf16_then_per_1x128_fp8", "combine": "bf16_atomic"}; None means "same as
-    # aiter's dispatched path". act_quant: none, per_token_fp8, per_1x128_fp8,
-    # mx_fp4, mx_fp8; inter: bf16, fp32_direct, bf16_then_<quant>; combine:
-    # bf16_atomic, fp32_atomic, bf16_rows_fp32_sum, fp32_reduce. A kernel may round less than, never more than,
+    # aiter's dispatched path". Keys: act_quant and inter_quant (QUANTS;
+    # inter_quant defaults to act_quant), inter (bf16, fp32_direct or
+    # bf16_then_<quant>), combine (COMBINES); checked at registration. A kernel may round less than, never more than,
     # the least-rounding aiter path for its family and arch.
     numerics: ClassVar[dict | None] = None
     # Not-yet-covered layer keywords (router.NOT_YET_COVERED) this kernel

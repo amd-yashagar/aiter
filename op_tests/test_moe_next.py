@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from typing import ClassVar
 
 import pandas as pd
 import torch
@@ -173,7 +174,31 @@ def test_router(probe):
             assert _is_probe(out), "handles_kwargs"
         finally:
             ProbeKernel.handles_kwargs = frozenset()
-    return [{"check": "routes, decline, error, strict, kill switch, last_route"}]
+
+    class Bad(moe.MoeKernel):
+        id = "test.bad_numerics"
+        numerics: ClassVar[dict] = {"act_quant": "mx_fp4"}
+
+    try:
+        moe.register_kernel(Bad)
+        raise AssertionError("bare mx_fp4 must raise")
+    except ValueError:
+        pass
+
+    class Good(moe.MoeKernel):
+        id = "test.good_numerics"
+        numerics: ClassVar[dict] = {
+            "act_quant": "mx_fp4_round_up",
+            "inter": "bf16_then_mx_fp4_round_up",
+            "combine": "bf16_rows_fp32_sum",
+        }
+
+    moe.register_kernel(Good)
+    assert moe.numerics("test.good_numerics")["inter_quant"] == "mx_fp4_round_up"
+    moe.unregister_kernel("test.good_numerics")
+    return [
+        {"check": "routes, decline, error, strict, kill switch, last_route, numerics"}
+    ]
 
 
 def test_family_import():
