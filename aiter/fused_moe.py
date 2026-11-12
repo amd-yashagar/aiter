@@ -6761,6 +6761,43 @@ def cktile_moe_stage1(
             "CK-Tile MXFP4 stage1 requires model_dim to be a multiple of 256; "
             f"got {model_dim}"
         )
+    if w1.dtype == dtypes.fp4x2 and dtype != dtypes.bf16:
+        if dtype != dtypes.fp16:
+            raise NotImplementedError(
+                f"CK-Tile MXFP4 stage1 has bf16 instances only; got dtype={dtype}"
+            )
+        # The kernels only have bf16 instances and read the activation as bf16,
+        # so compute in bf16 and return fp16.
+        res = cktile_moe_stage1(
+            (
+                hidden_states.to(dtypes.bf16)
+                if hidden_states.dtype == dtypes.fp16
+                else hidden_states
+            ),
+            w1,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            None,
+            topk,
+            block_m,
+            a1_scale,
+            w1_scale,
+            sorted_weights=sorted_weights,
+            n_pad_zeros=n_pad_zeros,
+            k_pad_zeros=k_pad_zeros,
+            bias1=bias1,
+            topk_ids=topk_ids,
+            activation=activation,
+            split_k=split_k,
+            dtype=dtypes.bf16,
+            kernel_name=kernel_name,
+            post_activation_layout=post_activation_layout,
+        ).to(dtypes.fp16)
+        if out is None or tuple(out.shape) != tuple(res.shape):
+            return res
+        return out.copy_(res)
     token_num = hidden_states.shape[0]
     _, _n1, k1 = w1.shape
     _, k2, n2 = w2.shape
@@ -6925,6 +6962,35 @@ def cktile_moe_stage2(
             "CK-Tile MXFP4 stage2 requires inter_dim to be a multiple of 256; "
             f"got {inter_dim}"
         )
+    if w2.dtype == dtypes.fp4x2 and out is not None and out.dtype != dtypes.bf16:
+        if out.dtype != dtypes.fp16:
+            raise NotImplementedError(
+                f"CK-Tile MXFP4 stage2 has bf16 instances only; got {out.dtype}"
+            )
+        # bf16 instances only, and the activation is read as bf16: accumulate
+        # into a bf16 buffer and add it to the fp16 output.
+        acc = torch.zeros(out.shape, dtype=dtypes.bf16, device=out.device)
+        cktile_moe_stage2(
+            a2.to(dtypes.bf16) if a2.dtype == dtypes.fp16 else a2,
+            w1,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            acc,
+            topk,
+            w2_scale,
+            a2_scale,
+            block_m,
+            activation=activation,
+            sorted_weights=sorted_weights,
+            zeros_out=zeros_out,
+            n_pad_zeros=n_pad_zeros,
+            k_pad_zeros=k_pad_zeros,
+            bias2=bias2,
+            kernel_name=kernel_name,
+        )
+        return out.add_(acc.to(out.dtype))
     bias2 = _normalize_bias_for_kernel(bias2)
     # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
     aiter.moe_cktile2stages_gemm2(
