@@ -226,6 +226,18 @@ def _quant_block_128(aiter, weight, quant_dtype):
     return wq, ws.view(E, d1 // 128, d2 // 128)
 
 
+def _e8m0_keys(**scales):
+    """Scales that are e8m0 bytes went through the cross-expert 256-row padding of
+    e8m0_shuffle; fp32 block or channel scales pass through it unpadded."""
+    from aiter import dtypes
+
+    return {
+        k.replace("sa", "_scale")
+        for k, t in scales.items()
+        if t is not None and t.dtype == dtypes.fp8_e8m0
+    }
+
+
 def quantize_chunk(S, w1, w2):
     """Quantize one expert chunk. Returns (ref, aiter) tensor dicts.
 
@@ -301,7 +313,7 @@ def quantize_chunk(S, w1, w2):
         )
         w1sa = fp4_utils.e8m0_shuffle(w1s)
         w2sa = fp4_utils.e8m0_shuffle(w2s)
-        shuffled |= {"w1_scale", "w2_scale"}
+        shuffled |= _e8m0_keys(w1sa=w1sa, w2sa=w2sa)
     elif (
         qT == aiter.QuantType.per_1x32
         and AQ in (dtypes.bf16, dtypes.fp16, dtypes.fp8)
@@ -317,13 +329,13 @@ def quantize_chunk(S, w1, w2):
         w1sa = shuffle_scale_a16w4(w1s, e, True)
         w2a = shuffle_weight_a16w4(w2a, 16, False)
         w2sa = fp4_utils.e8m0_shuffle(w2s)
-        shuffled.add("w2_scale")
+        shuffled |= _e8m0_keys(w2sa=w2sa)
     else:
         w1a = shuffle_weight(w1a, layout=(16, 16))
         w2a = shuffle_weight(w2a, layout=(16, 16))
         w1sa = fp4_utils.e8m0_shuffle(w1s)
         w2sa = fp4_utils.e8m0_shuffle(w2s)
-        shuffled |= {"w1_scale", "w2_scale"}
+        shuffled |= _e8m0_keys(w1sa=w1sa, w2sa=w2sa)
     attrs = {
         "w1": {"gate_up_interleave": getattr(w1a, "gate_up_interleave", None)},
         "w2": {"gate_up_interleave": getattr(w2a, "gate_up_interleave", None)},
