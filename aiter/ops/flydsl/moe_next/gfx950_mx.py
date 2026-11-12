@@ -57,7 +57,21 @@ def parse_config(config):
     out = {}
     for tok in (config or "").split("_"):
         key = tok.rstrip("0123456789")
-        keys = ("bm", "tn", "la", "nb", "ra", "nt", "ar", "dm", "iq", "xc")
+        keys = (
+            "bm",
+            "tn",
+            "la",
+            "nb",
+            "ra",
+            "nt",
+            "ar",
+            "dm",
+            "iq",
+            "xc",
+            "nw",
+            "sp",
+            "cg",
+        )
         if key in keys and tok[len(key) :]:
             out[key] = int(tok[len(key) :])
     return out
@@ -129,6 +143,13 @@ class _MxGfx950(MoeKernel):
         il = spec.gate_mode == GateMode.INTERLEAVE
         if tag is not None and bool(tag) != il:
             return "w1.gate_up_interleave disagrees with gate_mode"
+        # Untagged weights follow aiter's convention (fused_moe
+        # _flydsl_mxfp4_layout_is_compatible): fp4 activations come with separated
+        # gate/up rows, fp8 activations with interleaved ones.
+        if tag is None and il != (a == dtypes.fp8):
+            return (
+                f"untagged w1 with {_DT[a]} activations and gate_mode {spec.gate_mode}"
+            )
         if not (call.w1.is_contiguous() and call.w2.is_contiguous()):
             return "weights not contiguous"
         E, D, I = spec.experts, spec.model_dim, spec.inter_dim
@@ -144,6 +165,7 @@ class _MxGfx950(MoeKernel):
         )
         from aiter.ops.flydsl.kernels.moe_next.gfx950_mx.stage1 import compile_stage1
         from aiter.ops.flydsl.kernels.moe_next.gfx950_mx.stage2 import (
+            a_tile_resident,
             blocks_per_wg,
             compile_reduce,
             compile_stage2,
@@ -162,7 +184,10 @@ class _MxGfx950(MoeKernel):
         routes = m * topk
         per_expert = -(-routes // spec.experts)
         live = min(spec.experts, routes) * -(-per_expert // bm)
-        nb = cfg.get("nb") or blocks_per_wg(spec.model_dim, live)
+        resident = a_tile_resident(spec.inter_dim, bm, a)
+        nb = (cfg.get("nb") if resident else 1) or blocks_per_wg(
+            spec.model_dim, live, resident=resident
+        )
         reduce = self.epilogue == "reduce"
         xcd = bool(cfg.get("xc", 1 if self.prefill else 0))
         a_bytes = spec.model_dim if a == "fp8" else spec.model_dim // 2
@@ -200,6 +225,9 @@ class _MxGfx950(MoeKernel):
             experts_total=spec.experts,
             inline_quant=bool(cfg.get("iq", 0)),
             xcd=xcd,
+            waves=4 if direct else cfg.get("nw", 4),
+            sched_pin=bool(cfg.get("sp", 0)),
+            core_group=bool(cfg.get("cg", 0)),
         )
         s2 = compile_stage2(
             model_dim=spec.model_dim,

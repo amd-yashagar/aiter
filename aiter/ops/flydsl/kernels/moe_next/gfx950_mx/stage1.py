@@ -3,9 +3,11 @@
 
 """gfx950 MX MoE stage 1: gate/up GEMM, activation and the intermediate's MX quant.
 
-One workgroup (4 waves) owns one sorted tile of BM rows (one expert) and BNH
-intermediate columns: wave w computes gate and up for columns w*32 .. w*32+31, so the
-activation is local. Tokens are MFMA operand A (gathered token-major rows staged in
+One workgroup owns one sorted tile of BM rows (one expert) and BNH intermediate
+columns. With 4 waves, wave w computes gate and up of columns w*BNH/4 .. for all BM
+rows; with 8 waves the rows are split in two halves as well, which halves the
+accumulators per wave (two waves per SIMD fit) without adding LDS reads. Gate and up of
+a column sit in one wave, so the activation is local. Tokens are MFMA operand A (gathered token-major rows staged in
 LDS, XOR-swizzled 16 B chunks), weights operand B (straight to VGPRs from aiter's
 preshuffled layout, one K tile ahead). Scaled MFMA 16x16x128 with e8m0 scales:
 token scales in the lane-native order (common.py), weight scales as aiter's
@@ -24,6 +26,9 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float4E2M1FN, Float8E4M3FN, T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels.moe_next.core.direct import group_routes, lds_words
+from aiter.ops.flydsl.kernels.moe_next.core.direct import offsets as gr_offsets
+from aiter.ops.flydsl.kernels.moe_next.core.intermediate import scale_offset_mfma
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
     _activation_mul_batch,
     _inline_dpp_quad_amax,
@@ -73,12 +78,20 @@ def _build_stage1(
     experts_total=0,
     inline_quant=True,
     xcd=False,
+    waves=4,
+    sched_pin=False,
+    core_group=False,
 ):
     K = int(model_dim)
     INTER = int(inter_dim)
     BM = int(tile_m)
     BNH = int(tile_n)
     assert BNH in (64, 128)
+    NW = int(waves)
+    assert NW in (4, 8)
+    WM = NW // 4  # row halves
+    NTHR = 64 * NW
+    SCHED_PIN = bool(sched_pin)
     WCOLS = BNH // 4
     NT = WCOLS // 8  # weight tiles per wave: NT // 2 gate tiles, then their up tiles
     LA = int(ahead)
@@ -91,7 +104,7 @@ def _build_stage1(
     RAGGED = INTER % BNH != 0
     assert BM in (16, 32, 64, 128)
     KT = K // 256
-    MT = BM // 16
+    MT = BM // 16 // WM  # token tiles per wave
     a_f8 = a_dtype == "fp8"
     a_scale_cap = 254 if a_f8 else 0xFF
     w_f8 = w_dtype == "fp8"
@@ -111,7 +124,7 @@ def _build_stage1(
     OUT_ROW = INTER if o_f8 else INTER // 2
     OGP8 = cm.pad_up(INTER // 32, 8)
     out_max = cm.max_pos(out_dtype)
-    rows_per_pass = 256 // NCH
+    rows_per_pass = NTHR // NCH
     a_passes = max(1, BM // rows_per_pass)
     a_lds_bytes = BM * TILE_RB
     acc_stride = BNH * 4 + 16
@@ -127,6 +140,9 @@ def _build_stage1(
     XCD = bool(xcd) and not DIRECT
     assert not INLINE or (A_RESIDENT and BM == 16), "inline quant: BM 16, resident A"
     assert not DIRECT or BM == 16, "direct mode needs BM 16"
+    assert not DIRECT or NW == 4, "direct mode runs 4 waves"
+    CORE_GROUP = DIRECT and bool(core_group)
+    GR_WORDS = -(-lds_words(experts_total) // 256) * 256 if CORE_GROUP else 1
     NX = -(-INTER // BNH)
     ZCPW = -(-K // (8 * max(TOPK, 1) * NX))  # zero-fill 16 B chunks per workgroup
     G = K // 32
@@ -134,12 +150,19 @@ def _build_stage1(
     sc_off = region0
     rl_off = sc_off + (BM * GP if INLINE else 0)
     a_dump = rl_off + BM * 4 + 32  # 16 B dump for idle lanes of the inline quant
-    lds_bytes = rl_off + (BM * 4 + 48 if DIRECT else 0)
-    limit = float("inf") if swiglu_limit is None else float(swiglu_limit)
+    tk_off = rl_off + (BM * 4 + 48 if DIRECT else 0)
+    lds_bytes = tk_off + (0 if DIRECT else BM * 4)
+    # aiter's Swiglu (gpt-oss form) clamps at 7.0 when no limit is given; the
+    # other activations clamp only with an explicit limit.
+    if swiglu_limit is None:
+        limit = 7.0 if act == "swiglu" else float("inf")
+    else:
+        limit = float(swiglu_limit)
 
     @fx.struct
     class SharedStorage:
         buf: fx.Array[fx.Int8, lds_bytes, 16]
+        gr: fx.Array[fx.Int32, GR_WORDS, 16]
 
     def phys_tile(ct_gate, up):
         if const_expr(interleave):
@@ -283,6 +306,99 @@ def _build_stage1(
         )
         return e_r, leader
 
+    def _core_group_prologue(
+        lds_base,
+        gr,
+        tid,
+        nblk,
+        mblk,
+        tokens,
+        arg_tids,
+        arg_tw,
+        arg_zero,
+        arg_sid_out,
+        arg_eid_out,
+        arg_sw_out,
+    ):
+        """_direct_prologue on core's group_routes: route slot r = mblk is a
+        position in aiter's sort order, and leads a tile when its rank in its
+        expert's group is a multiple of BM."""
+        c0 = fx.Int32(0)
+        zc = (mblk * fx.Int32(NX) + nblk) * fx.Int32(ZCPW) + tid
+        zlive = (tid < fx.Int32(ZCPW)) & (zc < tokens * fx.Int32(K // 8))
+        _zero16_if(zlive, arg_zero, fx.Int64(zc) * fx.Int64(16))
+
+        def view(arg, ty):
+            return fx.Tensor(
+                fx.make_view(cm.global_ptr(arg, ty, 4), fx.make_layout((1, 1), (1, 1)))
+            )
+
+        ids_t = view(arg_tids, T.i32)
+        group_routes(
+            gr,
+            ids_t,
+            view(arg_tw, T.f32),
+            ids_t,
+            ids_t,
+            tokens,
+            experts_total,
+            TOPK,
+            False,
+            False,
+        )
+        o_order, _, o_ge, o_gs, o_meta = gr_offsets(experts_total)[:5]
+
+        def grd(i):
+            return fx.ptr_load(gr + fx.Int64(i))
+
+        n_valid = grd(fx.Int32(o_meta))
+        n_groups = grd(fx.Int32(o_meta + 1))
+        cnt_off = fx.Int32(rl_off + BM * 4)
+        dump = cnt_off + fx.Int32(24)
+        rl = fx.Int32(rl_off)
+        # group of position mblk: thread k tests group k
+        k = tid
+        gs_k = grd(fx.Int32(o_gs) + (k < n_groups).select(k, c0))
+        gs_k1 = grd(fx.Int32(o_gs + 1) + (k < n_groups).select(k, c0))
+        own = (k < n_groups) & (gs_k <= mblk) & (mblk < gs_k1)
+        fx.ptr_store(k, _lds_i32(lds_base, own.select(cnt_off, dump)))
+        gpu.barrier()
+        g = _lds_ld(lds_base, cnt_off)
+        inb = mblk < n_valid
+        gc = inb.select(g, c0)
+        start = grd(fx.Int32(o_gs) + gc)
+        end = grd(fx.Int32(o_gs + 1) + gc)
+        e_r = grd(fx.Int32(o_ge) + gc)
+        leader = inb & (((mblk - start) & fx.Int32(BM - 1)) == c0)
+        pos = mblk + (tid & fx.Int32(BM - 1))
+        packed = grd(fx.Int32(o_order) + (pos < end).select(pos, c0))
+        tok = packed & fx.Int32(0xFFFFFF)
+        slot = packed.shrui(fx.Int32(24))
+        u = (pos < end).select(tok * fx.Int32(TOPK) + slot, fx.Int32(-1))
+        fx.ptr_store(
+            u,
+            _lds_i32(
+                lds_base, (tid < fx.Int32(BM)).select(rl + tid * fx.Int32(4), dump)
+            ),
+        )
+        gpu.barrier()
+        _rowmap_if(
+            (nblk == c0) & (tid < fx.Int32(BM)),
+            u,
+            mblk * fx.Int32(BM) + tid,
+            tokens,
+            arg_tw,
+            arg_sid_out,
+            arg_sw_out,
+        )
+        _eid_if(
+            (nblk == c0) & (tid == c0),
+            mblk,
+            leader.select(e_r, fx.Int32(-1)),
+            arg_eid_out,
+        )
+        return e_r, leader
+
     def _inline_quant(lds_base, tid, arg_hidden, hstride):
         """bf16 token rows of the tile -> MX values in the resident LDS A tiles and
         e8m0 scales in LDS (lane-native order), with aiter's RoundUp rule."""
@@ -365,7 +481,9 @@ def _build_stage1(
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         lane = tid % fx.Int32(64)
-        wave = fx.Int32(rocdl.readfirstlane(T.i32, cm._raw(tid // fx.Int32(64))))
+        wave_all = fx.Int32(rocdl.readfirstlane(T.i32, cm._raw(tid // fx.Int32(64))))
+        wave = wave_all % fx.Int32(4)
+        rb = (wave_all // fx.Int32(4)) * fx.Int32(MT * 16)
         nblk = fx.Int32(gpu.block_id("x"))
         mblk = fx.Int32(gpu.block_id("y"))
         if const_expr(XCD):
@@ -374,19 +492,35 @@ def _build_stage1(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base = fx.Int32(fx.ptrtoint(lds.buf.ptr))
         if const_expr(DIRECT):
-            e, cond = _direct_prologue(
-                lds_base,
-                tid,
-                nblk,
-                mblk,
-                i32_tokens,
-                arg_tids,
-                arg_tw,
-                arg_zero,
-                arg_stids,
-                arg_eids,
-                arg_nvalid,
-            )
+            if const_expr(CORE_GROUP):
+                e, cond = _core_group_prologue(
+                    lds_base,
+                    lds.gr.ptr,
+                    tid,
+                    nblk,
+                    mblk,
+                    i32_tokens,
+                    arg_tids,
+                    arg_tw,
+                    arg_zero,
+                    arg_stids,
+                    arg_eids,
+                    arg_nvalid,
+                )
+            else:
+                e, cond = _direct_prologue(
+                    lds_base,
+                    tid,
+                    nblk,
+                    mblk,
+                    i32_tokens,
+                    arg_tids,
+                    arg_tw,
+                    arg_zero,
+                    arg_stids,
+                    arg_eids,
+                    arg_nvalid,
+                )
         else:
             nvalid = cm.global_ptr(arg_nvalid, T.i32)[0]
             cond = m_row < nvalid
@@ -407,6 +541,16 @@ def _build_stage1(
                 t = packed & fx.Int32(0xFFFFFF)
                 return (t < i32_tokens).select(t, fx.Int32(0))
 
+            if const_expr(not DIRECT):
+                # The tile's token ids in one coalesced load through LDS: per-lane
+                # loads of the rows a lane needs come out serialized.
+                r_own = tid & fx.Int32(BM - 1)
+                fx.ptr_store(
+                    safe_tok(stids[m_row + r_own]),
+                    _lds_i32(lds_base, fx.Int32(tk_off) + r_own * fx.Int32(4)),
+                )
+                gpu.barrier()
+
             # Token ids of the MFMA A rows (one per token tile) and of the rows this
             # thread stages into LDS.
             def row_token(r):
@@ -422,12 +566,15 @@ def _build_stage1(
                         result_type=fx.Int32,
                     )
                     return (u >= fx.Int32(0)).select(u, fx.Int32(0)) // fx.Int32(TOPK)
-                return safe_tok(stids[m_row + r])
+                return _lds_ld(lds_base, fx.Int32(tk_off) + r * fx.Int32(4))
 
             mfma_tok = (
                 []
                 if INLINE
-                else [row_token(fx.Int32(j * 16) + lane16) for j in range_constexpr(MT)]
+                else [
+                    row_token(rb + fx.Int32(j * 16) + lane16)
+                    for j in range_constexpr(MT)
+                ]
             )
             a_row_in_pass = tid // fx.Int32(NCH)
             a_chunk = tid % fx.Int32(NCH)
@@ -439,16 +586,22 @@ def _build_stage1(
             ]
             stage_tok = [] if INLINE else [row_token(r) for r in stage_rows]
 
+            # Buffer loads: the K tile offset rides in the descriptor, so the lane
+            # offsets (32-bit) are the only per-tile state kept across the
+            # unrolled loop.
+            a_lane_dw = (
+                []
+                if INLINE
+                else [
+                    t * fx.Int32(A_ROW // 4) + a_chunk * fx.Int32(4) for t in stage_tok
+                ]
+            )
+
             def load_a_tile(kt):
-                regs = []
-                for p in range_constexpr(a_passes):
-                    off = (
-                        fx.Int64(stage_tok[p]) * fx.Int64(A_ROW)
-                        + fx.Int64(kt * TILE_RB)
-                        + fx.Int64(a_chunk * fx.Int32(16))
-                    )
-                    regs.append(cm.global_vec_load(arg_aq, off, 4))
-                return regs
+                return [
+                    cm.buffer_load16(arg_aq, fx.Int32(kt * TILE_RB // 4), a_lane_dw[p])
+                    for p in range_constexpr(a_passes)
+                ]
 
             def store_a_tile(regs, slot):
                 for p in range_constexpr(a_passes):
@@ -459,7 +612,7 @@ def _build_stage1(
                     fx.ptr_store(regs[p], ptr)
 
             def read_a_frag(slot, j, ks):
-                row = fx.Int32(j * 16) + lane16
+                row = rb + fx.Int32(j * 16) + lane16
                 base = fx.Int32(slot * a_lds_bytes) + row * fx.Int32(TILE_RB)
                 rmask = row & fx.Int32(NCH - 1)
                 if const_expr(a_f8):
@@ -531,19 +684,20 @@ def _build_stage1(
                 sc_row = [(e_tile0 + t) // fx.Int32(2) for t in tiles]
                 sc_shift = [(t & fx.Int32(1)) * fx.Int32(8) for t in tiles]
 
+            w_lane_dw = lane * fx.Int32(4)
+            w_lane_hi = w_lane_dw + fx.Int32(256)
+
             def load_w(kt):
+                # Every K offset is wave-uniform and rides in the descriptor; the
+                # lane offsets are the same two registers for all K tiles.
                 frags = []
                 for t in range_constexpr(NT):
                     per_ks = []
                     for ks in range_constexpr(2):
-                        ldw = lane * fx.Int32(4) + fx.Int32(
-                            (2 * kt + ks) * W_KSTEP // 4
-                        )
-                        v = cm.buffer_load16(arg_w, w_base_dw[t], ldw, nt)
+                        base = w_base_dw[t] + fx.Int32((2 * kt + ks) * W_KSTEP // 4)
+                        v = cm.buffer_load16(arg_w, base, w_lane_dw, nt)
                         if const_expr(w_f8):
-                            hi = cm.buffer_load16(
-                                arg_w, w_base_dw[t], ldw + fx.Int32(256), nt
-                            )
+                            hi = cm.buffer_load16(arg_w, base, w_lane_hi, nt)
                             v = v.shuffle(hi, list(range(8)))
                         f = fx.make_rmem_tensor(W_NDW, fx.Int32)
                         f.store(v)
@@ -551,16 +705,26 @@ def _build_stage1(
                     frags.append(per_ks)
                 scales = []
                 for q in range_constexpr(len(sc_row)):
-                    off = (
-                        fx.Int64(sc_row[q]) * fx.Int64(GP8 * 32)
-                        + fx.Int64(kt * 256)
-                        + fx.Int64(lane * fx.Int32(4))
+                    v = cm.buffer_load4(
+                        arg_ws,
+                        scale_offset_mfma(
+                            sc_row[q] * fx.Int32(32), fx.Int32(kt * 8), GP8
+                        )
+                        // fx.Int32(4),
+                        lane,
                     )
-                    v = cm.global_vec_load(arg_ws, off, 1)
                     if const_expr(sc_shift[q] is not None):
                         v = v.shrui(sc_shift[q])
                     scales.append(v)
                 return frags, scales
+
+            as_lane_dw = (
+                []
+                if INLINE
+                else [
+                    t * fx.Int32(GP // 4) + lgrp * fx.Int32(GQ // 4) for t in mfma_tok
+                ]
+            )
 
             def load_a_scales(kt):
                 if const_expr(INLINE):
@@ -580,13 +744,7 @@ def _build_stage1(
                         for j in range_constexpr(MT)
                     ]
                 return [
-                    cm.global_vec_load(
-                        arg_as,
-                        fx.Int64(mfma_tok[j]) * fx.Int64(GP)
-                        + fx.Int64(lgrp * fx.Int32(GQ))
-                        + fx.Int64(4 * (kt // 2)),
-                        1,
-                    )
+                    cm.buffer_load4(arg_as, fx.Int32(kt // 2), as_lane_dw[j])
                     for j in range_constexpr(MT)
                 ]
 
@@ -658,6 +816,10 @@ def _build_stage1(
                             scale_a=a_sc[j],
                             scale_b=wsc[pair_of[t]],
                         )
+                    if const_expr(SCHED_PIN):
+                        # Keep each step's LDS reads next to its MFMAs: hoisted
+                        # reads of a whole K tile do not fit two waves per SIMD.
+                        rocdl.sched_barrier(0)
                 if const_expr(not A_RESIDENT):
                     if const_expr(kt + 1 < KT):
                         store_a_tile(a_pend.pop(kt + 1), 1 - slot)
@@ -690,7 +852,7 @@ def _build_stage1(
                         swiglu_limit=limit,
                     )
                     for i in range_constexpr(4):
-                        row = fx.Int32(j * 16) + lgrp * fx.Int32(4) + fx.Int32(i)
+                        row = rb + fx.Int32(j * 16) + lgrp * fx.Int32(4) + fx.Int32(i)
                         off = row * fx.Int32(acc_stride) + col * fx.Int32(4)
                         fx.ptr_store(
                             res[i],
@@ -700,7 +862,7 @@ def _build_stage1(
 
             # Epilogue 2: group-32 MX quant of 8 columns per thread, quads reduce amax.
             CPR = BNH // 8
-            RPP = 256 // CPR
+            RPP = NTHR // CPR
             prow = tid // fx.Int32(CPR)
             chunk = tid % fx.Int32(CPR)
             sp = cm.global_ptr(arg_out_scale, fx.Int8.ir_type, 1)
@@ -758,15 +920,7 @@ def _build_stage1(
                         )
                     if (chunk & fx.Int32(3)) == fx.Int32(0):
                         grp = gcol // fx.Int32(32)
-                        soff = (
-                            (srow // fx.Int32(32)) * fx.Int32(OGP8 * 32)
-                            + (grp // fx.Int32(8)) * fx.Int32(256)
-                            + (grp & fx.Int32(3)) * fx.Int32(64)
-                            + (srow & fx.Int32(15)) * fx.Int32(4)
-                            + ((grp & fx.Int32(7)) // fx.Int32(4)) * fx.Int32(2)
-                            + ((srow & fx.Int32(31)) // fx.Int32(16))
-                        )
-                        sp[soff] = fx.Int8(e8)
+                        sp[scale_offset_mfma(srow, grp, OGP8)] = fx.Int8(e8)
 
     @flyc.jit
     def launch_mx_stage1(
@@ -808,7 +962,7 @@ def _build_stage1(
             i32_hstride,
         ).launch(
             grid=(NX, fx.Int64(i32_m_blocks), 1),
-            block=(256, 1, 1),
+            block=(NTHR, 1, 1),
             stream=stream,
         )
 

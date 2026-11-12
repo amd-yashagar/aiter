@@ -12,10 +12,9 @@ Layouts (host and device agree on these):
   token t, group g sits at byte t * GP + (g % 4) * (GP // 4) + g // 4, with GP the
   group count padded to 16. A lane holding K group (4 * k + j) of a 16x16x128 MFMA
   step k reads one dword per four steps.
-- intermediate scales ("mfma_native", written by stage 1, read by stage 2): aiter's
-  e8m0_shuffle order over sorted rows, byte (r, g) at
-  (r // 32) * GP8 * 32 + (g // 8) * 256 + (g % 4) * 64 + (r % 16) * 4
-  + ((g % 8) // 4) * 2 + (r % 32) // 16, GP8 = groups padded to 8.
+- intermediate and weight scales: core's ``mfma_native`` order (aiter's e8m0_shuffle
+  over sorted rows, ``core.intermediate.scale_offset_mfma``); stage 2 reads one dword
+  per lane of a 32-row by 8-group block.
 """
 
 import flydsl.expr as fx
@@ -157,6 +156,19 @@ def buffer_load16(addr_i64, base_dw, lane_dw, nt=False):
     frag = fx.make_rmem_tensor(4, fx.Int32)
     fx.copy(atom, view[lane_dw, None], frag)
     return fx.Vector(frag.load())
+
+
+def buffer_load4(addr_i64, base_dw, lane_dw):
+    """One dword per lane by buffer load (wave-uniform dword base in the descriptor)."""
+    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import flat_buffer_view
+
+    view = flat_buffer_view(
+        addr_i64, _raw(base_dw), T.i32, align=4, elem_bytes=4, fold=True
+    )
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 32)
+    frag = fx.make_rmem_tensor(1, fx.Int32)
+    fx.copy(atom, view[lane_dw, None], frag)
+    return fx.Vector(frag.load())[0]
 
 
 def xcd_tile(bx, by, nx):
