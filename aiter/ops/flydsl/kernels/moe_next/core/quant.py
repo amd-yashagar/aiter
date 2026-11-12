@@ -18,7 +18,9 @@ by the hardware scaled conversion, as aiter's per_1x32_mx_quant_hip; scales
 lane-native (quant_mx_block).
 
 per_tensor_fp8 (static, a given scale): as aiter's static_per_tensor_quant,
-q = cvt_pk_fp8_f32(med3(x * rcp(scale), -fp8_max, fp8_max)).
+q = cvt_pk_fp8_f32(med3(x * rcp(scale), -fp8_max, fp8_max)). Dynamic (no
+scale, aiter's dynamic_per_tensor_quant) takes two passes: partial amaxes
+(amax_partial_block), then the scale and the quant (quant_dynamic_tensor_block).
 
 The helpers take a workgroup-relative block index, so a quant pass can run as
 standalone kernels or in extra workgroups of the sort launch.
@@ -124,7 +126,6 @@ def quant_token_block(x_it, q_it, s_it, red, row, n_rows, cols, fp8_max):
     """One token row per workgroup: 8 columns per thread per pass, max over the
     row through wave shuffles and ``red`` (WAVES floats of LDS)."""
     tid = gpu.thread_idx.x
-    lane, wave = tid % fx.Int32(WAVE), tid // fx.Int32(WAVE)
     live = row < n_rows
     passes = -(-cols // (BLOCK * 8))
     vals, cols_at = [], []
@@ -138,16 +139,7 @@ def quant_token_block(x_it, q_it, s_it, red, row, n_rows, cols, fp8_max):
         amax = _absmax(x, amax)
         vals.append(x)
         cols_at.append((ok, elem))
-    for sh in range_constexpr(6):
-        other = _fshuffle_xor(amax, 1 << sh, WAVE)
-        amax = (other > amax).select(other, amax)
-    gpu.barrier()
-    fx.ptr_store(amax, red + fx.Int64((lane == fx.Int32(0)).select(wave, fx.Int32(4))))
-    gpu.barrier()
-    amax = fx.ptr_load(red)
-    for w in range_constexpr(1, BLOCK // WAVE):
-        other = fx.ptr_load(red + fx.Int64(w))
-        amax = (other > amax).select(other, amax)
+    amax = _block_max(amax, red)
     scale = amax * fx.Float32(1.0 / fp8_max)
     inv = fx.Float32(rocdl.rcp(T.f32, _raw(scale)))
     for p in range_constexpr(passes):
@@ -161,14 +153,28 @@ def quant_token_block(x_it, q_it, s_it, red, row, n_rows, cols, fp8_max):
     fx.ptr_store(scale, s_it + fx.Int64(s))
 
 
+def _block_max(amax, red):
+    """Max of a per-thread f32 over the workgroup, through wave shuffles and
+    ``red`` (WAVES floats of LDS); every thread gets it."""
+    tid = gpu.thread_idx.x
+    lane, wave = tid % fx.Int32(WAVE), tid // fx.Int32(WAVE)
+    for sh in range_constexpr(6):
+        other = _fshuffle_xor(amax, 1 << sh, WAVE)
+        amax = (other > amax).select(other, amax)
+    gpu.barrier()
+    fx.ptr_store(amax, red + fx.Int64((lane == fx.Int32(0)).select(wave, fx.Int32(4))))
+    gpu.barrier()
+    amax = fx.ptr_load(red)
+    for w in range_constexpr(1, BLOCK // WAVE):
+        other = fx.ptr_load(red + fx.Int64(w))
+        amax = (other > amax).select(other, amax)
+    return amax
+
+
 @flyc.jit
-def quant_static_block(x_it, q_it, s_it, blk, n_rows, cols, fp8_max):
-    """Static per-tensor fp8 (aiter's static_per_tensor_quant): q =
-    cvt(med3(x * rcp(scale[0]))), 8 columns per thread, 2048 per workgroup
-    from element blk * 2048, over the first n_rows token rows."""
+def _quant_tensor_elems(x_it, q_it, blk, n_rows, cols, inv, fp8_max):
     elem = (blk * fx.Int32(BLOCK) + gpu.thread_idx.x) * fx.Int32(8)
     live = elem < n_rows * fx.Int32(cols)
-    inv = fx.Float32(rocdl.rcp(T.f32, _raw(fx.ptr_load(s_it))))
     x = _bf16x8_f32(_load8(x_it, live.select(elem, fx.Int32(0))))
     d0 = _fp8x4(x[0:4], inv, fp8_max)
     d1 = _fp8x4(x[4:8], inv, fp8_max)
@@ -176,6 +182,182 @@ def quant_static_block(x_it, q_it, s_it, blk, n_rows, cols, fp8_max):
         q = elem >> fx.Int32(2)
         fx.ptr_store(d0, q_it + fx.Int64(q))
         fx.ptr_store(d1, q_it + fx.Int64(q + fx.Int32(1)))
+
+
+@flyc.jit
+def quant_static_block(x_it, q_it, s_it, blk, n_rows, cols, fp8_max):
+    """Static per-tensor fp8 (aiter's static_per_tensor_quant): q =
+    cvt(med3(x * rcp(scale[0]))), 8 columns per thread, 2048 per workgroup
+    from element blk * 2048, over the first n_rows token rows."""
+    inv = fx.Float32(rocdl.rcp(T.f32, _raw(fx.ptr_load(s_it))))
+    _quant_tensor_elems(x_it, q_it, blk, n_rows, cols, inv, fp8_max)
+
+
+# Dynamic per-tensor in one one-shot workgroup up to this M x K (register-
+# resident; measured on MI300X: <= 5.0 us against 5.9-6.3 for one-shot + a
+# quant launch; a 64K build is slower at every size).
+SINGLE_WG_ELEMS = 1 << 15
+
+
+def _block_max_bits(bits, red):
+    """Signed int max of per-thread float bits over the workgroup (aiter's
+    atomicMaxFloat for values >= 0); every thread gets it, as an f32."""
+    tid = gpu.thread_idx.x
+    lane, wave = tid % fx.Int32(WAVE), tid // fx.Int32(WAVE)
+    for sh in range_constexpr(6):
+        other = bits.shuffle_xor(fx.Int32(1 << sh), fx.Int32(WAVE))
+        bits = (other > bits).select(other, bits)
+    gpu.barrier()
+    fx.ptr_store(
+        bits.bitcast(fx.Float32),
+        red + fx.Int64((lane == fx.Int32(0)).select(wave, fx.Int32(4))),
+    )
+    gpu.barrier()
+    bits = fx.ptr_load(red).bitcast(fx.Int32)
+    for w in range_constexpr(1, BLOCK // WAVE):
+        other = fx.ptr_load(red + fx.Int64(w)).bitcast(fx.Int32)
+        bits = (other > bits).select(other, bits)
+    return bits.bitcast(fx.Float32)
+
+
+@flyc.jit
+def _amax_strided(x_it, red, first, n, step):
+    """max |x| (from 0, NaN skipped, as aiter's per-row fmaxf) over the
+    2048-element blocks first, first + step, ... of the first n elements."""
+    tid = gpu.thread_idx.x
+    blk_elems = fx.Int32(BLOCK * 8)
+    n_blocks = (n + blk_elems - fx.Int32(1)) // blk_elems
+    left = n_blocks - first
+    iters = (left > fx.Int32(0)).select(
+        (left + step - fx.Int32(1)) // step, fx.Int32(0)
+    )
+    amax = fx.Float32(0.0)
+    for j in range(fx.Int32(0), iters, fx.Int32(1)):
+        elem = (first + fx.Int32(j) * step) * blk_elems + tid * fx.Int32(8)
+        ok = elem < n
+        x = _bf16x8_f32(_load8(x_it, ok.select(elem, fx.Int32(0))))
+        amax = _absmax([ok.select(v, fx.Float32(0.0)) for v in x], amax)
+    return _block_max_bits(amax.bitcast(fx.Int32), red)
+
+
+@flyc.jit
+def amax_partial_block(x_it, p_it, red, blk, n_rows, cols, n_part):
+    """Dynamic per-tensor, pass 1: workgroup ``blk`` of ``n_part`` writes the
+    max |x| of its blocks of the first n_rows rows to p_it[blk] (int32 view of
+    the float bits). Every slot is written every call: no initialised state."""
+    amax = _amax_strided(x_it, red, blk, n_rows * fx.Int32(cols), n_part)
+    if gpu.thread_idx.x == fx.Int32(0):
+        fx.ptr_store(amax.bitcast(fx.Int32), p_it + fx.Int64(blk))
+
+
+@flyc.jit
+def quant_dynamic_tensor_block(
+    x_it, q_it, s_it, p_it, red, blk, n_rows, cols, n_part, fp8_max
+):
+    """Dynamic per-tensor, pass 2: scale = max(partials) * float(1 / fp8_max),
+    combined on the float bits as aiter's atomicMaxFloat. It equals aiter's max
+    over rows of row_amax * float(1 / fp8_max): the product rounds
+    monotonically. Workgroup 0 writes it to s_it[0]; then quantize as the
+    static mode."""
+    tid = gpu.thread_idx.x
+    v = fx.ptr_load(p_it + fx.Int64((tid < n_part).select(tid, fx.Int32(0))))
+    amax = _block_max_bits((tid < n_part).select(v, fx.Int32(0)), red)
+    scale = amax * fx.Float32(1.0 / fp8_max)
+    if (blk == fx.Int32(0)) & (tid == fx.Int32(0)):
+        fx.ptr_store(scale, s_it)
+    inv = fx.Float32(rocdl.rcp(T.f32, _raw(scale)))
+    _quant_tensor_elems(x_it, q_it, blk, n_rows, cols, inv, fp8_max)
+
+
+@flyc.jit
+def quant_dynamic_tensor_single(x_it, q_it, s_it, red, n_rows, cols, fp8_max):
+    """Dynamic per-tensor in one workgroup, M x K <= SINGLE_WG_ELEMS: one
+    register-resident load, the amax, then the quant from registers."""
+    tid = gpu.thread_idx.x
+    n = n_rows * fx.Int32(cols)
+    vals, at = [], []
+    amax = fx.Float32(0.0)
+    for b in range_constexpr(SINGLE_WG_ELEMS // (BLOCK * 8)):
+        elem = fx.Int32(b * BLOCK * 8) + tid * fx.Int32(8)
+        ok = elem < n
+        x = _bf16x8_f32(_load8(x_it, ok.select(elem, fx.Int32(0))))
+        amax = _absmax([ok.select(v, fx.Float32(0.0)) for v in x], amax)
+        vals.append(x)
+        at.append((ok, elem))
+    amax = _block_max_bits(amax.bitcast(fx.Int32), red)
+    scale = amax * fx.Float32(1.0 / fp8_max)
+    if tid == fx.Int32(0):
+        fx.ptr_store(scale, s_it)
+    inv = fx.Float32(rocdl.rcp(T.f32, _raw(scale)))
+    for b in range_constexpr(SINGLE_WG_ELEMS // (BLOCK * 8)):
+        ok, elem = at[b]
+        d0 = _fp8x4(vals[b][0:4], inv, fp8_max)
+        d1 = _fp8x4(vals[b][4:8], inv, fp8_max)
+        if ok:
+            q = elem >> fx.Int32(2)
+            fx.ptr_store(d0, q_it + fx.Int64(q))
+            fx.ptr_store(d1, q_it + fx.Int64(q + fx.Int32(1)))
+
+
+@functools.lru_cache(maxsize=64)
+def build_tensor_quant(cols, fp8_max, has_local):
+    """Dynamic per-tensor pass 2 as its own launch, after a one-shot sort
+    whose extra workgroups wrote the partial amaxes."""
+
+    @fx.struct
+    class Lds:
+        red: fx.Array[fx.Float32, 8, 16]
+
+    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    def tensor_quant_kernel(
+        x: fx.Tensor,
+        q: fx.Tensor,
+        s: fx.Tensor,
+        p: fx.Tensor,
+        ltok: fx.Tensor,
+        m_cap: fx.Int32,
+        n_part: fx.Int32,
+    ):
+        lds = fx.SharedAllocator().allocate(Lds).peek()
+        rows = m_cap
+        if has_local:
+            t = fx.ptr_load(_it(ltok) + fx.Int64(0))
+            rows = (t < m_cap).select(t, m_cap)
+        quant_dynamic_tensor_block(
+            _it(x),
+            _it(q),
+            _it(s),
+            _it(p),
+            lds.red.ptr,
+            gpu.block_idx.x,
+            rows,
+            cols,
+            n_part,
+            fp8_max,
+        )
+
+    @flyc.jit
+    def launch(
+        x: fx.Tensor,
+        q: fx.Tensor,
+        s: fx.Tensor,
+        p: fx.Tensor,
+        ltok: fx.Tensor,
+        m_cap: fx.Int32,
+        n_part: fx.Int32,
+        grid: fx.Int32,
+        stream: fx.Stream = None,
+    ):
+        tensor_quant_kernel(x, q, s, p, ltok, m_cap, n_part).launch(
+            grid=(grid, 1, 1), block=(BLOCK, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+def tensor_partials(m, cols):
+    """Partial-amax workgroups of a dynamic per-tensor pass (at most BLOCK)."""
+    return max(1, min(BLOCK, -(-(m * cols) // (BLOCK * 8))))
 
 
 def _e8m0_round_up(amax, max_pos):

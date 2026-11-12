@@ -312,6 +312,119 @@ def test_mx_index():
     return rows_out
 
 
+def _dyn_input(token, K, seed, kind, local):
+    x = _quant_input(token, K, seed)
+    if kind == "zero":
+        x.zero_()
+    elif kind == "nan" and token > 2:
+        x[2] = float("nan")
+    elif kind == "inf" and token > 3:
+        x[3, :5] = float("inf")
+    if local is not None:
+        x[local:] = 3e38  # past num_local_tokens: must not reach the scale
+    return x
+
+
+def _check_dynamic_tensor(tm, x, rows):
+    rq, rs = aiter.get_hip_quant(QuantType.per_Tensor)(
+        x[:rows].contiguous(), quant_dtype=dtypes.fp8
+    )
+    bad = []
+    if not torch.equal(tm.a_q[:rows].view(torch.uint8), rq.view(torch.uint8)):
+        bad.append("a_q")
+    if not torch.equal(tm.a_scale.view(torch.int32), rs.view(torch.int32)):
+        bad.append(f"a_scale {tm.a_scale.item()} vs {rs.item()}")
+    return bad
+
+
+def _dyn_path(token, topk, K):
+    from aiter.ops.flydsl.kernels.moe_next.core.quant import SINGLE_WG_ELEMS
+
+    if token * topk > 2048:
+        return "count + scatter"
+    if token * K <= SINGLE_WG_ELEMS:
+        return "one workgroup"
+    return "one-shot + quant launch"
+
+
+def test_dynamic_tensor():
+    """Dynamic per-tensor fp8 against aiter's dynamic_per_tensor_quant (on the
+    rows below num_local_tokens; aiter's op takes no row count): the three
+    paths (one workgroup in the one-shot launch, one-shot plus a quant launch,
+    count plus scatter) and their boundaries, NaN and inf rows,
+    all-zero input (scale 0, NaN outputs), huge rows past num_local_tokens,
+    and graph replay."""
+    rows_out = []
+    cases = [
+        (8, 256, 8, 7168, None, "plain"),
+        (8, 64, 8, 4096, None, "plain"),  # M x K = SINGLE_WG_ELEMS (32K)
+        (8, 64, 8, 4104, None, "plain"),  # 32K + 64, the next size (K % 8)
+        (8, 64, 8, 4096, None, "nan"),
+        (8, 64, 8, 4096, None, "inf"),
+        (8, 64, 8, 4096, None, "zero"),
+        (8, 64, 8, 8192, None, "plain"),
+        (256, 64, 8, 7168, None, "plain"),  # last one-shot route count
+        (257, 64, 8, 7168, None, "plain"),  # first count + scatter
+        (4, 64, 4, 2048, 2, "plain"),
+        (8, 256, 8, 7168, None, "nan"),
+        (8, 256, 8, 7168, None, "inf"),
+        (8, 256, 8, 7168, None, "zero"),
+        (200, 128, 8, 4096, 150, "plain"),
+        (200, 128, 8, 4096, 150, "nan"),
+        (3000, 256, 8, 7168, None, "plain"),
+        (3000, 256, 8, 7168, None, "zero"),
+        (2050, 385, 7, 2048, 2000, "inf"),
+    ]
+    for token, E, topk, K, local, kind in cases:
+        ti, tw, _ = routing(token, E, topk)
+        x = _dyn_input(token, K, token, kind, local)
+        nl = torch.tensor([local], dtype=torch.int32) if local is not None else None
+        out_a = torch.full((token, 1024), 3.0, dtype=dtypes.bf16)
+        out_b = out_a.clone()
+        kw = {"num_experts": E, "tile_m": 32, "num_local_tokens": nl}
+        a = route_to_tiles(
+            ti, tw, zero_output=out_a, quant_input=x, quant_mode="per_tensor_fp8", **kw
+        )
+        b = reference_tile_map(ti, tw, zero_output=out_b, **kw)
+        rows = token if local is None else local
+        bad = compare(a, b, 32, out_a, out_b) + _check_dynamic_tensor(a, x, rows)
+        assert not bad, f"dynamic per-tensor M={token} K={K} {kind}: {bad}"
+        rows_out.append(
+            {
+                "token": token,
+                "K": K,
+                "local": local,
+                "input": kind,
+                "path": _dyn_path(token, topk, K),
+                "exact": True,
+            }
+        )
+    for token, K in [(8, 4096), (8, 7168), (512, 7168)]:
+        ti, tw, _ = routing(token, 256, 8)
+        x = _dyn_input(token, K, 1, "plain", None)
+        kw = {"num_experts": 256, "tile_m": 32, "quant_input": x}
+        route_to_tiles(ti, tw, quant_mode="per_tensor_fp8", **kw)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            tm = route_to_tiles(ti, tw, quant_mode="per_tensor_fp8", **kw)
+        x.copy_(_dyn_input(token, K, 9, "nan", None) * 7)
+        g.replay()
+        torch.cuda.synchronize()
+        bad = _check_dynamic_tensor(tm, x, token)
+        assert not bad, f"dynamic per-tensor graph replay M={token}: {bad}"
+        rows_out.append(
+            {
+                "token": token,
+                "K": K,
+                "local": None,
+                "input": "graph replay, new x",
+                "path": _dyn_path(token, 8, K),
+                "exact": True,
+            }
+        )
+    return rows_out
+
+
 def test_fused_quant():
     """Activation quant fused into the sort launch, bit-exact with aiter's
     quant op for each mode, on the one-shot and two-launch paths, and with the
@@ -560,6 +673,10 @@ def main():
     )
     aiter.logger.info(
         "fused quant:\n%s", pd.DataFrame(test_fused_quant()).to_markdown(index=False)
+    )
+    aiter.logger.info(
+        "dynamic per-tensor:\n%s",
+        pd.DataFrame(test_dynamic_tensor()).to_markdown(index=False),
     )
     aiter.logger.info(
         "MX addressing:\n%s", pd.DataFrame(test_mx_index()).to_markdown(index=False)

@@ -36,7 +36,10 @@ from flydsl.expr.typing import T
 
 from .quant import (
     MX_MODES,
+    amax_partial_block,
     quant_1x128_block,
+    quant_dynamic_tensor_block,
+    quant_dynamic_tensor_single,
     quant_mx_block,
     quant_static_block,
     quant_token_block,
@@ -674,7 +677,10 @@ def build(
     ``with_loc`` also writes loc_ids (each route's sorted row). ``quant`` =
     (mode, cols, fp8_max) adds workgroups that quantize the token rows (see
     quant.py): in the one-shot launch after workgroup 0, in the count launch
-    after the chunk workgroups."""
+    after the chunk workgroups. Dynamic per-tensor (``per_tensor_fp8_dynamic``)
+    writes partial amaxes there and quantizes in the scatter launch, after its
+    chunk workgroups (after a one-shot launch: in quant.build_tensor_quant's);
+    ``per_tensor_fp8_single`` does both passes in one one-shot workgroup."""
     E = num_experts
     key_bits = max(1, (E - 1).bit_length())
     ept = -(-E // BLOCK)  # experts per thread in the expert scan
@@ -691,10 +697,21 @@ def build(
         scan: fx.Array[fx.Int32, 2 * WAVES + 1, 16]
         red: fx.Array[fx.Float32, 8, 16]
 
-    def run_quant(lds, qx, qq, qs, blk, tokens, m_cap):
+    dyn_tensor = quant is not None and quant[0] == "per_tensor_fp8_dynamic"
+
+    def run_quant(lds, qx, qq, qs, blk, tokens, m_cap, n_part=None):
+        """The quant workgroups of the one-shot or count launch. Dynamic
+        per-tensor: partial amaxes into qs here (the scatter launch
+        quantizes), or both passes in one workgroup (``_single``)."""
         mode, cols, fp8_max = quant
         rows = (tokens < m_cap).select(tokens, m_cap)
-        if mode == "per_1x128_fp8":
+        if mode == "per_tensor_fp8_dynamic":
+            amax_partial_block(_it(qx), _it(qs), lds.red.ptr, blk, rows, cols, n_part)
+        elif mode == "per_tensor_fp8_single":
+            quant_dynamic_tensor_single(
+                _it(qx), _it(qq), _it(qs), lds.red.ptr, rows, cols, fp8_max
+            )
+        elif mode == "per_1x128_fp8":
             quant_1x128_block(
                 _it(qx), _it(qq), _it(qs), blk, rows * fx.Int32(cols // 128), fp8_max
             )
@@ -746,7 +763,7 @@ def build(
         if bid != c0:
             if quant is not None:  # noqa: SIM102 - trace-time test, then a device one
                 if bid <= qw:
-                    run_quant(lds, qx, qq, qs, bid - c1, tokens, m_cap)
+                    run_quant(lds, qx, qq, qs, bid - c1, tokens, m_cap, qw)
             if bid > qw:
                 _zero_fill(
                     _it(zbuf),
@@ -838,7 +855,7 @@ def build(
             _store_counts(hist, _it(counts), tid, bid, E, e_cap)
         if quant is not None:  # noqa: SIM102 - trace-time test, then a device one
             if (bid >= n_chunks) & (bid < n_chunks + qw):
-                run_quant(lds, qx, qq, qs, bid - n_chunks, tokens, m_cap)
+                run_quant(lds, qx, qq, qs, bid - n_chunks, tokens, m_cap, qw)
         if row_v4 > fx.Int32(0):
             _zero_fill(
                 _it(zbuf),
@@ -862,28 +879,51 @@ def build(
         ltok: fx.Tensor,
         counts: fx.Tensor,
         zbuf: fx.Tensor,
+        qx: fx.Tensor,
+        qq: fx.Tensor,
+        qs: fx.Tensor,
+        qp: fx.Tensor,
         m_cap: fx.Int32,
         chunk: fx.Int32,
         n_chunks: fx.Int32,
         row_v4: fx.Int32,
+        qw: fx.Int32,
+        n_part: fx.Int32,
     ):
-        """Workgroups below n_chunks scatter a chunk each; the rest zero-fill
-        the output, overlapping the scatter."""
+        """Workgroups below n_chunks scatter a chunk each; the next qw
+        quantize (dynamic per-tensor, from the count launch's n_part partial
+        amaxes in qp); the rest zero-fill the output, overlapping the scatter."""
         bid = gpu.block_idx.x
         tid = gpu.thread_idx.x
+        lds = fx.SharedAllocator().allocate(Lds).peek()
         tokens0 = m_cap
         if has_local:
             tokens0 = _ld(_it(ltok), fx.Int32(0))
-        if bid >= n_chunks:
+        if dyn_tensor:  # noqa: SIM102 - trace-time test, then a device one
+            if (bid >= n_chunks) & (bid < n_chunks + qw):
+                _, cols, fp8_max = quant
+                rows = (tokens0 < m_cap).select(tokens0, m_cap)
+                quant_dynamic_tensor_block(
+                    _it(qx),
+                    _it(qq),
+                    _it(qs),
+                    _it(qp),
+                    lds.red.ptr,
+                    bid - n_chunks,
+                    rows,
+                    cols,
+                    n_part,
+                    fp8_max,
+                )
+        if bid >= n_chunks + qw:
             _zero_fill(
                 _it(zbuf),
-                (bid - n_chunks) * fx.Int32(BLOCK) + tid,
-                (gpu.grid_dim.x - n_chunks) * fx.Int32(BLOCK),
+                (bid - n_chunks - qw) * fx.Int32(BLOCK) + tid,
+                (gpu.grid_dim.x - n_chunks - qw) * fx.Int32(BLOCK),
                 _zero_rows(tokens0, m_cap) * row_v4,
             )
         if bid < n_chunks:
             c0 = fx.Int32(0)
-            lds = fx.SharedAllocator().allocate(Lds).peek()
             hist, run, local, start = (
                 lds.hist.ptr,
                 lds.run.ptr,
@@ -1057,10 +1097,16 @@ def build(
         ltok: fx.Tensor,
         counts: fx.Tensor,
         zbuf: fx.Tensor,
+        qx: fx.Tensor,
+        qq: fx.Tensor,
+        qs: fx.Tensor,
+        qp: fx.Tensor,
         m_cap: fx.Int32,
         chunk: fx.Int32,
         n_chunks: fx.Int32,
         row_v4: fx.Int32,
+        qw: fx.Int32,
+        n_part: fx.Int32,
         grid: fx.Int32,
         stream: fx.Stream = None,
     ):
@@ -1078,10 +1124,16 @@ def build(
             ltok,
             counts,
             zbuf,
+            qx,
+            qq,
+            qs,
+            qp,
             m_cap,
             chunk,
             n_chunks,
             row_v4,
+            qw,
+            n_part,
         ).launch(grid=(grid, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     return launch_oneshot, launch_count, launch_scatter

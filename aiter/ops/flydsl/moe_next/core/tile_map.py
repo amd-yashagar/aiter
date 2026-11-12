@@ -190,11 +190,15 @@ def route_to_tiles(
     )
     if with_loc_ids:
         tm.loc_ids = torch.empty((m, topk), dtype=torch.int32, device=dev)
-    quant, qw = None, 0
+    quant, qw, dyn = None, 0, None
     qx = qq = qs = _empty_i32(dev)
     if quant_mode is not None:
         from aiter.jit.utils.chip_info import get_gfx_runtime
-        from aiter.ops.flydsl.kernels.moe_next.core.quant import blocks
+        from aiter.ops.flydsl.kernels.moe_next.core.quant import (
+            SINGLE_WG_ELEMS,
+            blocks,
+            tensor_partials,
+        )
 
         if quant_mode not in QUANT_MODES:
             raise ValueError(f"quant_mode must be one of {sorted(QUANT_MODES)}")
@@ -214,14 +218,19 @@ def route_to_tiles(
                 f"quant_input must be contiguous bf16 [M, K], K % {mult} == 0"
             )
         tm.a_q, tm.a_scale, qq, qs, fp8_max = _quant_buffers(quant_mode, m, k, dev)
-        if quant_mode == "per_tensor_fp8":
-            if quant_scale is None:
-                raise NotImplementedError("per_tensor_fp8 needs a static quant_scale")
+        quant = (quant_mode, k, fp8_max)
+        qw = blocks(quant_mode, m, k)
+        if quant_mode == "per_tensor_fp8" and quant_scale is not None:
             if quant_scale.dtype != torch.float32 or quant_scale.numel() != 1:
                 raise ValueError("quant_scale must be one fp32 value")
             tm.a_scale = qs = quant_scale.view(1)
-        quant = (quant_mode, k, fp8_max)
-        qw = blocks(quant_mode, m, k)
+        elif quant_mode == "per_tensor_fp8":
+            tm.a_scale = qs = torch.empty(1, dtype=torch.float32, device=dev)
+            if m * topk <= ONESHOT_MAX_ROUTES and m * k <= SINGLE_WG_ELEMS:
+                quant, qw = ("per_tensor_fp8_single", k, fp8_max), 1
+            else:
+                quant = ("per_tensor_fp8_dynamic", k, fp8_max)
+                dyn = (qw, tensor_partials(m, k))
         qx = quant_input.view(torch.int32)
     loc = tm.loc_ids if with_loc_ids else _empty_i32(dev)
     mask = expert_mask if expert_mask is not None else _empty_i32(dev)
@@ -255,6 +264,10 @@ def route_to_tiles(
     )
     stream = torch.cuda.current_stream(dev)
     if n_routes <= ONESHOT_MAX_ROUTES:
+        if dyn is not None:  # partial amaxes here, the quant in its own launch
+            qw2, n_part = dyn
+            qs = torch.empty(n_part, dtype=torch.int32, device=dev)
+            qw = n_part
         _launch(
             oneshot,
             ids,
@@ -279,12 +292,34 @@ def route_to_tiles(
             stream,
             device=dev,
         )
+        if dyn is not None:
+            from aiter.ops.flydsl.kernels.moe_next.core.quant import (
+                build_tensor_quant,
+            )
+
+            _launch(
+                build_tensor_quant(quant[1], quant[2], num_local_tokens is not None),
+                qx,
+                qq,
+                tm.a_scale,
+                qs,
+                ltok,
+                m,
+                n_part,
+                qw2,
+                stream,
+                device=dev,
+            )
         return tm
     n_chunks = min(MAX_CHUNKS, -(-n_routes // CHUNK_MIN_ROUTES))
     per_chunk = -(-n_routes // n_chunks)
     chunk = -(-per_chunk // 256) * 256
     n_chunks = -(-n_routes // chunk)
-    counts = torch.empty(n_chunks * num_experts, dtype=torch.int32, device=dev)
+    # dynamic per-tensor: the count launch's partial amaxes follow the counts
+    qw2, n_part = dyn if dyn is not None else (0, 0)
+    counts = torch.empty(n_chunks * num_experts + n_part, dtype=torch.int32, device=dev)
+    qp = counts[n_chunks * num_experts :] if dyn is not None else _empty_i32(dev)
+    q_count = (qx, qq, qp, n_part) if dyn is not None else (qx, qq, qs, qw)
     early = zero_v4 * 16 >= ZERO_IN_COUNT_BYTES
     _launch(
         count,
@@ -293,15 +328,13 @@ def route_to_tiles(
         ltok,
         counts,
         zbuf,
-        qx,
-        qq,
-        qs,
+        *q_count[:3],
         m,
         chunk,
         n_chunks,
         row_v4 if early else 0,
-        qw,
-        max(n_chunks + qw, z_wg) if early else n_chunks + qw,
+        q_count[3],
+        max(n_chunks + q_count[3], z_wg) if early else n_chunks + q_count[3],
         stream,
         device=dev,
     )
@@ -320,11 +353,17 @@ def route_to_tiles(
         ltok,
         counts,
         zbuf,
+        qx,
+        qq,
+        qs,
+        qp,
         m,
         chunk,
         n_chunks,
         0 if early else row_v4,
-        n_chunks if early else n_chunks + z_wg,
+        qw2,
+        n_part,
+        n_chunks + qw2 + (0 if early else z_wg),
         stream,
         device=dev,
     )
