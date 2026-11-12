@@ -18,6 +18,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import common as fxh
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import (
     _f32_to_bf16,
@@ -114,10 +115,11 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
         arg_p_weight: fx.Tensor,
         p_w_scale,
         a_scale_tensor,
-        asc_idx,
+        row_toks,
         lds,
     ):
         tid = gpu.thread_idx.x
+        lane = tid % 64
         TILE_M = BLOCK_M
 
         a_tensor = fx.rocdl.make_buffer_tensor(arg_p_input, max_size=False)
@@ -224,12 +226,21 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
         _n_reps = fx.size(fx.get_shape(c_gate)[2]).to_py_value()
         k_iters = TILE_K // (2 * k_per_mma)
 
-        # Weight scale rows of this tile's gate and up channels.
-        gate_nb = (blk_n * contiguous_n) // SCALE_BLOCK
-        up_nb = (N // 2 + blk_n * contiguous_n) // SCALE_BLOCK
-        ws_base = fxh._as_ptr(p_w_scale) + expert_id * (NB * KB)
-
-        tok_rows = [(asc_idx[0, n] & 0xFFFFFF) * KB for n in range_constexpr(_n_reps)]
+        # Weight scales: wave-uniform, one scalar load per K tile and gate/up half.
+        ws_view = fx.make_view(
+            fxh._as_ptr(p_w_scale) + expert_id * (NB * KB), fx.make_layout(NB * KB, 1)
+        )
+        ws_rsrc = fx.rocdl.get_buffer_rsrc(
+            fx.get_iter(fx.rocdl.make_buffer_tensor(ws_view, max_size=False))
+        )
+        gate_off = (blk_n * contiguous_n) // SCALE_BLOCK * KB
+        up_off = (N // 2 + blk_n * contiguous_n) // SCALE_BLOCK * KB
+        # Activation scales: lane l loads the scale of tile row l (+ 64 j); the MFMA
+        # fragment's token column n * 16 + lane % 16 is then read with ds_bpermute.
+        n_row_loads = len(row_toks)
+        bperm_addr = [
+            (((n * 16) % 64) + lane % 16) * 4 for n in range_constexpr(_n_reps)
+        ]
         mfma_per_gemm = _m_reps * _n_reps * (TILE_K // k_per_mma)
         mem_a_cnt = a_cp_frag.load().numel * weight_dtype.width // 8 // 16
         mem_b_cnt = bl_frag_st[0].load().numel * weight_dtype.width // 8 // 16
@@ -262,18 +273,31 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
             if const_expr(mfma_cnt - used > 0):
                 rocdl.sched_mfma(mfma_cnt - used)
 
+        def _sload(off):
+            v = buffer_ops.buffer_load(
+                ws_rsrc,
+                rocdl.readfirstlane(T.i32, _raw(fx.Int32(off))),
+                vec_width=1,
+                is_scalar=True,
+            )
+            return fx.Int32(v).bitcast(fx.Float32)
+
         def load_scales(k_cur):
-            sb_gate = fx.make_view(
-                ws_base + gate_nb * KB + k_cur, fx.make_layout(1, 1)
-            )[0]
-            sb_up = fx.make_view(ws_base + up_nb * KB + k_cur, fx.make_layout(1, 1))[0]
-            sa = [a_scale_tensor[tok_rows[n] + k_cur] for n in range_constexpr(_n_reps)]
-            return [sb_gate, sb_up] + sa
+            sb_gate = _sload(gate_off + k_cur)
+            sb_up = _sload(up_off + k_cur)
+            rows = [
+                a_scale_tensor[row_toks[j] + k_cur]
+                for j in range_constexpr(n_row_loads)
+            ]
+            return [sb_gate, sb_up] + rows
 
         def fold(scales):
             sb_gate, sb_up = fx.Float32(scales[0]), fx.Float32(scales[1])
             for n in range_constexpr(_n_reps):
-                sa = fx.Float32(scales[2 + n])
+                src = fx.Float32(scales[2 + (n * 16) // 64]).bitcast(fx.Int32)
+                sa = fx.Int32(
+                    rocdl.ds_bpermute(T.i32, _raw(fx.Int32(bperm_addr[n])), _raw(src))
+                ).bitcast(fx.Float32)
                 sg = Vec.filled(4, sa * sb_gate, fx.Float32)
                 su = Vec.filled(4, sa * sb_up, fx.Float32)
                 for m in range_constexpr(_m_reps):
@@ -339,7 +363,7 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
         fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w[0])
         gpu.barrier()
 
-        n_sc = 2 + _n_reps
+        n_sc = 2 + n_row_loads
         acc_init = [c_gate.load(), c_up.load()] + scales0
         results = acc_init
         for iv, state in range(0, num_tiles // 2 - 1, 1, init=acc_init):
@@ -436,17 +460,14 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
                 TOPK=TOPK,
             )
 
-            asc_index_copy = fx.make_tiled_copy(
-                fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
-                fx.make_layout(((16, 4, 4), 1), ((1, 0, 0), 0)),
-                fx.make_tile(16),
-            )
-            asc_lds = fx.make_view(lds.sorted_lds.ptr, fx.make_layout(BLOCK_M, 1))
-            asc_thr = asc_index_copy.get_slice(tid).partition_S(asc_lds)
-            asc_idx = fx.make_fragment_like(asc_thr)
-            fx.copy(
-                fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32), asc_thr, asc_idx
-            )
+            # Row token of tile row (lane % BLOCK_M) + 64 j, read before the GEMM
+            # reuses sorted_lds; times KB, the activation-scale row offset.
+            sorted_view = fx.make_view(lds.sorted_lds.ptr, fx.make_layout(256, 1))
+            lane = tid % 64
+            row_toks = [
+                (sorted_view[(lane + 64 * j) % BLOCK_M] & 0xFFFFFF) * KB
+                for j in range_constexpr(max(1, BLOCK_M // 64))
+            ]
 
             a_scale_tensor = fx.rocdl.make_buffer_tensor(
                 fx.make_view(
@@ -463,7 +484,7 @@ def compile_gateup(*, N, K, TOPK, BLOCK_M, BLOCK_N, activation="silu"):
                 arg_p_weight,
                 p_w_scale,
                 a_scale_tensor,
-                asc_idx,
+                row_toks,
                 lds,
             )
 
