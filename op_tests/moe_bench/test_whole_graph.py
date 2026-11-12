@@ -160,3 +160,14 @@ def test_source_discarded_everywhere_is_flagged(tmp_path):
     assert bad == ["fused_moe:flydsl-graph"]
     meta = json.loads((tmp_path / "bar-t.meta.json").read_text())
     assert meta["router_discarded_sources"] == {"fused_moe:flydsl-graph": 3}
+
+
+def test_relabel_finds_only_lambda_rows():
+    from op_tests.moe_bench import relabel
+
+    rows = [
+        {"case_id": "a", "kernel1": "<lambda>", "full_impl": "<lambda>"},
+        {"case_id": "b", "kernel1": "moe_ck2stages_x", "full_impl": ""},
+        {"case_id": "c", "kernel1": "impl__flydsl_gfx942__16_16_16", "full_impl": ""},
+    ]
+    assert [r["case_id"] for r in relabel.affected_rows(rows)] == ["a"]
