@@ -218,23 +218,56 @@ def _local_ids(ti, mask):
     return local[ti.long()].to(torch.int32)
 
 
-def references(S, ref_w, bias, hidden, tw, ti, mask, rows):
-    """{"path": [r, D] fp64, "exact": [r, D] fp64} on the sampled rows.
+DEFAULT_NUMERICS = {"act": "hip", "inter": "bf16"}
 
-    ``path`` raises NotImplementedError where the path's activation quant is not
-    reproduced (MX); the caller records it and leaves the path columns empty.
+
+def numerics_key(n):
+    n = dict(DEFAULT_NUMERICS, **(n or {}))
+    return f"act={n['act']};inter={n['inter']}"
+
+
+def numerics_of(S, cand, route):
+    """Rounding points of the path that serves a candidate (the ref_path it is scored on).
+
+    ``act``: ``hip`` = activations quantized with aiter's ``get_hip_quant``, ``none`` =
+    bf16 activations into the GEMM. ``inter``: ``bf16`` = stage-1 output rounded to the
+    output dtype, then re-quantized (CK 2-stage, torch_moe_stage1); ``fp32`` = quantized
+    from the fp32 accumulators in-kernel (ASM 1-stage, MXMOE g1); ``none`` = bf16
+    intermediate, no quantization (a16 paths, gfx942 FlyDSL whole-graph decode).
+    New kernels declare their own ``numerics`` class attribute; aiter candidates are
+    mapped from the route:
+
+    * CK 2-stage, ck_tile, ASM stage1 + CK, FlyDSL stage pairs: act hip, inter bf16
+    * ASM 1-stage: act none for the a16/xbf16 kernels, else hip; inter fp32
+    * FlyDSL whole-graph (impl__flydsl_gfx942): act none, inter none
+    * MXMOE: act hip, inter fp32
     """
+    declared = getattr(cand, "numerics", None)
+    if isinstance(declared, dict) and declared:
+        return dict(DEFAULT_NUMERICS, **declared)
+    route = route or {}
+    full = route.get("full_impl", "") or ""
+    k1 = route.get("kernel1", "") or ""
+    if "flydsl_gfx942" in full:
+        return {"act": "none", "inter": "none"}
+    if route.get("stages") == "1-stage" or str(route.get("backend1", "")) == "asm":
+        a16 = bool(route.get("flat")) or "a16" in k1 or "xbf16" in k1
+        return {"act": "none" if a16 else "hip", "inter": "fp32"}
+    if k1.startswith("flydsl_mxmoe"):
+        return {"act": "hip", "inter": "fp32"}
+    return dict(DEFAULT_NUMERICS)
+
+
+def exact_ref(S, ref_w, bias, hidden, tw, ti, mask, rows):
+    """ref_exact: bf16 activations, dequantized weights, no quantization, fp64."""
     import aiter
 
     E = S.E_local
     ids = _local_ids(ti, mask)
-    h_rows, tw_rows, ids_rows = hidden[rows], tw[rows], ids[rows]
     r = len(rows)
-    out = {}
     with fp64_math():
-        # ref_exact: bf16 activations, dequantized weights, no quantization anywhere
         a1s = _ones_scale(S, r, S.D)
-        out1 = _stage1(S, ref_w, bias, h_rows, a1s, tw_rows, ids_rows, E)
+        out1 = _stage1(S, ref_w, bias, hidden[rows], a1s, tw[rows], ids[rows], E)
         a2s = None
         if S.qtype in (aiter.QuantType.per_Token,):
             a2s = torch.ones((r, S.topk, 1), dtype=torch.float32, device="cuda")
@@ -244,35 +277,81 @@ def references(S, ref_w, bias, hidden, tw, ti, mask, rows):
             a2s = torch.ones(
                 (r, S.topk, S.I // 128), dtype=torch.float32, device="cuda"
             )
-        out["exact"] = _stage2(S, ref_w, bias, out1, a2s, tw_rows, ids_rows, E)
-        del out1
-        # ref_path: aiter's activation quant, bf16-rounded intermediate, aiter re-quant
-        try:
-            a1q_all, a1s_all = _path_quant(S, hidden)
-        except NotImplementedError:
-            return out
-        if a1s_all is None:
-            a1q, a1s = h_rows, None
-        elif a1s_all.numel() == 1:
-            a1q, a1s = a1q_all[rows], a1s_all
+        return _stage2(S, ref_w, bias, out1, a2s, tw[rows], ids[rows], E)
+
+
+def path_ref(S, ref_w, bias, hidden, tw, ti, mask, rows, numerics=None):
+    """ref_path at the given rounding points (see ``numerics_of``), fp64 elsewhere.
+
+    Raises NotImplementedError where aiter's activation quant is not reproduced (MX).
+    """
+    import aiter
+
+    n = dict(DEFAULT_NUMERICS, **(numerics or {}))
+    E = S.E_local
+    ids = _local_ids(ti, mask)
+    h_rows, tw_rows, ids_rows = hidden[rows], tw[rows], ids[rows]
+    r = len(rows)
+    with fp64_math():
+        if n["act"] == "none":
+            a1q, a1s = h_rows, _ones_scale(S, r, S.D)
         else:
-            a1q, a1s = a1q_all[rows], a1s_all[rows]
-        del a1q_all
+            a1q_all, a1s_all = _path_quant(S, hidden)
+            if a1s_all is None:
+                a1q, a1s = h_rows, None
+            elif a1s_all.numel() == 1:
+                a1q, a1s = a1q_all[rows], a1s_all
+            else:
+                a1q, a1s = a1q_all[rows], a1s_all[rows]
+            del a1q_all
         out1 = _stage1(S, ref_w, bias, a1q, a1s, tw_rows, ids_rows, E)
-        flat = out1.to(S.dtype).reshape(r * S.topk, S.I)
-        if S.qtype == aiter.QuantType.per_Tensor:
+        flat_src = out1 if n["inter"] == "fp32" else out1.to(S.dtype)
+        flat = flat_src.reshape(r * S.topk, S.I)
+        if n["inter"] == "none" or S.qtype in (aiter.QuantType.No,):
+            a2q = flat.reshape(r, S.topk, S.I)
+            a2s = _ones_scale3(S, r)
+            if S.qtype == aiter.QuantType.No:
+                a2s = None
+        elif S.qtype == aiter.QuantType.per_Tensor:
             # the intermediate scale is a function of the whole batch
-            a1q_f, a1s_f = _path_quant(S, hidden)
+            a1q_f, a1s_f = (
+                (hidden, _ones_scale(S, hidden.shape[0], S.D))
+                if n["act"] == "none"
+                else _path_quant(S, hidden)
+            )
             full = _stage1(S, ref_w, bias, a1q_f, a1s_f, tw, ids, E)
-            _, a2s_t = _path_quant(S, full.to(S.dtype).reshape(-1, S.I))
+            full = full if n["inter"] == "fp32" else full.to(S.dtype)
+            _, a2s_t = _path_quant(S, full.reshape(-1, S.I))
             a2q, a2s_f = _path_quant(S, flat, scale=a2s_t)
             a2s = a2s_f if a2s_f is not None else a2s_t
+            a2q = a2q.reshape(r, S.topk, S.I)
             del full
         else:
             a2q, a2s_f = _path_quant(S, flat)
             a2s = None if a2s_f is None else a2s_f.reshape(r, S.topk, -1)
-        a2q = a2q.reshape(r, S.topk, S.I)
-        out["path"] = _stage2(S, ref_w, bias, a2q, a2s, tw_rows, ids_rows, E)
+            a2q = a2q.reshape(r, S.topk, S.I)
+        return _stage2(S, ref_w, bias, a2q, a2s, tw_rows, ids_rows, E)
+
+
+def _ones_scale3(S, r):
+    import aiter
+
+    if S.qtype == aiter.QuantType.per_Token:
+        return torch.ones((r, S.topk, 1), dtype=torch.float32, device="cuda")
+    if S.qtype == aiter.QuantType.per_Tensor:
+        return torch.ones((1,), dtype=torch.float32, device="cuda")
+    if S.qtype == aiter.QuantType.per_1x128:
+        return torch.ones((r, S.topk, S.I // 128), dtype=torch.float32, device="cuda")
+    return None
+
+
+def references(S, ref_w, bias, hidden, tw, ti, mask, rows, numerics=None):
+    """{"path": ..., "exact": ...} on the sampled rows ("path" absent for MX paths)."""
+    out = {"exact": exact_ref(S, ref_w, bias, hidden, tw, ti, mask, rows)}
+    try:
+        out["path"] = path_ref(S, ref_w, bias, hidden, tw, ti, mask, rows, numerics)
+    except NotImplementedError:
+        pass
     return out
 
 

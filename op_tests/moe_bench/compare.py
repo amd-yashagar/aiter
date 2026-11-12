@@ -238,19 +238,28 @@ ACC_GATE = [f"{ref}_{k}" for ref in ("path", "exact") for k in ("rel_l2", "max_n
 
 
 def acc_ok(bar, new):
-    """Accuracy rule of the plan: for rel_l2 and max_norm against both references,
-    mean(new) <= mean(bar) + 2 * std(bar) + 1% of mean(bar). Also needs the new kernel to
-    pass aiter's rule. None when the numbers are missing."""
+    """Accuracy rule of the plan: mean(new) <= mean(bar) + 2 * std(bar) + 1% of mean(bar)
+    for rel_l2 and max_norm (mean and std over seeds and repeats). When the new kernel's
+    rounding points equal the bar's, against both references; when they differ, against
+    ref_exact only. Also needs the new kernel to pass aiter's rule.
+
+    Returns (ok, form): ok True/False/None (numbers missing), form ``both`` or ``exact``.
+    """
     if str(new.get("new_acc_pass", "")) != "True":
-        return None if new.get("new_acc_pass", "") == "" else False
+        return (None if new.get("new_acc_pass", "") == "" else False), ""
+    same = bool(bar.get("bar_numerics")) and bar.get("bar_numerics") == new.get(
+        "new_numerics"
+    )
+    form = "both" if same else "exact"
+    names = ACC_GATE if same else [n for n in ACC_GATE if n.startswith("exact_")]
     ok = True
-    for name in ACC_GATE:
+    for name in names:
         bm, bs = _f(bar.get(f"bar_{name}_mean")), _f(bar.get(f"bar_{name}_std"))
         nm = _f(new.get(f"new_{name}_mean"))
         if bm is None or bs is None or nm is None:
-            return None
+            return None, form
         ok = ok and nm <= bm + 2 * bs + 0.01 * bm
-    return ok
+    return ok, form
 
 
 def bar_view(rows, bar_rows, new_rows, weights):
@@ -270,7 +279,7 @@ def bar_view(rows, bar_rows, new_rows, weights):
         roof = _f(b.get("roofline_us"))
         new_us = _f(n.get("median_us")) if n and n.get("status") == "ok" else None
         band_v = band(d)[0] if d else 0.02
-        err_ok = acc_ok(b, n or {}) if (new_us and bar_us) else None
+        err_ok, acc_form = acc_ok(b, n or {}) if (new_us and bar_us) else (None, "")
         gap = new_us / bar_us - 1 if (new_us and bar_us) else None
         if new_us and not bar_us and b.get("status") == "no-bar":
             gap = -1.0  # no existing backend computes it: any correct kernel wins
@@ -308,6 +317,11 @@ def bar_view(rows, bar_rows, new_rows, weights):
                 "bar_acc_pass": b.get("bar_acc_pass", ""),
                 "new_acc_pass": (n or {}).get("new_acc_pass", ""),
                 "acc_ok": "" if err_ok is None else err_ok,
+                "acc_form": acc_form,
+                "bar_numerics": b.get("bar_numerics", ""),
+                "new_numerics": (n or {}).get("new_numerics", ""),
+                "dispatch_exact_rel_l2_mean": b.get("dispatch_exact_rel_l2_mean", ""),
+                "bar_exact_rel_l2_mean_": b.get("bar_exact_rel_l2_mean", ""),
                 "won_mode": bool(
                     gap is not None
                     and gap < -band_v

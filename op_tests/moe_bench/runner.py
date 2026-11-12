@@ -324,7 +324,14 @@ class GroupJob:
         self.inflight = None
         self.done = False
 
+    MAX_SPAWNS = 40
+
     def _spawn(self):
+        if getattr(self, "spawns", 0) >= self.MAX_SPAWNS:
+            # a crash loop: give up on what is left instead of restarting forever
+            self._fail("crash", f"worker restarted {self.MAX_SPAWNS} times")
+            self.pending.clear()
+            return False
         todo = [c for c in self.cases if c.id in self.pending]
         spec = {"cases": [c.row for c in todo], "modes": self.modes}
         spec.update(self.extra_spec())
@@ -359,6 +366,7 @@ class GroupJob:
             cmd, env=env, cwd=self.tree, stdout=self.log, stderr=subprocess.STDOUT
         )
         self.last_event = time.time()
+        self.spawns = getattr(self, "spawns", 0) + 1
         return True
 
     def extra_spec(self):

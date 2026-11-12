@@ -163,7 +163,19 @@ def main(argv=None):
     )
     p.add_argument(
         "--new-routes",
-        help="new mode: route table path or kernel id for prepare(routes=...), test only",
+        help="new mode: kernel id or route file for AITER_MOE_ROUTES; also sets "
+        "AITER_MOE_STRICT=1 so a fallback raises instead of posing as the kernel",
+    )
+    p.add_argument(
+        "--no-off",
+        action="store_true",
+        help="new mode: skip the routing-off pass (AITER_MOE_DISABLE=1, off_us)",
+    )
+    p.add_argument(
+        "--first",
+        type=int,
+        default=0,
+        help="new mode: first-call.csv for this many weight sets (warm and empty FlyDSL cache)",
     )
     p.add_argument(
         "--source-module", action="append", help="module that registers sources"

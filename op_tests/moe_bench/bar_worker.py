@@ -106,9 +106,11 @@ class RoutedFusedMoe(DispatchCandidate):
 class Measurer:
     """Correctness plus timing of one candidate over the shared timed region."""
 
-    def __init__(self, ctx, acc_refs, acc_err, rows, pool, fh, case_id):
+    def __init__(self, ctx, acc_refs, acc_err, rows, pool, fh, case_id, ref_ctx=None):
         self.ctx, self.acc_refs, self.acc_err = ctx, acc_refs, acc_err
         self.rows, self.pool = rows, pool
+        self.ref_ctx = ref_ctx or {}
+        self._path_cache = {}
         self.fh, self.case_id = fh, case_id
         self.records = []  # confirmed results for the bar
 
@@ -160,11 +162,16 @@ class Measurer:
                     base, modes, status="no-reference", detail=self.acc_err or ""
                 )
                 return res
+            num = accuracy.numerics_of(ctx.S, cand, route)
+            nkey = accuracy.numerics_key(num)
+            base["numerics"] = nkey
+            res["numerics"] = nkey
+            refs = self.refs_for(num)
             acc = accuracy.evaluate(
                 ctx.S,
                 ctx,
                 call,
-                self.acc_refs,
+                refs,
                 self.rows,
                 ctx.n_valid,
                 seeds=accuracy.SEEDS[:1] if quick else accuracy.SEEDS,
@@ -230,6 +237,36 @@ class Measurer:
                 cand.release(ctx)
             except Exception:  # noqa: BLE001
                 emit(self.fh, {"event": "log", "msg": f"release failed for {cand.id}"})
+
+    def refs_for(self, numerics):
+        """{seed: {"exact", "path"}} with ref_path at the candidate's rounding points."""
+        from . import accuracy
+
+        key = accuracy.numerics_key(numerics)
+        if key not in self._path_cache:
+            rc = self.ref_ctx
+            by_seed = {}
+            for seed in accuracy.SEEDS:
+                hs, tw, ti = accuracy.acc_inputs(rc["S"], rc["M"], seed)
+                d = {"exact": self.acc_refs[seed]}
+                try:
+                    d["path"] = accuracy.path_ref(
+                        rc["S"],
+                        rc["rw"],
+                        rc["bias"],
+                        hs,
+                        tw,
+                        ti,
+                        rc["mask"],
+                        self.rows,
+                        numerics,
+                    )
+                except NotImplementedError:
+                    pass
+                by_seed[seed] = d
+                del hs
+            self._path_cache[key] = by_seed
+        return self._path_cache[key]
 
     def _emit(self, base, modes, **kw):
         for m in modes:
@@ -357,16 +394,12 @@ def run_bar_group(cases, spec, fh):
             by_seed = {}
             for seed in accuracy.SEEDS:
                 hs, tw, ti = accuracy.acc_inputs(S, c.token, seed)
-                by_seed[seed] = accuracy.references(S, rw, bias, hs, tw, ti, mask, rows)
+                by_seed[seed] = accuracy.exact_ref(S, rw, bias, hs, tw, ti, mask, rows)
                 del hs
-            if not all("path" in r for r in by_seed.values()):
-                refs[c.id] = (None, "ref_path not available for this path", rows)
-            else:
-                refs[c.id] = (by_seed, None, rows)
+            refs[c.id] = (by_seed, None, rows)
         except Exception as e:  # noqa: BLE001
             refs[c.id] = (None, f"reference error: {_err(e)}", rows)
         torch.cuda.empty_cache()
-    rw = None
     torch.cuda.empty_cache()
     group_cache = {}
 
@@ -402,13 +435,26 @@ def run_bar_group(cases, spec, fh):
         k = int(max(1, min(4, (2 << 30) // max(per, 1))))
         pool = [workload.make_inputs(S, M) if j else hidden.clone() for j in range(k)]
         acc_refs, acc_err, rows = refs[c.id]
-        meas = Measurer(ctx, acc_refs, acc_err, rows, pool, fh, c.id)
+        meas = Measurer(
+            ctx,
+            acc_refs,
+            acc_err,
+            rows,
+            pool,
+            fh,
+            c.id,
+            ref_ctx={"S": S, "M": c.token, "rw": rw, "bias": bias, "mask": mask},
+        )
         results = {}
         skipped = []
         emit(fh, {"event": "case_start", "case_id": c.id, "phase": "run"})
         if mode_kind == "bar":
-            d = meas.measure(DispatchCandidate(), quick=False, modes=modes)
-            results["dispatch"] = d
+            if "dispatch" in bad.get(c.id, ()):
+                # the dispatch call killed an earlier worker: do not run it again
+                results["dispatch"] = {"ok": False, "crashed": True}
+            else:
+                d = meas.measure(DispatchCandidate(), quick=False, modes=modes)
+                results["dispatch"] = d
         elif mode_kind in ("new", "off"):
             cand = RoutedFusedMoe(off=mode_kind == "off")
             results[cand.id] = meas.measure(cand, quick=False, modes=modes)
@@ -496,13 +542,14 @@ class _Screener:
         return self.meas.measure(cand, quick=quick, modes=("warm",))
 
 
-def _gate(who, acc):
+def _gate(who, acc, numerics=""):
     """Gated accuracy columns (mean/std vs both references) of one candidate."""
     from . import accuracy
 
     if not acc:
         return {}
     out = {
+        f"{who}_numerics": numerics,
         f"{who}_acc_pass": acc["pass"],
         f"{who}_nondeterministic": acc["nondeterministic"],
     }
@@ -542,7 +589,7 @@ def _emit_summary(fh, c, S, mode, results, ident, skipped, kind, main_failure=No
             row["dispatch_us"] = disp["by_mode"][mode]["median_us"]
         for k in ("route_key", "kernel1", "kernel2", "route_family"):
             row["dispatch_" + k] = disp.get("route", {}).get(k, "")
-        row.update(_gate("dispatch", disp.get("acc")))
+        row.update(_gate("dispatch", disp.get("acc"), disp.get("numerics", "")))
     if kind in ("new", "off"):
         who = kind
         if ok:
@@ -558,7 +605,7 @@ def _emit_summary(fh, c, S, mode, results, ident, skipped, kind, main_failure=No
                     "status": "ok",
                 }
             )
-            row.update(_gate(who, r.get("acc")))
+            row.update(_gate(who, r.get("acc"), r.get("numerics", "")))
         else:
             row.update(status="no-correct-candidate")
     elif ok:
@@ -573,7 +620,7 @@ def _emit_summary(fh, c, S, mode, results, ident, skipped, kind, main_failure=No
             bar_kernels=d["kernels"],
             bar_timing_mode=best.get("timing_mode", ""),
         )
-        row.update(_gate("bar", best.get("acc")))
+        row.update(_gate("bar", best.get("acc"), best.get("numerics", "")))
     else:
         # a case no existing backend computes correctly has no bar
         row["status"] = "no-bar"

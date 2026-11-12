@@ -73,6 +73,12 @@ BAR_COLS = (
         "bar_roofline_eff",
         "dispatch_roofline_eff",
         "new_roofline_eff",
+        "dispatch_numerics",
+        "bar_numerics",
+        "new_numerics",
+        "dispatch_numerics",
+        "bar_numerics",
+        "new_numerics",
         *accuracy.gate_columns("dispatch"),
         *accuracy.gate_columns("bar"),
         *accuracy.gate_columns("new"),
@@ -109,12 +115,18 @@ CAND_COLS = [
     "new_kernel_id",
     "reason",
     "host_us",
+    "numerics",
+    "numerics",
     *accuracy.seed_columns(),
     "node",
     "gpu",
     "aiter_sha",
     "date",
 ]
+
+
+BAR_COLS = list(dict.fromkeys(BAR_COLS))
+CAND_COLS = list(dict.fromkeys(CAND_COLS))
 
 
 class Table:
