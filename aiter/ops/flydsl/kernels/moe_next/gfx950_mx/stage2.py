@@ -24,18 +24,26 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import BFloat16, T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels.moe_next.core.intermediate import scale_offset_mfma
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
 
 from . import common as cm
 from .stage1 import _scale_atoms
 
 
-def blocks_per_wg(model_dim, m_tiles, cu_num=256):
+def a_tile_resident(inter_dim, tile_m, a_dtype):
+    """Whether the whole intermediate tile fits in stage 2's LDS (needed to loop
+    one workgroup over several channel blocks)."""
+    trb = 128 if a_dtype == "fp8" else 64
+    return -(-int(inter_dim) // 128) * int(tile_m) * trb <= 96 * 1024
+
+
+def blocks_per_wg(model_dim, m_tiles, cu_num=256, resident=True):
     """Channel blocks one workgroup loops over: 2 when model_dim / 256 is even and
     that still leaves four workgroups per CU (measured best of 1, 2, 4, 7 on
-    DSV4-Pro and Kimi-K3 prefill), else 1."""
+    DSV4-Pro and Kimi-K3 prefill), else 1; always 1 without a resident tile."""
     nb = model_dim // 256
-    if nb % 2 == 0 and (nb // 2) * m_tiles >= 4 * cu_num:
+    if resident and nb % 2 == 0 and (nb // 2) * m_tiles >= 4 * cu_num:
         return 2
     return 1
 
@@ -86,7 +94,7 @@ def _build_stage2(
     a_lds_bytes = BM * TRB
     # The whole intermediate tile stays in LDS when it fits; else a 2-slot K ring
     # (then one channel block per workgroup).
-    PRE = KS * a_lds_bytes <= 96 * 1024
+    PRE = a_tile_resident(INTER, BM, a_dtype)
     assert PRE or NBW == 1, "channel-block persistence needs the whole K in LDS"
     lds_bytes = (KS if PRE else 2) * a_lds_bytes
     # Prefetch the next block's W2 while this one computes, when registers allow.
@@ -241,10 +249,17 @@ def _build_stage2(
                     cm.global_vec_load(
                         arg_ws,
                         fx.Int64(
-                            e * fx.Int32(D // 32) + p0 // fx.Int32(2) + fx.Int32(q)
+                            scale_offset_mfma(
+                                (
+                                    e * fx.Int32(D // 32)
+                                    + p0 // fx.Int32(2)
+                                    + fx.Int32(q)
+                                )
+                                * fx.Int32(32),
+                                fx.Int32(kp * 8),
+                                GP8,
+                            )
                         )
-                        * fx.Int64(GP8 * 32)
-                        + fx.Int64(kp * 256)
                         + fx.Int64(lane * fx.Int32(4)),
                         1,
                     )
@@ -265,8 +280,9 @@ def _build_stage2(
                     r0 = m_row + fx.Int32(j * 16)
                     v = cm.global_vec_load(
                         arg_as,
-                        fx.Int64(r0 // fx.Int32(32)) * fx.Int64(GP8 * 32)
-                        + fx.Int64(kp * 256)
+                        fx.Int64(
+                            scale_offset_mfma(r0 & fx.Int32(-32), fx.Int32(kp * 8), GP8)
+                        )
                         + fx.Int64(lane * fx.Int32(4)),
                         1,
                     )
