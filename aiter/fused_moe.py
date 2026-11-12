@@ -2454,8 +2454,15 @@ def fused_moe_1stage(
                     token_num=token_num,
                     cols=model_dim,
                 )
-            w1_scale = w1_scale.view(E, -1)
-            w2_scale = w2_scale.view(E, -1)
+            # e8m0_shuffle pads the total row count to a multiple of 256, which
+            # leaves a tail that is not a whole number of experts (E=513). Each
+            # expert's rows are contiguous, so take exactly E experts' worth.
+            w1_scale = w1_scale.view(-1)[
+                : E * w1.shape[1] * _padded_scale_cols(model_dim)
+            ].view(E, -1)
+            w2_scale = w2_scale.view(-1)[
+                : E * w2.shape[1] * _padded_scale_cols(_inter_dim)
+            ].view(E, -1)
 
         if quant_type == QuantType.per_1x128:
             fmoe_func = functools.partial(
