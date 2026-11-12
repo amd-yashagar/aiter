@@ -21,6 +21,7 @@ compiled or marked failed: a call without ready state takes today's path.
 import os
 import threading
 import weakref
+from typing import NamedTuple
 
 import torch
 
@@ -65,14 +66,27 @@ def strict() -> bool:
 _DEBUG = os.getenv("AITER_MOE_DEBUG", "0") == "1"
 
 
-def last_route() -> tuple:
-    """(kernel id or "aiter", family, gpu, reason) of the last fused_moe call on
-    this thread."""
-    return getattr(_LAST, "route", ("aiter", "", "", "no call yet"))
+class LastRoute(NamedTuple):
+    kernel: str
+    family: str
+    gpu: str
+    reason: str
+    numerics: dict | None
+
+
+def last_route() -> LastRoute:
+    """(kernel id or "aiter", family, gpu, reason, numerics) of the last
+    fused_moe call on this thread; numerics is None for today's path."""
+    return getattr(_LAST, "route", LastRoute("aiter", "", "", "no call yet", None))
 
 
 def _record(kernel, family, gpu, reason, key):
-    _LAST.route = (kernel, family, gpu, reason)
+    num = None
+    if kernel != "aiter":
+        from .registry import numerics
+
+        num = numerics(kernel)
+    _LAST.route = LastRoute(kernel, family, gpu, reason, num)
     if _DEBUG:
         log_once(f"aiter.moe route {key}: {kernel} ({family}, {gpu}): {reason}")
 

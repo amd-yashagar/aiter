@@ -89,6 +89,11 @@ class MoeKernel:
     routing: ClassVar[str] = "tiles"
     # "atomic": the sort zero-fills the output; "reduce": every row is written once.
     epilogue: ClassVar[str] = "atomic"
+    # Rounding points, e.g. {"act_quant": "per_1x128_fp8", "inter":
+    # "bf16_then_per_1x128_fp8", "combine": "bf16_atomic"}; None means "same as
+    # aiter's dispatched path". A kernel may round less than, never more than,
+    # the least-rounding aiter path for its family and arch.
+    numerics: ClassVar[dict | None] = None
     # Not-yet-covered layer keywords (router.NOT_YET_COVERED) this kernel
     # implements; any other one set on a layer makes it decline.
     handles_kwargs: ClassVar[frozenset] = frozenset()

@@ -131,6 +131,7 @@ def test_router(probe):
     with env(AITER_MOE_ROUTES=table):
         out = fused_moe(hidden[:4], w1, w2, tw[:4], ti[:4])
         assert _is_probe(out) and moe.last_route()[0] == "test.probe"
+        assert moe.last_route().numerics == {"same_as": "aiter dispatched path"}
         assert "routes" in moe.last_route()[3] or ".csv" in moe.last_route()[3]
         assert probe.prepared == 1 and probe.compiled >= 1, "lazy state built once"
         assert _is_probe(fused_moe(hidden[:9], w1, w2, tw[:9], ti[:9]))

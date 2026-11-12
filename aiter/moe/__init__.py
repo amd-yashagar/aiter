@@ -16,7 +16,7 @@ runs unchanged. Environment:
 """
 
 from .kernel import MoeCall, MoeKernel, compile_only
-from .registry import get_kernel, kernels, register_kernel, unregister_kernel
+from .registry import get_kernel, kernels, numerics, register_kernel, unregister_kernel
 from .router import last_route, refresh
 from .spec import FAMILIES, MoeSpec
 from .weights import MoeWeights
@@ -31,6 +31,7 @@ __all__ = [
     "get_kernel",
     "kernels",
     "last_route",
+    "numerics",
     "refresh",
     "register_kernel",
     "unregister_kernel",

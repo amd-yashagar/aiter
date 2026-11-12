@@ -48,6 +48,25 @@ def get_kernel(kernel_id: str) -> MoeKernel | None:
     return _KERNELS.get(kernel_id)
 
 
+SAME_AS_AITER = {"same_as": "aiter dispatched path"}
+
+
+def numerics(kernel_id: str) -> dict | None:
+    """The kernel's declared rounding points (``MoeKernel.numerics``); a kernel
+    that declares none is "same as aiter's dispatched path" (logged once)."""
+    kernel = get_kernel(kernel_id)
+    if kernel is None:
+        return None
+    if kernel.numerics is None:
+        from .log import log_once
+
+        log_once(
+            f"aiter.moe: {kernel_id} declares no numerics; assuming {SAME_AS_AITER}"
+        )
+        return dict(SAME_AS_AITER)
+    return dict(kernel.numerics)
+
+
 def kernels() -> dict[str, MoeKernel]:
     _load_packages()
     return dict(_KERNELS)
