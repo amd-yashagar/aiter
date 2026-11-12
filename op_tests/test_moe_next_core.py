@@ -139,6 +139,142 @@ def _real_rows(tm):
     return real
 
 
+@functools.cache
+def _tail_consumer(tile_m):
+    """A consumer shaped like the fp8-token mid kernels: one workgroup per
+    live tile from live_tiles (expert, first row, real rows); every row of the
+    tile reads its sorted id and weight and gathers x[token] through an
+    M-bounded buffer (garbage tokens read 0 or a real row), and only rows below
+    the tile's real rows store out[token * topk + slot] = x[token] * weight."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    def it(t, n=None):
+        if n is None:
+            return fx.get_iter(fx.rocdl.make_buffer_tensor(t, max_size=True))
+        return fx.get_iter(
+            fx.rocdl.make_buffer_tensor(t, max_size=False, num_records_bytes=n)
+        )
+
+    @flyc.kernel(known_block_size=[128, 1, 1])
+    def consume(
+        x: fx.Tensor,
+        sids: fx.Tensor,
+        sw: fx.Tensor,
+        live: fx.Tensor,
+        nlive: fx.Tensor,
+        out: fx.Tensor,
+        m: fx.Int32,
+        topk: fx.Int32,
+    ):
+        t = fx.gpu.block_idx.x
+        row = fx.gpu.thread_idx.x
+        if (t < fx.ptr_load(it(nlive))) & (row < fx.Int32(tile_m)):
+            lt = it(live)
+            r0 = fx.ptr_load(lt + fx.Int64(t * fx.Int32(3) + fx.Int32(1)))
+            real = fx.ptr_load(lt + fx.Int64(t * fx.Int32(3) + fx.Int32(2)))
+            sid = fx.ptr_load(it(sids) + fx.Int64(r0 + row)).bitcast(fx.Uint32)
+            tok = fx.Int32(sid & fx.Uint32(0xFFFFFF))
+            slot = fx.Int32(sid >> fx.Uint32(24))
+            w = fx.ptr_load(it(sw) + fx.Int64(r0 + row))
+            xv = fx.ptr_load(it(x, fx.Int64(m) * fx.Int64(4)) + fx.Int64(tok))
+            if row < real:
+                fx.ptr_store(xv * w, it(out) + fx.Int64(tok * topk + slot))
+
+    @flyc.jit
+    def launch(
+        x: fx.Tensor,
+        sids: fx.Tensor,
+        sw: fx.Tensor,
+        live: fx.Tensor,
+        nlive: fx.Tensor,
+        out: fx.Tensor,
+        m: fx.Int32,
+        topk: fx.Int32,
+        grid: fx.Int32,
+        stream: fx.Stream = None,
+    ):
+        consume(x, sids, sw, live, nlive, out, m, topk).launch(
+            grid=(grid, 1, 1), block=(128, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+def test_pad_rows_consumer():
+    """pad_rows=False with a consumer that masks the tile tail by live_tiles
+    (as the fp8-token mid kernels do): with the padding skipped (garbage) or
+    poisoned (AITER_MOE_DEBUG), its output equals the padded map's and the
+    reference, x[token] * weight for every kept route."""
+    import os
+
+    import aiter.ops.flydsl.moe_next.core.tile_map as tmap
+
+    rows_out = []
+    for token, E, topk, tile_m, mask, local in [
+        (8, 256, 8, 32, False, None),
+        (100, 513, 11, 16, True, 90),
+        (300, 385, 7, 64, False, None),
+        (1024, 256, 8, 128, False, 1000),
+    ]:
+        ti, tw, em = routing(token, E, topk, mask=mask)
+        nl = None if local is None else torch.tensor([local], dtype=torch.int32)
+        x = torch.randn(token, dtype=torch.float32) + 2
+        kw = {"num_experts": E, "tile_m": tile_m, "expert_mask": em}
+        kw["num_local_tokens"] = nl
+        outs = {}
+        for name, pad_rows, debug in (
+            ("padded", True, False),
+            ("unpadded", False, False),
+            ("poisoned", False, True),
+        ):
+            old = os.environ.get("AITER_MOE_DEBUG")
+            os.environ["AITER_MOE_DEBUG"] = "1" if debug else "0"
+            tmap._debug.cache_clear()
+            try:
+                tm = route_to_tiles(ti, tw, pad_rows=pad_rows, **kw)
+            finally:
+                if old is None:
+                    del os.environ["AITER_MOE_DEBUG"]
+                else:
+                    os.environ["AITER_MOE_DEBUG"] = old
+                tmap._debug.cache_clear()
+            out = torch.full((token * topk,), -7.0, dtype=torch.float32)
+            _tail_consumer(tile_m)(
+                x,
+                tm.sorted_token_ids,
+                tm.sorted_weights,
+                tm.live_tiles,
+                tm.num_live_tiles,
+                out,
+                token,
+                topk,
+                tm.live_tiles.shape[0],
+            )
+            outs[name] = (out, tm)
+        ref = torch.full((token * topk,), -7.0, dtype=torch.float32)
+        tm = outs["padded"][1]
+        nv = int(tm.num_valid_ids[0])
+        sid = tm.sorted_token_ids[:nv].long()
+        tok, slot = sid & 0xFFFFFF, sid >> 24
+        kept = slot < topk
+        u = tok[kept] * topk + slot[kept]
+        ref[u] = x[tok[kept]] * tm.sorted_weights[:nv][kept]
+        bad = [
+            n
+            for n, (o, _) in outs.items()
+            if not torch.equal(o.view(torch.int32), ref.view(torch.int32))
+        ]
+        assert not bad, f"pad_rows consumer M={token} E={E} topk={topk}: {bad}"
+        rows_out.append(
+            {
+                "check": f"pad_rows=False tail consumer M={token} E={E} tile_m={tile_m}",
+                "exact": True,
+            }
+        )
+    return rows_out
+
+
 def test_pad_rows():
     """pad_rows=False: everything a consumer may read (expert ids, counts,
     live_tiles, ids and weights of real rows, loc_ids, zero-fill, quant)
@@ -1441,7 +1577,7 @@ def main():
         "eager host time:\n%s", pd.DataFrame(test_host_time()).to_markdown(index=False)
     )
     checks = test_graph_capture() + test_intermediate() + test_mfma_native()
-    checks += test_pad_rows()
+    checks += test_pad_rows() + test_pad_rows_consumer()
     aiter.logger.info("checks:\n%s", pd.DataFrame(checks).to_markdown(index=False))
     if args.tier:
         rows, qrows = [], []
