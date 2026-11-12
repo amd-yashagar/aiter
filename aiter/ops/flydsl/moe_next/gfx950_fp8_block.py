@@ -33,6 +33,7 @@ def _configs(gpu: str) -> dict:
 
 
 _COUNTERS = {}
+_UNUSED = {}
 # Split-K target: about this many stage-1 workgroups in flight at decode, with at
 # most _SPLITK_MAX splits (the range measured).
 _SPLITK_WGS = 256
@@ -67,6 +68,15 @@ def _splitk_counters(device, n):
     return cnt
 
 
+def _unused_i32(device):
+    """Placeholder for the combine's absent expert_mask / num_local_tokens: an int32 vector,
+    like the real ones, so every call traces to the cache key the host build produced."""
+    t = _UNUSED.get(device)
+    if t is None:
+        t = _UNUSED[device] = torch.zeros(1, dtype=torch.int32, device=device)
+    return t
+
+
 def _tile_config(gpu, config, m, topk, experts):
     table = _configs(gpu)
     if config:
@@ -90,6 +100,7 @@ class _Fp8BlockGfx950(MoeKernel):
         "combine": "bf16_atomic",
     }
     handles_kwargs = frozenset()
+    _combine = None  # set: overrides the config's "combine"
 
     def supports(self, spec, m, topk, call=None):
         if spec.quant != QuantType.per_1x128:
@@ -192,7 +203,8 @@ class _Fp8BlockGfx950(MoeKernel):
             tile_m=cfg["tile_m"],
             tile_n=cfg["tile_n2"],
             doweight_stage1=spec.doweight_stage1,
-            combine=cfg.get("combine", "atomic_bf16"),
+            combine=self._combine or cfg.get("combine", "atomic_bf16"),
+            rows_nt=bool(cfg.get("rows_nt", False)),
         )
         return s1, s2
 
@@ -213,22 +225,25 @@ class _Fp8BlockGfx950(MoeKernel):
         tm = cfg["tile_m"]
         splits = _splits(cfg, spec, call.m, call.topk)
         s1, s2 = self._launchers(call.topk, spec, cfg, splits)
-        combine = cfg.get("combine", "atomic_bf16")
+        combine = self._combine or cfg.get("combine", "atomic_bf16")
         x = call.hidden_states
         M, D, I = call.m, spec.model_dim, spec.inter_dim
         xq, xs = per_group_quant_hip(x, quant_dtype=dtypes.fp8, group_size=128)
         # atomic_bf16: the sort zeroes the output (or output=); atomic_f32: it zeroes
-        # an f32 buffer; rows_f32 writes every route row, so nothing is zeroed.
+        # an f32 buffer; rows_* write every route row, so nothing is zeroed.
         if combine == "atomic_bf16":
             buf = call.output
             if buf is None:
                 buf = torch.empty((M, D), dtype=torch.bfloat16, device=x.device)
         elif combine == "atomic_f32":
             buf = torch.empty((M, D), dtype=torch.float32, device=x.device)
+        elif combine == "rows_bf16":
+            # rows the sort drops are never written: the combine skips them by topk_ids
+            buf = torch.empty((M * call.topk, D), dtype=torch.bfloat16, device=x.device)
         else:
             # zeroed: masked, -1 and past-num_local_tokens routes write no row
             buf = torch.zeros((M * call.topk, D), dtype=torch.float32, device=x.device)
-        zero = None if combine == "rows_f32" else buf
+        zero = None if combine.startswith("rows") else buf
         # As fused_moe sorts: global expert count, EP mask (local expert ids out, masked
         # and -1 routes dropped, their rows zeroed), num_local_tokens.
         if _CORE_SORT:
@@ -316,6 +331,32 @@ class _Fp8BlockGfx950(MoeKernel):
         out = call.output
         if out is None:
             out = torch.empty((M, D), dtype=torch.bfloat16, device=x.device)
+        if combine == "rows_bf16":
+            from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.combine import (
+                compile_rows_reduce,
+            )
+
+            mask, local = call.expert_mask, call.num_local_tokens
+            if mask is not None and mask.dtype != torch.int32:
+                mask = mask.to(torch.int32)
+            reduce = compile_rows_reduce(
+                model_dim=D,
+                topk=call.topk,
+                has_mask=mask is not None,
+                has_local=local is not None,
+            )
+            ids = call.topk_ids.to(torch.int32).contiguous()
+            _run_compiled(
+                reduce,
+                out,
+                buf,
+                ids,
+                mask if mask is not None else _unused_i32(x.device),
+                local if local is not None else _unused_i32(x.device),
+                M,
+                stream,
+            )
+            return out
         if combine == "rows_f32":
             buf = buf.view(M, call.topk, D).sum(dim=1)
         out.copy_(buf)
@@ -330,3 +371,18 @@ class Fp8BlockGfx950Decode(_Fp8BlockGfx950):
 @register_kernel
 class Fp8BlockGfx950Prefill(_Fp8BlockGfx950):
     id = "gfx950_fp8_block.prefill"
+
+
+@register_kernel
+class Fp8BlockGfx950PrefillRows(_Fp8BlockGfx950):
+    """Stage 2 stores bf16 per-route rows; combine.py sums each token's topk rows in fp32
+    and rounds once. Deterministic, unlike the atomic combine."""
+
+    id = "gfx950_fp8_block.prefill_rows"
+    epilogue = "reduce"
+    numerics = {
+        "act_quant": "per_1x128_fp8",
+        "inter": "bf16_then_per_1x128_fp8",
+        "combine": "bf16_rows_fp32_sum",
+    }
+    _combine = "rows_bf16"

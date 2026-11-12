@@ -14,6 +14,8 @@ g: P = A[:, g] . W2[:, g]^T, acc += P * (inter_scale[row, g] * w2_scale[block, g
 Epilogue: acc * sorted_weight[row] (unless doweight_stage1), then by `combine`:
   atomic_bf16  pk-bf16 atomics into out[token], zeroed by the sort (as aiter's CK stage 2)
   atomic_f32   f32 atomics into a zeroed f32 [M, N] buffer, rounded to bf16 once after
+  rows_bf16    bf16 per-route rows [M, topk, N] (row = token * topk + slot), plain stores, summed
+               over topk in fp32 and rounded once by combine.py (deterministic)
   rows_f32     f32 per-route rows [M, topk, N] (row = token * topk + slot), summed over
                topk in fp32 and rounded once after (deterministic)
 Padding rows (token >= M) are skipped.
@@ -32,7 +34,7 @@ from . import helpers as fxh
 # keep fp32 folds as VOP2: v_pk_fma_f32 does not issue under an MFMA (lag-scale-fold-behind-mfma)
 _NO_PACKED_F32 = {"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]}
 
-COMBINES = ("atomic_bf16", "atomic_f32", "rows_f32")
+COMBINES = ("atomic_bf16", "atomic_f32", "rows_bf16", "rows_f32")
 _BUF_COPY = {
     32: fx.rocdl.BufferCopy32b,
     64: fx.rocdl.BufferCopy64b,
@@ -56,6 +58,7 @@ def _build_stage2(
     doweight_stage1,
     combine,
     wide_k,
+    rows_nt=False,
 ):
     elem_t = fx.Float8E4M3FN
     K = int(inter_dim)
@@ -67,7 +70,7 @@ def _build_stage2(
     TILE_K = 128
     TOPK = int(topk)
     assert combine in COMBINES, combine
-    out_is_f32 = combine != "atomic_bf16"
+    out_is_f32 = combine in ("atomic_f32", "rows_f32")
     atomic = combine.startswith("atomic")
     out_elem = fx.Float32 if out_is_f32 else fx.BFloat16
     out_bytes = 4 if out_is_f32 else 2
@@ -399,14 +402,16 @@ def _build_stage2(
                     ),
                 )
             out_tensor = fx.rocdl.make_buffer_tensor(arg_p_output, max_size=False)
-            _cshuffle_nlane = 32
-            _n_row_thr = 256 // _cshuffle_nlane
             # Atomics: two values per lane keep the 32 lanes on contiguous channels
-            # (one pk pair, or two f32 atomics, per instruction). Rows: 128-bit stores.
+            # (one pk pair, or two f32 atomics, per instruction). Rows: 128-bit stores,
+            # with as many lanes per row as span BN.
             _e_vec = 2 if const_expr(atomic) else 128 // out_elem.width
+            _cshuffle_nlane = min(32, BN // _e_vec)
+            _n_row_thr = 256 // _cshuffle_nlane
             _n_chan_tile = _cshuffle_nlane * _e_vec
             _epi_bits = _e_vec * out_elem.width
-            buf_atom = fx.make_copy_atom(_BUF_COPY[_epi_bits](), out_elem)
+            # rows_nt: the per-route rows are read once, by the combine: non-temporal stores
+            buf_atom = fx.make_copy_atom(_BUF_COPY[_epi_bits](2 if rows_nt and not atomic else 0), out_elem)
             c_rw_copy = fx.make_tiled_copy(
                 buf_atom,
                 fx.make_layout(
@@ -534,6 +539,7 @@ def compile_stage2(
     doweight_stage1=False,
     combine="atomic_bf16",
     wide_k=True,
+    rows_nt=False,
 ):
     return _build_stage2(
         model_dim=model_dim,
@@ -545,4 +551,5 @@ def compile_stage2(
         doweight_stage1=doweight_stage1,
         combine=combine,
         wide_k=wide_k,
+        rows_nt=rows_nt,
     )

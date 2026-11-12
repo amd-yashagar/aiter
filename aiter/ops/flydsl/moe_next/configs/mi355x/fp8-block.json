@@ -83,6 +83,27 @@
       "tile_n2": 128,
       "splits": "auto",
       "stage1": "general"
+    },
+    "p64_nt": {
+      "tile_m": 64,
+      "tile_n2": 128,
+      "rows_nt": true
+    },
+    "p128_nt": {
+      "tile_m": 128,
+      "tile_n2": 128,
+      "rows_nt": true
+    },
+    "p128w8_nt": {
+      "tile_m": 128,
+      "tile_n2": 128,
+      "stage1": "8wave",
+      "rows_nt": true
+    },
+    "d32_nt": {
+      "tile_m": 32,
+      "tile_n2": 128,
+      "rows_nt": true
     }
   },
   "default": [
