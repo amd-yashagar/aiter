@@ -1,0 +1,14 @@
+{
+  "about": "gfx950 fp8 blockscale (per_1x128) tile configs for MI355X (MI350X reads these, unverified). Keyed by config name from the route table; 'default' maps a token-per-expert bucket to a config when a route names none.",
+  "configs": {
+    "d16": {"tile_m": 16, "tile_n2": 128},
+    "d32": {"tile_m": 32, "tile_n2": 128},
+    "p64": {"tile_m": 64, "tile_n2": 128},
+    "p128": {"tile_m": 128, "tile_n2": 128}
+  },
+  "default": [
+    {"max_tokens_per_expert": 16, "config": "d16"},
+    {"max_tokens_per_expert": 32, "config": "d32"},
+    {"max_tokens_per_expert": 1000000000, "config": "p64"}
+  ]
+}
