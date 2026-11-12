@@ -48,6 +48,7 @@ class _Tile:
     own_gateup: bool
     atomic: bool
     down_n_split: int
+    down_waves_n: int
 
 
 def _tile(config, gpu, model_dim, inter_dim, combine=None):
@@ -68,6 +69,7 @@ def _tile(config, gpu, model_dim, inter_dim, combine=None):
         own_gateup=own,
         atomic=(combine or cfg.get("combine", "atomic")) == "atomic",
         down_n_split=_n_split(int(cfg.get("down_n_split", 1)), model_dim),
+        down_waves_n=int(cfg.get("down_waves_n", 1)),
     )
 
 
@@ -118,7 +120,7 @@ def _gateup(N, K, topk, block_n, block_k, quant, act, swiglu_limit):
 
 
 @functools.cache
-def _down(N, K, topk, tile_m, per_tensor, atomic, n_split):
+def _down(N, K, topk, tile_m, per_tensor, atomic, n_split, waves_n):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token.down import compile_down
 
     return compile_down(
@@ -129,6 +131,7 @@ def _down(N, K, topk, tile_m, per_tensor, atomic, n_split):
         PER_TENSOR=per_tensor,
         ATOMIC=atomic,
         N_SPLIT=n_split,
+        WAVES_N=waves_n,
     )
 
 
@@ -239,7 +242,16 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
                 types += (fx.Int32,) * 2
             types += (fx.Float32,) * 2
             gu(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
-            dn = _down(D, I, topk, t.tile_m, per_tensor, t.atomic, t.down_n_split)
+            dn = _down(
+                D,
+                I,
+                topk,
+                t.tile_m,
+                per_tensor,
+                t.atomic,
+                t.down_n_split,
+                t.down_waves_n,
+            )
             types = (fx.Uint8, fx.Uint8, fx.BFloat16, fx.Int32, fx.Float32)
             types += (fx.Int32, fx.Int32, fx.Float32, fx.Float32)
             dn(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
@@ -318,7 +330,16 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
         if not atomic:
             rows = torch.empty((tasks * t.tile_m, D), dtype=torch.bfloat16, device=dev)
         _launch(
-            _down(D, I, topk, t.tile_m, per_tensor, atomic, t.down_n_split),
+            _down(
+                D,
+                I,
+                topk,
+                t.tile_m,
+                per_tensor,
+                atomic,
+                t.down_n_split,
+                t.down_waves_n,
+            ),
             aq,
             call.w2,
             rows,
