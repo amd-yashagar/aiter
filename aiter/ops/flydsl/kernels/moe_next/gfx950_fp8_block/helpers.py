@@ -120,6 +120,14 @@ def buffer_atomic_pk(rsrc, elem_idx, reg_vec, elem_bytes):
         rocdl.raw_ptr_buffer_atomic_fadd(pair, rsrc, byte_off, z, z)
 
 
+def buffer_atomic_f32(rsrc, elem_idx, reg_vec):
+    """Scalar buffer atomic add of an f32 vector."""
+    z = fx.Int32(0)
+    for i in range_constexpr(reg_vec.numel):
+        byte_off = (elem_idx + fx.Int32(i)) * fx.Int32(4)
+        rocdl.raw_ptr_buffer_atomic_fadd(reg_vec[i], rsrc, byte_off, z, z)
+
+
 class TensorWithIndex:
     """Gather/scatter of per-thread tiles by packed sorted ids (token | slot << 24)."""
 
@@ -175,7 +183,8 @@ class TensorWithIndex:
         rep_k = reps(self.fake_tensor_thr, 2)
         value_size = fx.get_shape(frag)[0].to_py_value()
         stride_size = fx.get_stride(frag)[0].to_py_value()
-        tensor_block = self.tensor_blocks_in_k[None, (None, k_idx)]
+        rank = fx.get_shape(self.view).rank
+        tensor_block = self.tensor_blocks_in_k[None, (*([None] * (rank - 1)), k_idx)]
         for m in range_constexpr(rep_m):
             if const_expr(atomic_rsrc is not None):
                 tok = self.index_frag[0, m] & 0xFFFFFF
@@ -200,9 +209,18 @@ class TensorWithIndex:
                         elem_idx = valid.select(
                             aligned, fx.Int32(row_limit) * fx.Int32(row_stride)
                         )
-                        buffer_atomic_pk(atomic_rsrc, elem_idx, reg_vec, out_bytes)
+                        if const_expr(out_bytes == 4):
+                            buffer_atomic_f32(atomic_rsrc, elem_idx, reg_vec)
+                        else:
+                            buffer_atomic_pk(atomic_rsrc, elem_idx, reg_vec, out_bytes)
                 continue
-            tensor_sub_block = tensor_block[None, self.index_frag[0, m] & 0xFFFFFF]
+            if const_expr(rank == 3):
+                # [tokens, topk, N] rows: (token, slot) from the packed sorted id
+                tensor_sub_block = tensor_block[
+                    None, self.index_frag[0, m] & 0xFFFFFF, self.index_frag[0, m] >> 24
+                ]
+            else:
+                tensor_sub_block = tensor_block[None, self.index_frag[0, m] & 0xFFFFFF]
             for k in range_constexpr(rep_k):
                 offset_block = fx.crd2idx((0, m, k), layout).to_py_value()
                 offset_k_in_tile = offset_block // self.tile_m + self.offset_thread_k

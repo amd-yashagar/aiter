@@ -11,8 +11,12 @@ CShuffle epilogue with channel-major pk-bf16 buffer atomics.
 A is core's per_1x128 intermediate: values [rows, I] fp8 and scales [rows, I/128] fp32,
 row = sorted position, so a tile's rows are contiguous (no gather). Per 128-wide K group
 g: P = A[:, g] . W2[:, g]^T, acc += P * (inter_scale[row, g] * w2_scale[block, g]).
-Epilogue: acc * sorted_weight[row] (unless doweight_stage1), atomically added into
-out[token] (the output is zeroed before stage 1); padding rows (token >= M) are skipped.
+Epilogue: acc * sorted_weight[row] (unless doweight_stage1), then by `combine`:
+  atomic_bf16  pk-bf16 atomics into out[token], zeroed by the sort (as aiter's CK stage 2)
+  atomic_f32   f32 atomics into a zeroed f32 [M, N] buffer, rounded to bf16 once after
+  rows_f32     f32 per-route rows [M, topk, N] (row = token * topk + slot), summed over
+               topk in fp32 and rounded once after (deterministic)
+Padding rows (token >= M) are skipped.
 """
 
 import functools
@@ -25,8 +29,22 @@ from flydsl.expr.typing import Vector as Vec
 
 from . import helpers as fxh
 
+COMBINES = ("atomic_bf16", "atomic_f32", "rows_f32")
+_BUF_COPY = {
+    32: fx.rocdl.BufferCopy32b,
+    64: fx.rocdl.BufferCopy64b,
+    128: fx.rocdl.BufferCopy128b,
+}
+_UNI_COPY = {
+    32: fx.UniversalCopy32b,
+    64: fx.UniversalCopy64b,
+    128: fx.UniversalCopy128b,
+}
 
-def _build_stage2(*, model_dim, inter_dim, experts, tile_m, tile_n, doweight_stage1):
+
+def _build_stage2(
+    *, model_dim, inter_dim, experts, topk, tile_m, tile_n, doweight_stage1, combine
+):
     elem_t = fx.Float8E4M3FN
     MFMA_K = 32
     K = int(inter_dim)
@@ -36,8 +54,12 @@ def _build_stage2(*, model_dim, inter_dim, experts, tile_m, tile_n, doweight_sta
     BM = int(tile_m)
     BN = int(tile_n)
     TILE_K = 128
-    out_elem = fx.BFloat16
-    out_bytes = 2
+    TOPK = int(topk)
+    assert combine in COMBINES, combine
+    out_is_f32 = combine != "atomic_bf16"
+    atomic = combine.startswith("atomic")
+    out_elem = fx.Float32 if out_is_f32 else fx.BFloat16
+    out_bytes = 4 if out_is_f32 else 2
     assert K % TILE_K == 0, f"inter_dim={K} must be a multiple of 128"
     assert (
         BN in (64, 128, 256) and N % BN == 0
@@ -212,7 +234,10 @@ def _build_stage2(*, model_dim, inter_dim, experts, tile_m, tile_n, doweight_sta
                 acc = c_frag[None, m, n].load()
                 if const_expr(not doweight_stage1):
                     acc = acc * tw_frag[0, n]
-                out_frag[None, m, n].store(acc.to(out_elem))
+                if const_expr(out_is_f32):
+                    out_frag[None, m, n].store(acc)
+                else:
+                    out_frag[None, m, n].store(acc.to(out_elem))
         return out_frag
 
     _weight_and_cast = ASTRewriter.transform(_weight_and_cast)
@@ -287,25 +312,39 @@ def _build_stage2(*, model_dim, inter_dim, experts, tile_m, tile_n, doweight_sta
             )
             tw_frag = fxh.load_sorted_weight_frag(arg_sorted_weights, row0, BM, tid)
 
+            out_rows = tokens if const_expr(atomic) else tokens * fx.Int32(TOPK)
             out_atomic_rsrc = fx.rocdl.get_buffer_rsrc(
                 fx.get_iter(
                     fx.rocdl.make_buffer_tensor(
                         arg_out,
                         max_size=False,
-                        num_records_bytes=fx.Int64(tokens) * fx.Int64(N * out_bytes),
+                        num_records_bytes=fx.Int64(out_rows) * fx.Int64(N * out_bytes),
                     )
                 )
             )
-            arg_p_output = fx.make_view(
-                fx.recast_iter(out_elem, fx.get_iter(arg_out)),
-                fx.make_layout((tokens, fx.Int32(N)), (fx.Int32(N), 1)),
-            )
+            if const_expr(atomic):
+                arg_p_output = fx.make_view(
+                    fx.recast_iter(out_elem, fx.get_iter(arg_out)),
+                    fx.make_layout((tokens, fx.Int32(N)), (fx.Int32(N), 1)),
+                )
+            else:
+                # per-route rows [tokens, topk, N]: row = token * topk + slot
+                arg_p_output = fx.make_view(
+                    fx.recast_iter(out_elem, fx.get_iter(arg_out)),
+                    fx.make_layout(
+                        (tokens, fx.Int32(TOPK), fx.Int32(N)),
+                        (fx.Int32(TOPK * N), fx.Int32(N), 1),
+                    ),
+                )
             out_tensor = fx.rocdl.make_buffer_tensor(arg_p_output, max_size=False)
             _cshuffle_nlane = 32
             _n_row_thr = 256 // _cshuffle_nlane
-            _e_vec = 2
+            # Atomics: two values per lane keep the 32 lanes on contiguous channels
+            # (one pk pair, or two f32 atomics, per instruction). Rows: 128-bit stores.
+            _e_vec = 2 if const_expr(atomic) else 128 // out_elem.width
             _n_chan_tile = _cshuffle_nlane * _e_vec
-            buf_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), out_elem)
+            _epi_bits = _e_vec * out_elem.width
+            buf_atom = fx.make_copy_atom(_BUF_COPY[_epi_bits](), out_elem)
             c_rw_copy = fx.make_tiled_copy(
                 buf_atom,
                 fx.make_layout(
@@ -347,9 +386,9 @@ def _build_stage2(*, model_dim, inter_dim, experts, tile_m, tile_n, doweight_sta
 
             _, _tiled_mma = fxh.make_1x4_tiled_mma(elem_t)
             cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy64b(), out_elem)
-            cshuf_atom_r = fx.make_copy_atom(fx.UniversalCopy32b(), out_elem)
+            cshuf_atom_r = fx.make_copy_atom(_UNI_COPY[_epi_bits](), out_elem)
             cshuf_ptr = fx.recast_iter(out_elem, lds.gemm.region.ptr)
-            swz_c = fx.SwizzleType.get(3, 3, 3)
+            swz_c = fx.SwizzleType.get(3, 2 if const_expr(out_is_f32) else 3, 3)
             lds_c_store = fx.make_view(
                 cshuf_ptr,
                 fx.make_composed_layout(
@@ -372,15 +411,18 @@ def _build_stage2(*, model_dim, inter_dim, experts, tile_m, tile_n, doweight_sta
             gpu.barrier()
             rd = fx.make_fragment_like(c_rw_copy.get_slice(tid).partition_S(lds_c))
             fx.copy(cshuf_atom_r, c_rw_copy.get_slice(tid).partition_S(lds_c), rd)
-            c_out.copy(
-                buf_atom,
-                blk_n,
-                rd,
-                atomic_rsrc=out_atomic_rsrc,
-                out_bytes=out_bytes,
-                row_stride=N,
-                row_limit=tokens,
-            )
+            if const_expr(atomic):
+                c_out.copy(
+                    buf_atom,
+                    blk_n,
+                    rd,
+                    atomic_rsrc=out_atomic_rsrc,
+                    out_bytes=out_bytes,
+                    row_stride=N,
+                    row_limit=tokens,
+                )
+            else:
+                c_out.copy(buf_atom, blk_n, rd)
 
     @flyc.jit
     def launch_fp8b_stage2(
@@ -419,13 +461,23 @@ def _build_stage2(*, model_dim, inter_dim, experts, tile_m, tile_n, doweight_sta
 
 @functools.lru_cache(maxsize=256)
 def compile_stage2(
-    *, model_dim, inter_dim, experts, tile_m, tile_n=128, doweight_stage1=False
+    *,
+    model_dim,
+    inter_dim,
+    experts,
+    topk,
+    tile_m,
+    tile_n=128,
+    doweight_stage1=False,
+    combine="atomic_bf16",
 ):
     return _build_stage2(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=experts,
+        topk=topk,
         tile_m=tile_m,
         tile_n=tile_n,
         doweight_stage1=doweight_stage1,
+        combine=combine,
     )
