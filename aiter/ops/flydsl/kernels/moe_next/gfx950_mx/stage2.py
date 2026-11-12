@@ -63,6 +63,8 @@ def _build_stage2(
     nt=False,
     direct=False,
     xcd=False,
+    waves_per_eu=0,
+    xcd_group=1,
 ):
     D = int(model_dim)
     INTER = int(inter_dim)
@@ -124,7 +126,7 @@ def _build_stage2(
         ngrp = fx.Int32(gpu.block_id("x"))
         mblk = fx.Int32(gpu.block_id("y"))
         if const_expr(XCD):
-            ngrp, mblk = cm.xcd_tile(ngrp, mblk, D // (BN * NBW))
+            ngrp, mblk = cm.xcd_tile(ngrp, mblk, D // (BN * NBW), int(xcd_group))
         m_row = mblk * fx.Int32(BM)
         eids = cm.global_ptr(arg_eids, T.i32)
         if const_expr(direct):
@@ -460,6 +462,9 @@ def _build_stage2(
             stream=stream,
         )
 
+    if waves_per_eu:
+        # register budget for that many waves per SIMD (the compiler spills past it)
+        launch_mx_stage2.compile_hints["waves_per_eu"] = int(waves_per_eu)
     return launch_mx_stage2
 
 
