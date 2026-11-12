@@ -1799,6 +1799,18 @@ def _fused_moe_impl(
                 not (isShuffled and isG1U1 and not doweight_stage1),
                 "non-preshuffled / non-g1u1 weights or doweight_stage1=True",
             ),
+            (
+                _is_a16w4_situv2
+                and (
+                    gate_mode == GateMode.INTERLEAVE
+                    or getattr(w1, "gate_up_interleave", None) is True
+                ),
+                (
+                    "interleaved gate/up weights (the FlyDSL a16w4 kernels read "
+                    "separated rows; with this layout set AITER_SITUV2_A8W4=1 "
+                    "to run fp8 activations)"
+                ),
+            ),
         ):
             if _bad:
                 raise NotImplementedError(
