@@ -11,6 +11,8 @@ as e8m0_shuffle / shuffle_scale_a16w4; gate/up separated or 16-row interleaved
 (gate_mode). The activation dtype is the one fused_moe itself resolves.
 """
 
+from typing import ClassVar
+
 import torch
 
 from aiter import ActivationType, QuantType, dtypes
@@ -47,6 +49,16 @@ def activation_dtype(spec, weights, w1, m, hidden_dtype, has_a1_scale):
         has_a1_scale=has_a1_scale,
         gate_up_interleave=getattr(w1, "gate_up_interleave", None),
     )
+
+
+def parse_config(config):
+    """'bm128_tn64_la4' -> {"bm": 128, "tn": 64, "la": 4}; empty means defaults."""
+    out = {}
+    for tok in (config or "").split("_"):
+        key = tok.rstrip("0123456789")
+        if key in ("bm", "tn", "la") and tok[len(key) :]:
+            out[key] = int(tok[len(key) :])
+    return out
 
 
 def tile_m_for(m, topk, experts, prefill):
@@ -133,8 +145,10 @@ class _MxGfx950(MoeKernel):
 
         a = _DT[a_dtype]
         w = _DT[spec.w_dtype]
-        bm = int(config[2:]) if config.startswith("bm") else None
-        bm = bm or tile_m_for(m, topk, spec.experts, self.prefill)
+        cfg = parse_config(config)
+        bm = cfg.get("bm") or tile_m_for(m, topk, spec.experts, self.prefill)
+        tn = cfg.get("tn") or (128 if self.prefill else 64)
+        la = cfg.get("la") or (2 if self.prefill else 4)
         reduce = self.epilogue == "reduce"
         beta = weights.kwarg("beta", 1.0)
         lbeta = weights.kwarg("linear_beta", 1.0)
@@ -154,6 +168,8 @@ class _MxGfx950(MoeKernel):
             situ_beta=float(beta),
             situ_linear_beta=float(lbeta),
             round_bf16=False,
+            tile_n=tn,
+            ahead=la,
         )
         s2 = compile_stage2(
             model_dim=spec.model_dim,
@@ -191,13 +207,13 @@ class _MxGfx950(MoeKernel):
     def __call__(self, call: MoeCall) -> torch.Tensor:
         import flydsl.expr as fx
 
-        from aiter.fused_moe import moe_sorting
         from aiter.ops.flydsl.kernels.moe_next.gfx950_mx import common as cm
         from aiter.ops.flydsl.kernels.moe_next.gfx950_mx.quant import (
             token_quant_blocks,
         )
         from aiter.ops.flydsl.kernels.moe_next.gfx950_mx.stage2 import reduce_blocks
         from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+        from aiter.ops.flydsl.moe_next.core.tile_map import route_to_tiles
 
         spec, weights = call.spec, call.weights
         x = call.hidden_states
@@ -207,16 +223,23 @@ class _MxGfx950(MoeKernel):
             spec, weights, M, call.topk, a_dtype, call.config
         )
         dev = x.device
-        sids, sw, se, nv, out = moe_sorting(
+        out = call.output
+        if out is None:
+            out = torch.empty((M, D), dtype=torch.bfloat16, device=dev)
+        tm = route_to_tiles(
             call.topk_ids,
             call.topk_weight,
-            E,
-            D,
-            torch.bfloat16,
-            block_size=bm,
-            output=call.output,
+            num_experts=E,
+            tile_m=bm,
+            zero_output=None if r is not None else out,
         )
-        rows, mblocks = sids.numel(), se.numel()
+        sids, sw, se, nv = (
+            tm.sorted_token_ids,
+            tm.sorted_weights,
+            tm.sorted_expert_ids,
+            tm.num_valid_ids,
+        )
+        rows, mblocks = tm.rows, tm.max_tiles
         stream = fx.Stream(torch.cuda.current_stream(dev))
         aq = torch.empty(
             (M, D // 2 if a == "fp4" else D), dtype=torch.uint8, device=dev
@@ -283,6 +306,11 @@ class _MxGfx950(MoeKernel):
 class MxGfx950Decode(_MxGfx950):
     id = "gfx950_mx.decode"
     epilogue = "atomic"
+    numerics: ClassVar[dict] = {
+        "act_quant": "per_1x32_mx_roundup",
+        "inter": "fp32_direct",
+        "combine": "bf16_atomic",
+    }
     prefill = False
 
 
@@ -290,4 +318,9 @@ class MxGfx950Decode(_MxGfx950):
 class MxGfx950Prefill(_MxGfx950):
     id = "gfx950_mx.prefill"
     epilogue = "reduce"
+    numerics: ClassVar[dict] = {
+        "act_quant": "per_1x32_mx_roundup",
+        "inter": "fp32_direct",
+        "combine": "bf16_rows_fp32_reduce",
+    }
     prefill = True
