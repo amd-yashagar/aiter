@@ -34,6 +34,9 @@ from flydsl.expr.typing import Vector as Vec
 
 from . import helpers as fxh
 
+# keep fp32 folds as VOP2: v_pk_fma_f32 does not issue under an MFMA (lag-scale-fold-behind-mfma)
+_NO_PACKED_F32 = {"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]}
+
 CHANNELS = 128  # intermediate channels per workgroup = one quant group
 
 
@@ -185,8 +188,10 @@ def _build_stage1(
         ]
         c_gate = tiled_mma.make_fragment_C(c_fake)
         c_up = tiled_mma.make_fragment_C(c_fake)
-        p_gate = tiled_mma.make_fragment_C(c_fake)
-        p_up = tiled_mma.make_fragment_C(c_fake)
+        p_gate = p_up = None
+        if const_expr(not wide_k):
+            p_gate = tiled_mma.make_fragment_C(c_fake)
+            p_up = tiled_mma.make_fragment_C(c_fake)
         c_gate.fill(0)
         c_up.fill(0)
         m_reps = fxh.reps(c_gate, 1)
@@ -227,35 +232,65 @@ def _build_stage1(
                     a_frag_retile_bufs[s][None, None, ki],
                 )
 
+        def _fold(acc, m, n, p, f):
+            c = acc[None, m, n].load()
+            acc[None, m, n].store(
+                Vec.from_elements([fx.fma(p[v], f, c[v]) for v in range(4)], fx.Float32)
+            )
+
         def _mfma_fold(s, sa, sg, su):
-            p_gate.fill(0)
-            p_up.fill(0)
-            fx.gemm(mma_atom, p_gate, bl_frag_bufs[s], a_frag_bufs[s], p_gate)
-            fx.gemm(mma_atom, p_up, br_frag_bufs[s], a_frag_bufs[s], p_up)
+            if const_expr(not wide_k):
+                p_gate.fill(0)
+                p_up.fill(0)
+                fx.gemm(mma_atom, p_gate, bl_frag_bufs[s], a_frag_bufs[s], p_gate)
+                fx.gemm(mma_atom, p_up, br_frag_bufs[s], a_frag_bufs[s], p_up)
+                for n in range_constexpr(n_reps):
+                    for m in range_constexpr(m_reps):
+                        _fold(c_gate, m, n, p_gate[None, m, n].load(), sa[n] * sg)
+                        _fold(c_up, m, n, p_up[None, m, n].load(), sa[n] * su)
+                return
+            # One 16x16x128 MFMA per (operand, m, n) into a fresh 4-register partial
+            # (inline zero accumulator), folded into the fp32 accumulator one MFMA later
+            # so the fold's VALU issues under the next MFMA (lag-scale-fold-behind-mfma).
+            pending = None
             for n in range_constexpr(n_reps):
-                fg = sa[n] * sg
-                fu = sa[n] * su
+                # this token rep's A straight from the current LDS buffer: only one rep live
+                fx.copy(
+                    uni_cp_atom,
+                    a_lds_r_bufs[s][None, n, 0],
+                    a_frag_retile_bufs[s][None, n, 0],
+                )
+                tok = Vec(a_frag_bufs[s][None, n, 0].load()).bitcast(fx.Int32)
                 for m in range_constexpr(m_reps):
-                    pg = p_gate[None, m, n].load()
-                    pu = p_up[None, m, n].load()
-                    cg = c_gate[None, m, n].load()
-                    cu = c_up[None, m, n].load()
-                    c_gate[None, m, n].store(
-                        Vec.from_elements(
-                            [fx.fma(pg[v], fg, cg[v]) for v in range(4)], fx.Float32
+                    for acc, wf, sw in (
+                        (c_gate, bl_frag_bufs[s], sg),
+                        (c_up, br_frag_bufs[s], su),
+                    ):
+                        p = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                            T.vec(4, T.f32),
+                            [
+                                Vec(wf[None, m, 0].load()).bitcast(fx.Int32),
+                                tok,
+                                Vec.filled(4, 0.0, fx.Float32),
+                                0,
+                                0,
+                                0,
+                                fx.Int32(0),
+                                0,
+                                fx.Int32(0),
+                            ],
                         )
-                    )
-                    c_up[None, m, n].store(
-                        Vec.from_elements(
-                            [fx.fma(pu[v], fu, cu[v]) for v in range(4)], fx.Float32
-                        )
-                    )
+                        if const_expr(pending is not None):
+                            _fold(*pending)
+                        pending = (acc, m, n, Vec(p), sa[n] * sw)
+            _fold(*pending)
 
         _load_gmem(0, 0)
         rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile))
         _write_a_lds(0)
         gpu.barrier()
-        _read_a_lds(0)
+        if const_expr(not wide_k):
+            _read_a_lds(0)
         # Rolled K loop, two tiles per trip so the ping-pong buffers stay static. The
         # prefetch past the last tile is clamped to it (loaded and ignored), so every
         # trip issues the same loads and waits on the same vmcnt.
@@ -271,7 +306,8 @@ def _build_stage1(
                 _write_a_lds(1 - u)
                 _mfma_fold(u, sa, sg, su)
                 gpu.barrier()
-                _read_a_lds(1 - u)
+                if const_expr(not wide_k):
+                    _read_a_lds(1 - u)
         return c_gate, c_up
 
     _gemm = ASTRewriter.transform(_gemm)
@@ -510,6 +546,7 @@ def _build_stage1(
             arg_num_valid_ids,
             i32_tokens,
             i32_rows,
+            value_attrs=_NO_PACKED_F32,
         ).launch(grid=(IB, fx.Int64(i32_tiles), 1), block=(256, 1, 1), stream=stream)
 
     return launch_fp8b_stage1
