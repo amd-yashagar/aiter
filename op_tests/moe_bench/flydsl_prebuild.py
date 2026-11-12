@@ -145,8 +145,17 @@ def build_slice(case, part, parts, tmpdir, indices=None):
             mine = [cands[i] for i in indices if i < len(cands)]
         else:
             mine = [c for i, c in enumerate(cands) if i % parts == part]
-        aw, _rw, bias = workload.build_group(S)
-        hs, tw, ti = accuracy.acc_inputs(S, case.token, 0)
+        import torch
+
+        # values never matter for a build key; the quantizers' scalar reads (.item())
+        # have no value on a FakeTensor and raise (mxfp8's scale rule does)
+        real_item = torch.Tensor.item
+        torch.Tensor.item = lambda self: 0.0
+        try:
+            aw, _rw, bias = workload.build_group(S)
+            hs, tw, ti = accuracy.acc_inputs(S, case.token, 0)
+        finally:
+            torch.Tensor.item = real_item
         mask = workload.make_expert_mask(S) if S.is_ep else None
         kw = workload.fused_kwargs(S, aw, bias, mask)
         params = inspect.signature(fm._fused_moe_impl).parameters
