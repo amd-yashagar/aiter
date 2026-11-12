@@ -21,6 +21,8 @@ from aiter.ops.flydsl.moe_common import GateMode
 
 _CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
 _ACTS = {ActivationType.Silu: "silu"}
+# Core's route_to_tiles is 1.2-1.6x slower on the device than Opus at mid and large M.
+_CORE_SORT = os.getenv("AITER_FP8B_CORE_SORT", "0") == "1"
 
 
 @functools.cache
@@ -143,6 +145,7 @@ class _Fp8BlockGfx950(MoeKernel):
     def __call__(self, call: MoeCall) -> torch.Tensor:
         import flydsl.expr as fx
 
+        from aiter.fused_moe import moe_sorting
         from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
         from aiter.ops.flydsl.moe_next.core.intermediate import Layout
         from aiter.ops.flydsl.moe_next.core.tile_map import route_to_tiles
@@ -170,18 +173,35 @@ class _Fp8BlockGfx950(MoeKernel):
         else:
             # zeroed: masked, -1 and past-num_local_tokens routes write no row
             buf = torch.zeros((M * call.topk, D), dtype=torch.float32, device=x.device)
-        tmap = route_to_tiles(
-            call.topk_ids.to(torch.int32),
-            call.topk_weight.to(torch.float32),
-            num_experts=call.global_experts,
-            tile_m=tm,
-            expert_mask=call.expert_mask,
-            num_local_tokens=call.num_local_tokens,
-            zero_output=None if combine == "rows_f32" else buf,
-        )
-        sorted_ids, sorted_w = tmap.sorted_token_ids, tmap.sorted_weights
-        sorted_e, nvalid = tmap.sorted_expert_ids, tmap.num_valid_ids
-        rows, tiles = tmap.rows, tmap.max_tiles
+        zero = None if combine == "rows_f32" else buf
+        # As fused_moe sorts: global expert count, EP mask (local expert ids out, masked
+        # and -1 routes dropped, their rows zeroed), num_local_tokens.
+        if _CORE_SORT:
+            tmap = route_to_tiles(
+                call.topk_ids.to(torch.int32),
+                call.topk_weight.to(torch.float32),
+                num_experts=call.global_experts,
+                tile_m=tm,
+                expert_mask=call.expert_mask,
+                num_local_tokens=call.num_local_tokens,
+                zero_output=zero,
+            )
+            sorted_ids, sorted_w = tmap.sorted_token_ids, tmap.sorted_weights
+            sorted_e, nvalid = tmap.sorted_expert_ids, tmap.num_valid_ids
+        else:
+            sorted_ids, sorted_w, sorted_e, nvalid, _ = moe_sorting(
+                call.topk_ids,
+                call.topk_weight,
+                call.global_experts,
+                D,
+                buf.dtype if zero is not None else torch.bfloat16,
+                block_size=tm,
+                expert_mask=call.expert_mask,
+                num_local_tokens=call.num_local_tokens,
+                output=zero,
+                accumulate=zero is not None,
+            )
+        rows, tiles = sorted_ids.numel(), sorted_e.numel()
         inter = Layout.for_spec(spec, M, call.topk, tm).alloc(x.device)
         inter, inter_s = inter.values, inter.scales
         stream = fx.Stream(torch.cuda.current_stream(x.device))
