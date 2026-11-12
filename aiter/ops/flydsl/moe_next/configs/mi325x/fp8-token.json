@@ -27,5 +27,8 @@
   },
   "w4": {
     "down_waves_n": 1
+  },
+  "dw8": {
+    "decode_waves": 8
   }
 }
