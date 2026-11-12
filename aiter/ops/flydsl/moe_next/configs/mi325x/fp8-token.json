@@ -2,8 +2,7 @@
   "default": {
     "gateup": "own",
     "tile_m": 128,
-    "gateup_block_n": 256,
-    "combine": "atomic"
+    "gateup_block_n": 256
   },
   "bn128": {
     "gateup_block_n": 128
@@ -16,7 +15,13 @@
     "gateup_block_n": 128,
     "gateup_block_k": 256
   },
-  "rows": {
-    "combine": "rows"
+  "ns2": {
+    "down_n_split": 2
+  },
+  "ns4": {
+    "down_n_split": 4
+  },
+  "ns8": {
+    "down_n_split": 8
   }
 }
