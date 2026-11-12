@@ -53,6 +53,7 @@ def _build_stage2(
     topk,
     blocks=1,
     nt=False,
+    direct=False,
 ):
     D = int(model_dim)
     INTER = int(inter_dim)
@@ -109,15 +110,17 @@ def _build_stage2(
         ngrp = fx.Int32(gpu.block_id("x"))
         mblk = fx.Int32(gpu.block_id("y"))
         m_row = mblk * fx.Int32(BM)
-        nvalid = cm.global_ptr(arg_nvalid, T.i32)[0]
-        if m_row < nvalid:
+        e = fx.Int32(
+            rocdl.readfirstlane(T.i32, cm._raw(cm.global_ptr(arg_eids, T.i32)[mblk]))
+        )
+        if const_expr(direct):
+            # Direct mode: one tile per route slot; non-leading slots hold -1.
+            cond = e >= fx.Int32(0)
+        else:
+            cond = m_row < cm.global_ptr(arg_nvalid, T.i32)[0]
+        if cond:
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
             lds_base = fx.Int32(fx.ptrtoint(lds.buf.ptr))
-            e = fx.Int32(
-                rocdl.readfirstlane(
-                    T.i32, cm._raw(cm.global_ptr(arg_eids, T.i32)[mblk])
-                )
-            )
             lane16 = lane % fx.Int32(16)
             lgrp = lane // fx.Int32(16)
             a_row_in_pass = tid // fx.Int32(NCH)
