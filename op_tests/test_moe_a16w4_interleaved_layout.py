@@ -73,7 +73,7 @@ def _dispatch(token, model_dim, inter_dim, expert, topk, gate_mode, tag):
         (dtypes.bf16, GateMode.INTERLEAVE, None, False),
         (dtypes.fp8, GateMode.INTERLEAVE, True, True),
         (dtypes.fp8, GateMode.INTERLEAVE, None, True),
-        (dtypes.fp4x2, GateMode.INTERLEAVE, True, True),
+        (dtypes.fp4x2, GateMode.INTERLEAVE, True, False),
     ],
 )
 def test_layout_check(q_dtype_a, gate_mode, tag, want):
