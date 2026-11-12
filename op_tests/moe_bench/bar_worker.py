@@ -198,6 +198,7 @@ class Measurer:
                 res["route"] = route
             reason = cand.verify(route) if hasattr(cand, "verify") else None
             if reason:
+                res["outcome"] = "discarded"
                 self._emit(base, modes, status="router-discarded", detail=reason)
                 return res
             if self.acc_refs is None:
@@ -671,6 +672,11 @@ def _accounting(enum_counts, stats, enum_errors, kind):
         reasons.append("generator errors: " + "; ".join(enum_errors)[:300])
     for k, t in acct.items():
         total = t.get("total", 0)
+        if t.get("enumerated", 0) > 0 and total > 0 and t.get("discarded", 0) == total:
+            reasons.append(
+                f"{k}: all {total} tried candidates router-discarded "
+                "(the router never ran what the harness forced)"
+            )
         if (
             t.get("enumerated", 0) > 0
             and total > 0

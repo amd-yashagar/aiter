@@ -314,6 +314,44 @@ def tier_name(cases_arg):
     return os.path.splitext(os.path.basename(cases_arg.split(",")[0]))[0]
 
 
+def check_discarded_sources(out_dir, tier, prefix):
+    """Flag a candidate source (source and backend) the router discarded on every row.
+
+    One discard is a mismatch between what was forced and what ran; a whole source
+    discarded everywhere is a harness defect that leaves the bar missing a backend. The
+    finding goes into the bar's meta and the log; rerun the run after the fix.
+    """
+    path = os.path.join(out_dir, f"candidates-{tier}.csv")
+    if not os.path.exists(path):
+        return []
+    from . import routes
+
+    tally = {}
+    with open(path, newline="") as f:
+        for r in csv.DictReader(f):
+            if r.get("source") in ("dispatch", "off", "new"):
+                continue
+            be = routes.backend_of((r.get("kernels") or "").split(" ")[0]) or "?"
+            t = tally.setdefault(f"{r.get('source')}:{be}", [0, 0])
+            t[0] += 1
+            t[1] += r.get("status") == "router-discarded"
+    bad = {k: v for k, v in tally.items() if v[0] > 0 and v[1] == v[0]}
+    if bad:
+        print(
+            f"WARNING {prefix}: candidate sources discarded by the router on every "
+            f"case: {sorted(bad)}. The bar lacks these backends; do not use it as a gate.",
+            flush=True,
+        )
+        mp = os.path.join(out_dir, f"{prefix}-{tier}.meta.json")
+        if os.path.exists(mp):
+            with open(mp) as f:
+                meta = json.load(f)
+            meta["router_discarded_sources"] = {k: v[0] for k, v in bad.items()}
+            with open(mp, "w") as f:
+                json.dump(meta, f, indent=1)
+    return sorted(bad)
+
+
 def cmd_bar(args):
     """bar mode, or new mode: routing on, routing off (AITER_MOE_DISABLE), first calls."""
     if args.kind != "new":
@@ -565,6 +603,8 @@ def _run_pass(args, kind):
     runner.run_jobs(jobs, args.jobs)
     bar.close()
     cand.close()
+    if kind == "bar":
+        check_discarded_sources(args.out_dir, tier, prefix)
     if getattr(args, "inner", False):
         open(os.path.join(args.out_dir, ".done"), "w").close()
     print(f"{prefix} finished in {time.time() - t0:.0f}s -> {args.out_dir}", flush=True)

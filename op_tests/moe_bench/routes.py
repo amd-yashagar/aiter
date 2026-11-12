@@ -91,12 +91,12 @@ def describe_metadata(md):
     k2 = _stage_name(md.stage2)
     full = ""
     if md.full_impl is not None:
-        full = str(
-            getattr(md.full_impl, "name", None)
-            or getattr(getattr(md.full_impl, "impl", None), "__name__", None)
-            or getattr(md.full_impl, "__name__", None)
-            or repr(md.full_impl)
-        )
+        full = str(getattr(md.full_impl, "name", None) or "")
+        if not full.startswith("impl__"):
+            raise RuntimeError(
+                f"whole-graph impl {md.full_impl!r} carries no kernel name; "
+                "routes.install_impl_tag() was not active when it was resolved"
+            )
     flat = int(md.flat) if md.flat is not None else 0
     if full:
         b1, b2, k1, k2 = backend_of(full) or "impl", "", full, ""
@@ -235,12 +235,39 @@ def tuned_row_hit(fm, call_args, md_desc):
     return False
 
 
+def install_impl_tag():
+    """Name whole-graph impls after their kernel name.
+
+    ``resolve_fused_moe_impl`` returns ``lambda request: implementation(request, config)``
+    and the lambda carries nothing that says which ``impl__...`` kernel it is, so a route
+    that resolved to a FlyDSL whole-graph config read ``<lambda>`` and every such
+    candidate failed the router check. The tag is set on the returned callable (as
+    ``name``) where it is made; cached metadata made before the patch is dropped.
+    """
+    import aiter.fused_moe as fm
+
+    cur = fm.resolve_fused_moe_impl
+    if getattr(cur, "_moe_bench_tag", False):
+        return
+
+    def tagged(kernel_name):
+        impl = cur(kernel_name)
+        if impl is not None:
+            impl.name = kernel_name
+        return impl
+
+    tagged._moe_bench_tag = True
+    fm.resolve_fused_moe_impl = tagged
+    fm.get_2stage_cfgs.cache_clear()
+
+
 class RouteRecorder:
     """Wrap ``aiter.fused_moe.get_2stage_cfgs`` to log every resolution."""
 
     def __init__(self):
         import aiter.fused_moe as fm
 
+        install_impl_tag()
         self.fm = fm
         self.orig = fm.get_2stage_cfgs
         self.records = []
@@ -360,6 +387,8 @@ def _stub_full_impl(md):
 
     def stub(*a, **k):
         raise _DryStop()
+
+    stub.name = getattr(md.full_impl, "name", None)
 
     return dataclasses.replace(md, full_impl=stub)
 
