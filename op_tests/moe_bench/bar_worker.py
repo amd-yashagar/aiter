@@ -431,7 +431,10 @@ def _gate(who, acc):
 
     if not acc:
         return {}
-    out = {f"{who}_acc_pass": acc["pass"]}
+    out = {
+        f"{who}_acc_pass": acc["pass"],
+        f"{who}_nondeterministic": acc["nondeterministic"],
+    }
     for ref in accuracy.REFS:
         for k in accuracy.GATE_METRICS:
             name = f"{ref}_{k}"

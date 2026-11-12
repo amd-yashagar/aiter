@@ -152,7 +152,7 @@ class NewCandidate(Candidate):
             return
         if "new" not in ctx.group_cache:
             prep, _ = split_kwargs(ctx.kwargs, self.mod)
-            kw = dict(prep, dtype=S.dtype, topk=S.topk)
+            kw = dict(prep, dtype=S.dtype, topk=S.topk, warmup_m=(S.M,))
             if S.is_ep:
                 kw["num_global_experts"] = S.E
             routes = os.environ.get("MOE_BENCH_NEW_ROUTES")
@@ -164,9 +164,15 @@ class NewCandidate(Candidate):
         explain = getattr(self.mod, "explain", None)
         if explain is not None:
             try:
-                info = explain(ctx.group_cache["new"], S.M, topk=S.topk)
+                info = explain(
+                    ctx.group_cache["new"],
+                    S.M,
+                    topk=S.topk,
+                    hidden_dtype=S.dtype,
+                    has_a1_scale=ctx.kwargs.get("a1_scale") is not None,
+                )
             except TypeError:
-                info = explain(ctx.group_cache["new"], S.M)
+                info = explain(ctx.group_cache["new"], S.M, topk=S.topk)
             self.kernel_id = str(info.get("route", ""))
             self.kernels = self.kernel_id
 

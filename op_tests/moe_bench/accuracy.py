@@ -315,14 +315,19 @@ def evaluate(
     """
     saved = (ctx.hidden_static.clone(), ctx.tw, ctx.ti)
     per_seed, nan_inf = [], 0
+    nondeterministic = False
     try:
         for seed in seeds:
             hs, tw, ti = acc_inputs(S, S.M, seed)
             ctx.hidden_static.copy_(hs)
             ctx.tw, ctx.ti = tw, ti
+            prev = None
             for rep in range(repeats):
                 out = call()
                 torch.cuda.synchronize()
+                if prev is not None and not torch.equal(prev, out):
+                    nondeterministic = True
+                prev = out.clone() if repeats > 1 else None
                 bad = int(torch.isnan(out).sum()) + int(torch.isinf(out).sum())
                 nan_inf += bad
                 y = out[:n_valid][rows[rows < n_valid]]
@@ -349,7 +354,12 @@ def evaluate(
         sentinel_ok = not bool((out_s[:n_valid].float() == 12345.0).all(dim=-1).any())
     except Exception:  # noqa: BLE001  (output= unsupported by this candidate)
         sentinel_ok = None
-    res = {"per_seed": per_seed, "nan_inf": nan_inf, "sentinel_ok": sentinel_ok}
+    res = {
+        "per_seed": per_seed,
+        "nan_inf": nan_inf,
+        "sentinel_ok": sentinel_ok,
+        "nondeterministic": nondeterministic if repeats > 1 else None,
+    }
     res.update(aggregate(per_seed))
     res["pass"] = rule(res)
     return res
@@ -387,7 +397,11 @@ def rule(res):
 
 def flat_columns(res, prefix=""):
     """Flat per-seed, mean and std columns of one evaluation."""
-    out = {f"{prefix}acc_pass": res["pass"], f"{prefix}acc_nan_inf": res["nan_inf"]}
+    out = {
+        f"{prefix}acc_pass": res["pass"],
+        f"{prefix}acc_nan_inf": res["nan_inf"],
+        f"{prefix}nondeterministic": res["nondeterministic"],
+    }
     for ref in REFS:
         for k in METRICS:
             name = f"{ref}_{k}"
@@ -401,7 +415,7 @@ def flat_columns(res, prefix=""):
 
 
 def seed_columns():
-    cols = ["acc_pass", "acc_nan_inf"]
+    cols = ["acc_pass", "acc_nan_inf", "nondeterministic"]
     for ref in REFS:
         for k in METRICS:
             cols += [f"{ref}_{k}_s{i}" for i in range(len(SEEDS))]
@@ -411,7 +425,7 @@ def seed_columns():
 
 def gate_columns(who):
     """Mean/std of the gated metrics against both references for dispatch, bar or new."""
-    cols = [f"{who}_acc_pass"]
+    cols = [f"{who}_acc_pass", f"{who}_nondeterministic"]
     for ref in REFS:
         for k in GATE_METRICS:
             cols += [f"{who}_{ref}_{k}_mean", f"{who}_{ref}_{k}_std"]
