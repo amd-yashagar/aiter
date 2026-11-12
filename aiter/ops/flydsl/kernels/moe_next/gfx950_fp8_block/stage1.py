@@ -16,7 +16,8 @@ Per sorted tile of tile_m rows and one 128-channel block of the intermediate:
                                  reference multiplies act_input before the activation)
   h = act(gate) * up            (SiLU as CK computes it: x * rcp(1 + exp(-x)))
   h = bf16(h)                   (the reference rounds stage 1 to bf16 before quant)
-  scale = amax(|h|) / 448 over the 128 channels (1 when amax is 0); q = fp8(h / scale)
+  scale = max(amax(|h|), 1e-10) * (1/448) over the 128 channels; q = fp8(h * (1/scale)),
+                                (aiter's per-group HIP quant, which the dispatched path uses)
 Writes q to inter[row, channels] and scale to inter_scale[row, block], row = sorted
 position (core's per_1x128 intermediate layout: values [rows, I], scales [rows, I/128]).
 """
@@ -318,7 +319,7 @@ def _build_stage1(*, model_dim, inter_dim, experts, tile_m, act, doweight_stage1
         grp = lane // fx.Int32(16)
         amax_view = fx.make_view(epi.amax.ptr, fx.make_layout(4 * 128, 1))
         for n in range_constexpr(n_reps):
-            mx = fx.Float32(0.0)
+            mx = fx.Float32(fxh.AMAX_FLOOR)
             for m in range_constexpr(m_reps):
                 h = h_frag[None, m, n].load()
                 for v in range_constexpr(4):
@@ -334,9 +335,10 @@ def _build_stage1(*, model_dim, inter_dim, experts, tile_m, act, doweight_stage1
                 fx.max(amax_view[r], amax_view[fx.Int32(128) + r]),
                 fx.max(amax_view[fx.Int32(256) + r], amax_view[fx.Int32(384) + r]),
             )
-            # As the reference (torch divides by a Python scalar via its fp32 reciprocal).
+            # As aiter's per-group HIP quant (quant_kernels.cu: absMax floored at
+            # kAmaxFloor, scale = absMax * (1 / max), q = x * (1 / scale)).
             scale = amax * fx.Float32(fxh.FP8_MAX_RCP)
-            scale = (scale == fx.Float32(0.0)).select(fx.Float32(1.0), scale)
+            inv_scale = fx.Float32(1.0) / scale
             row = row0 + r
             if (wave == fx.Int32(0)) & (grp == fx.Int32(0)):
                 rocdl.raw_ptr_buffer_store(
@@ -348,7 +350,7 @@ def _build_stage1(*, model_dim, inter_dim, experts, tile_m, act, doweight_stage1
                 )
             for m in range_constexpr(m_reps):
                 h = h_frag[None, m, n].load()
-                q = [h[v] / scale for v in range(4)]
+                q = [h[v] * inv_scale for v in range(4)]
                 lo = rocdl.cvt_pk_fp8_f32(
                     res=T.i32, src_a=q[0], src_b=q[1], old=fx.Int32(0), word_sel=False
                 )
