@@ -5,6 +5,7 @@
 zero-fill fused in. See kernels/moe_next/core/sort.py for the array contract."""
 
 import functools
+import os
 from dataclasses import dataclass
 
 import torch
@@ -136,6 +137,11 @@ def _launch(fn, *args, device):
     _run_compiled(fn, *args, specialization_key=(device.index,))
 
 
+@functools.cache
+def _debug() -> bool:
+    return os.getenv("AITER_MOE_DEBUG", "0") == "1"
+
+
 def _empty_i32(device):
     return torch.empty(1, dtype=torch.int32, device=device)
 
@@ -153,6 +159,7 @@ def route_to_tiles(
     quant_input: torch.Tensor | None = None,
     quant_mode: str | None = None,
     quant_scale: torch.Tensor | None = None,
+    pad_rows: bool = True,
 ) -> TileMap:
     """Sort routes into tiles of ``tile_m`` rows and zero ``zero_output``'s rows
     below the token count (``num_local_tokens`` when given), as aiter's sort does.
@@ -162,8 +169,13 @@ def route_to_tiles(
     into; pass None for a reduce epilogue. ``quant_input`` / ``quant_mode``
     quantize the token rows in the same launch; ``per_tensor_fp8`` takes its
     static scale as ``quant_scale`` (fp32, one value; ``a_scale`` is that
-    tensor). Graph-capture safe: launch shape depends only on shapes; every
-    buffer is a per-call ``torch.empty``.
+    tensor). ``pad_rows=False`` skips writing the padding rows (each expert's
+    tail up to tile_m) of sorted_token_ids and sorted_weights, which then hold
+    garbage there; a kernel that passes it must take each tile's real rows
+    from ``live_tiles`` and never read ids or weights past them. Under
+    AITER_MOE_DEBUG=1 those rows get a poison instead (id 0x7FFFFFFF, weight
+    NaN) so a consumer that reads them is caught. Graph-capture safe: launch
+    shape depends only on shapes; every buffer is a per-call ``torch.empty``.
     """
     from aiter.ops.flydsl.kernels.moe_next.core.sort import build
 
@@ -261,6 +273,7 @@ def route_to_tiles(
         rounds=min(8, max(1, -(-n_routes // 256))),
         with_loc=with_loc_ids,
         quant=quant,
+        pad="sentinel" if pad_rows else ("poison" if _debug() else "none"),
     )
     stream = torch.cuda.current_stream(dev)
     if n_routes <= ONESHOT_MAX_ROUTES:

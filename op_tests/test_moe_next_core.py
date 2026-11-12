@@ -129,6 +129,118 @@ def test_tile_map(token, E, topk, tile_m, case, mask, local, model_dim=4096):
     return {"exact": True}
 
 
+def _real_rows(tm):
+    """Bool [rows]: rows that hold a route, from live_tiles alone."""
+    n_live = int(tm.num_live_tiles[0])
+    lt = tm.live_tiles[:n_live].cpu()
+    real = torch.zeros(tm.sorted_token_ids.numel(), dtype=torch.bool, device="cpu")
+    for _, first, rows in lt.tolist():
+        real[first : first + rows] = True
+    return real
+
+
+def test_pad_rows():
+    """pad_rows=False: everything a consumer may read (expert ids, counts,
+    live_tiles, ids and weights of real rows, loc_ids, zero-fill, quant)
+    matches the padded tile map; under AITER_MOE_DEBUG every padding row is
+    poisoned, so a consumer that reads past a tile's real rows sees NaN."""
+    import os
+
+    import aiter.ops.flydsl.moe_next.core.tile_map as tmap
+
+    rows_out = []
+    for token, E, topk, tile_m, mask, local in [
+        (8, 256, 8, 32, False, None),
+        (8, 896, 16, 16, True, 6),
+        (300, 385, 7, 32, True, 250),
+        (512, 256, 8, 64, False, None),
+        (3000, 513, 11, 32, False, 2900),
+    ]:
+        ti, tw, em = routing(token, E, topk, mask=mask)
+        nl = None if local is None else torch.tensor([local], dtype=torch.int32)
+        x = _quant_input(token, 1024, token)
+        outs = [torch.full((token, 256), 3.0, dtype=dtypes.bf16) for _ in range(3)]
+        kw = {
+            "num_experts": E,
+            "tile_m": tile_m,
+            "expert_mask": em,
+            "num_local_tokens": nl,
+            "with_loc_ids": True,
+            "quant_input": x,
+            "quant_mode": "per_token_fp8",
+        }
+        a = route_to_tiles(ti, tw, zero_output=outs[0], **kw)
+        b = route_to_tiles(ti, tw, zero_output=outs[1], pad_rows=False, **kw)
+        old = os.environ.get("AITER_MOE_DEBUG")
+        os.environ["AITER_MOE_DEBUG"] = "1"
+        tmap._debug.cache_clear()
+        try:
+            c = route_to_tiles(ti, tw, zero_output=outs[2], pad_rows=False, **kw)
+        finally:
+            if old is None:
+                del os.environ["AITER_MOE_DEBUG"]
+            else:
+                os.environ["AITER_MOE_DEBUG"] = old
+            tmap._debug.cache_clear()
+        real = _real_rows(a)
+        nv = int(a.num_valid_ids[0])
+        pad = ~real
+        pad[nv:] = False
+        n_live = int(a.num_live_tiles[0])
+        bad = []
+        for name, t in (("b", b), ("poisoned", c)):
+            if not torch.equal(t.num_valid_ids, a.num_valid_ids):
+                bad.append(f"{name} num_valid_ids")
+            if not torch.equal(t.num_live_tiles, a.num_live_tiles):
+                bad.append(f"{name} num_live_tiles")
+            if not torch.equal(t.live_tiles[:n_live], a.live_tiles[:n_live]):
+                bad.append(f"{name} live_tiles")
+            tiles = -(-nv // tile_m)
+            if not torch.equal(
+                t.sorted_expert_ids[:tiles], a.sorted_expert_ids[:tiles]
+            ):
+                bad.append(f"{name} sorted_expert_ids")
+            if not torch.equal(
+                t.sorted_token_ids.cpu()[real], a.sorted_token_ids.cpu()[real]
+            ):
+                bad.append(f"{name} real-row ids")
+            if not torch.equal(
+                t.sorted_weights.cpu()[real].view(torch.int32),
+                a.sorted_weights.cpu()[real].view(torch.int32),
+            ):
+                bad.append(f"{name} real-row weights")
+            rows = token if local is None else local  # rows past it: unwritten
+            if not torch.equal(t.loc_ids[:rows], a.loc_ids[:rows]):
+                bad.append(f"{name} loc_ids")
+            if not torch.equal(
+                t.a_q[:rows].view(torch.uint8), a.a_q[:rows].view(torch.uint8)
+            ):
+                bad.append(f"{name} a_q")
+        if not (torch.equal(outs[1], outs[0]) and torch.equal(outs[2], outs[0])):
+            bad.append("zero-fill")
+        # the poison, and a consumer that reads whole tiles against one that
+        # takes real rows from live_tiles
+        cid, cw = c.sorted_token_ids.cpu(), c.sorted_weights.cpu()
+        if pad.any() and not (
+            (cid[pad] == 0x7FFFFFFF).all() and torch.isnan(cw[pad]).all()
+        ):
+            bad.append("poison")
+        whole = cw[: (nv // tile_m) * tile_m].sum()
+        good = cw[real].sum()
+        if pad.any() and not torch.isnan(whole):
+            bad.append("whole-tile read not caught")
+        if not torch.equal(good, a.sorted_weights.cpu()[real].sum()):
+            bad.append("real-row read")
+        assert not bad, f"pad_rows M={token} E={E} topk={topk} tile_m={tile_m}: {bad}"
+        rows_out.append(
+            {
+                "check": f"pad_rows=False M={token} E={E} topk={topk} tile_m={tile_m}",
+                "exact": True,
+            }
+        )
+    return rows_out
+
+
 def test_graph_capture(token=256, E=256, topk=8, tile_m=32):
     """Captured once, replayed with new routing written into the same inputs."""
     ti, tw, _ = routing(token, E, topk, seed=1)
@@ -572,14 +684,24 @@ def _graph_us(fn, iters=20, per_graph=20):
 
 
 def time_sorts(token, E, topk, mask, model_dim, tile_m=32):
-    """us per call, captured 20 per graph, for the new sort and today's sorts,
-    each zero-filling an [M, model_dim] bf16 output as an atomic stage 2 needs."""
+    """us per call, captured 20 per graph, for the new sort (also with
+    pad_rows=False) and today's sorts, each zero-filling an [M, model_dim] bf16
+    output as an atomic stage 2 needs."""
     ti, tw, em = routing(token, E, topk, mask=mask)
     buf = torch.empty((token, model_dim), dtype=dtypes.bf16)
     bf16 = dtypes.bf16
     fns = {
         "new": lambda: route_to_tiles(
             ti, tw, num_experts=E, tile_m=tile_m, expert_mask=em, zero_output=buf
+        ),
+        "new nopad": lambda: route_to_tiles(
+            ti,
+            tw,
+            num_experts=E,
+            tile_m=tile_m,
+            expert_mask=em,
+            zero_output=buf,
+            pad_rows=False,
         ),
         "opus": lambda: _moe_sorting_impl(
             ti, tw, E, model_dim, bf16, tile_m, em, None, 0, True, output=buf
@@ -1318,6 +1440,7 @@ def main():
         "eager host time:\n%s", pd.DataFrame(test_host_time()).to_markdown(index=False)
     )
     checks = test_graph_capture() + test_intermediate() + test_mfma_native()
+    checks += test_pad_rows()
     aiter.logger.info("checks:\n%s", pd.DataFrame(checks).to_markdown(index=False))
     if args.tier:
         rows, qrows = [], []

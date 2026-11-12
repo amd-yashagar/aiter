@@ -297,7 +297,7 @@ def _expert_scan(
 ):
     """hist (raw counts) -> start[e] (padded exclusive prefix) and local[e]
     (local expert id); returns the padded total. ``pad`` = (sids_it, sw_it,
-    sentinel, on) also writes each expert's padding rows (_pad_tail) from the
+    sentinel, weight, on) also writes each expert's padding rows (_pad_tail) from the
     values in registers."""
     cE, cT, c0, c1 = fx.Int32(num_experts), fx.Int32(tile_m), fx.Int32(0), fx.Int32(1)
     base = tid * fx.Int32(ept)
@@ -378,28 +378,49 @@ def _write_tile_list(
         _st(live_it, (rows < cT).select(rows, cT), t * fx.Int32(3) + fx.Int32(2))
 
 
+POISON_ID = 0x7FFFFFFF  # slot 127, token 0xFFFFFF: past any real route
+
+
+def _pad_arg(pad, sids_it, sw_it, topk, tokens, on):
+    """The _expert_scan ``pad`` argument for a pad mode (None: no stores)."""
+    if pad == "none":
+        return None
+    sentinel, weight = _pad_values(pad, topk, tokens)
+    return (sids_it, sw_it, sentinel, weight, on)
+
+
+def _pad_values(pad, topk, tokens):
+    """(id, weight) the padding rows get: aiter's sentinel and 0, or under
+    ``pad == "poison"`` (pad_rows=False with AITER_MOE_DEBUG) an id past every
+    token and slot and a NaN weight, so a consumer reading them is caught."""
+    if pad == "poison":
+        return fx.Int32(POISON_ID), fx.Float32(float("nan"))
+    return (fx.Int32(topk) << fx.Int32(24)) | tokens, fx.Float32(0.0)
+
+
 @flyc.jit
-def _pad_tail(sids_it, sw_it, sentinel, on, beg, end, tile_m):
-    """Padding rows [beg, end) of one expert (end - beg < tile_m): sentinel id
-    and weight 0. The 1 to 3 rows before the first whole quad take one 1- to
-    3-dword store, each whole quad one 16-byte store, each under a branch so
-    lanes with nothing to write send no data."""
+def _pad_tail(sids_it, sw_it, sentinel, weight, on, beg, end, tile_m):
+    """Padding rows [beg, end) of one expert (end - beg < tile_m): ``sentinel``
+    ids and ``weight`` weights (the sentinel and 0, or a debug poison). The 1
+    to 3 rows before the first whole quad take one 1- to 3-dword store, each
+    whole quad one 16-byte store, each under a branch so lanes with nothing to
+    write send no data."""
     c3, c4 = fx.Int32(3), fx.Int32(4)
     lead = (c4 - (beg & c3)) & c3
     lead = (lead < end - beg).select(lead, end - beg)
     if on & (lead == fx.Int32(1)):
         _st(sids_it, sentinel, beg)
-        _st(sw_it, fx.Float32(0.0), beg)
+        _st(sw_it, weight, beg)
     for n in range_constexpr(2, 4):
         if on & (lead == fx.Int32(n)):
             fx.ptr_store(fx.full(n, 0, fx.Int32) + sentinel, sids_it + fx.Int64(beg))
-            fx.ptr_store(fx.full(n, 0.0, fx.Float32), sw_it + fx.Int64(beg))
+            fx.ptr_store(fx.full(n, 0.0, fx.Float32) + weight, sw_it + fx.Int64(beg))
     q0 = beg + lead
     for q in range_constexpr((tile_m - 1) // 4):
         p = q0 + fx.Int32(4 * q)
         if on & (p < end):
             fx.ptr_store(fx.full(4, 0, fx.Int32) + sentinel, sids_it + fx.Int64(p))
-            fx.ptr_store(fx.full(4, 0.0, fx.Float32), sw_it + fx.Int64(p))
+            fx.ptr_store(fx.full(4, 0.0, fx.Float32) + weight, sw_it + fx.Int64(p))
 
 
 @flyc.jit
@@ -618,6 +639,7 @@ def _oneshot_body(
     rounds,
     loc_it,
     with_loc,
+    pad,
 ):
     """The whole sort in one workgroup, for at most ``rounds`` * BLOCK routes
     (``rounds`` <= STAGE_ROUNDS, from the static token count): every route's id
@@ -653,7 +675,6 @@ def _oneshot_body(
                 hist + fx.Int64(routes[k][0]), fx.Int32(1), syncscope="workgroup"
             )
     gpu.barrier()
-    sentinel = (fx.Int32(topk) << fx.Int32(24)) | tokens
     total = _expert_scan(
         hist,
         start,
@@ -665,7 +686,7 @@ def _oneshot_body(
         tile_m,
         ept,
         has_mask,
-        (sids_it, sw_it, sentinel, fx.Boolean(True)),
+        _pad_arg(pad, sids_it, sw_it, topk, tokens, fx.Boolean(True)),
     )
     _write_meta(nv_it, nlive_it, tid, tokens, total, tile_m)
     _write_tile_list(
@@ -752,8 +773,11 @@ def build(
     rounds=STAGE_ROUNDS,
     with_loc=False,
     quant=None,
+    pad="sentinel",
 ):
     """Compile-time specialisation; returns (oneshot, count, scatter) launchers.
+    ``pad``: the padding rows get aiter's sentinel ("sentinel"), nothing
+    ("none", for pad_rows=False), or a debug poison ("poison").
     ``rounds`` bounds the one-shot's 256-route rounds (from M * topk);
     ``with_loc`` also writes loc_ids (each route's sorted row). ``quant`` =
     (mode, cols, fp8_max) adds workgroups that quantize the token rows (see
@@ -882,6 +906,7 @@ def build(
                 rounds,
                 _it(loc_ids),
                 with_loc,
+                pad,
             )
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
@@ -1033,7 +1058,6 @@ def build(
                 raw0, mask_lds, begin, tid, E, has_mask, topk, key_bits
             )
             _sum_counts(hist, run, _it(counts), tid, bid, n_chunks, E, e_cap)
-            sentinel = (fx.Int32(topk) << fx.Int32(24)) | tokens
             total = _expert_scan(
                 hist,
                 start,
@@ -1045,7 +1069,7 @@ def build(
                 tile_m,
                 ept,
                 has_mask,
-                (_it(sorted_ids), _it(sorted_w), sentinel, bid == c0),
+                _pad_arg(pad, _it(sorted_ids), _it(sorted_w), topk, tokens, bid == c0),
             )
             if bid == c0:
                 _write_meta(_it(num_valid), _it(num_live), tid, tokens, total, tile_m)
