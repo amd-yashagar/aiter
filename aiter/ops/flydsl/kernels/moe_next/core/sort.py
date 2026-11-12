@@ -22,8 +22,9 @@ order, which is token-major, so expert segments come out in token order.
 Two launch shapes:
   oneshot   one launch, up to STAGE routes; workgroup 0 sorts, the rest
             zero-fill the output.
-  count +   per-chunk expert counts (and the zero-fill), then every chunk
-  scatter   reads all counts, takes its prefix and scatters its routes.
+  count +   per-chunk expert counts, then every chunk reads all counts,
+  scatter   takes its prefix and scatters its routes, while extra workgroups
+            of the scatter launch zero-fill the output.
 """
 
 import functools
@@ -696,12 +697,13 @@ def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
                 hist, lds.mask.ptr, tid, _it(ids), begin, end, n, E, topk, has_mask
             )
             _store_counts(hist, _it(counts), tid, bid, E, e_cap)
-        _zero_fill(
-            _it(zbuf),
-            bid * fx.Int32(BLOCK) + tid,
-            gpu.grid_dim.x * fx.Int32(BLOCK),
-            _zero_rows(tokens, m_cap) * row_v4,
-        )
+        if row_v4 > fx.Int32(0):
+            _zero_fill(
+                _it(zbuf),
+                bid * fx.Int32(BLOCK) + tid,
+                gpu.grid_dim.x * fx.Int32(BLOCK),
+                _zero_rows(tokens, m_cap) * row_v4,
+            )
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def scatter_kernel(
@@ -716,91 +718,106 @@ def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
         mask: fx.Tensor,
         ltok: fx.Tensor,
         counts: fx.Tensor,
+        zbuf: fx.Tensor,
         m_cap: fx.Int32,
         chunk: fx.Int32,
         n_chunks: fx.Int32,
+        row_v4: fx.Int32,
     ):
+        """Workgroups below n_chunks scatter a chunk each; the rest zero-fill
+        the output, overlapping the scatter."""
         bid = gpu.block_idx.x
         tid = gpu.thread_idx.x
-        c0 = fx.Int32(0)
-        lds = fx.SharedAllocator().allocate(Lds).peek()
-        hist, run, local, start = (
-            lds.hist.ptr,
-            lds.run.ptr,
-            lds.local.ptr,
-            lds.start.ptr,
-        )
-        tbl, scan = lds.tbl.ptr, lds.scan.ptr
-        ids_it, w_it, mask_it = _it(ids), _it(weights), _it(mask)
-        tokens = m_cap
+        tokens0 = m_cap
         if has_local:
-            tokens = _ld(_it(ltok), c0)
-        n = tokens * fx.Int32(topk)
-        mask_lds = lds.mask.ptr
-        if has_mask:
-            _load_mask(mask_lds, mask_it, tid, E, e_cap)
-        _clear(hist, e_cap, tid)
-        _clear(run, e_cap, tid)
-        _clear(tbl, 2 * WAVES * e_cap, tid)
-        gpu.barrier()
-        _sum_counts(hist, run, _it(counts), tid, bid, n_chunks, E, e_cap)
-        total = _expert_scan(
-            hist, start, local, scan, tid, mask_lds, E, tile_m, ept, has_mask
-        )
-        if bid == c0:
-            _write_meta(_it(num_valid), _it(num_live), tid, tokens, total, tile_m)
-        _write_tile_list(
-            hist,
-            start,
-            local,
-            _it(sorted_eids),
-            _it(live_tiles),
-            total,
-            bid * fx.Int32(BLOCK) + tid,
-            n_chunks * fx.Int32(BLOCK),
-            E,
-            tile_m,
-            key_bits,
-        )
-        if bid == c0:
-            _write_padding(
+            tokens0 = _ld(_it(ltok), fx.Int32(0))
+        if bid >= n_chunks:
+            _zero_fill(
+                _it(zbuf),
+                (bid - n_chunks) * fx.Int32(BLOCK) + tid,
+                (gpu.grid_dim.x - n_chunks) * fx.Int32(BLOCK),
+                _zero_rows(tokens0, m_cap) * row_v4,
+            )
+        if bid < n_chunks:
+            c0 = fx.Int32(0)
+            lds = fx.SharedAllocator().allocate(Lds).peek()
+            hist, run, local, start = (
+                lds.hist.ptr,
+                lds.run.ptr,
+                lds.local.ptr,
+                lds.start.ptr,
+            )
+            tbl, scan = lds.tbl.ptr, lds.scan.ptr
+            ids_it, w_it, mask_it = _it(ids), _it(weights), _it(mask)
+            tokens = m_cap
+            if has_local:
+                tokens = _ld(_it(ltok), c0)
+            n = tokens * fx.Int32(topk)
+            mask_lds = lds.mask.ptr
+            if has_mask:
+                _load_mask(mask_lds, mask_it, tid, E, e_cap)
+            _clear(hist, e_cap, tid)
+            _clear(run, e_cap, tid)
+            _clear(tbl, 2 * WAVES * e_cap, tid)
+            gpu.barrier()
+            _sum_counts(hist, run, _it(counts), tid, bid, n_chunks, E, e_cap)
+            total = _expert_scan(
+                hist, start, local, scan, tid, mask_lds, E, tile_m, ept, has_mask
+            )
+            if bid == c0:
+                _write_meta(_it(num_valid), _it(num_live), tid, tokens, total, tile_m)
+            _write_tile_list(
                 hist,
                 start,
+                local,
+                _it(sorted_eids),
+                _it(live_tiles),
+                total,
+                bid * fx.Int32(BLOCK) + tid,
+                n_chunks * fx.Int32(BLOCK),
+                E,
+                tile_m,
+                key_bits,
+            )
+            if bid == c0:
+                _write_padding(
+                    hist,
+                    start,
+                    _it(sorted_ids),
+                    _it(sorted_w),
+                    tid,
+                    tokens,
+                    E,
+                    topk,
+                    tile_m,
+                    ept,
+                )
+            for k in range_constexpr(0, e_cap, BLOCK):
+                e = fx.Int32(k) + tid
+                _lds_st(run, _lds(run, e) + _lds(start, e), e)
+            gpu.barrier()
+            begin = bid * chunk
+            end = begin + chunk
+            end = (end < n).select(end, n)
+            begin = (begin < end).select(begin, end)
+            _rank_and_scatter(
+                run,
+                tbl,
+                mask_lds,
+                tid,
+                ids_it,
+                w_it,
                 _it(sorted_ids),
                 _it(sorted_w),
-                tid,
-                tokens,
+                begin,
+                end,
+                n,
                 E,
                 topk,
-                tile_m,
-                ept,
+                has_mask,
+                key_bits,
+                e_cap,
             )
-        for k in range_constexpr(0, e_cap, BLOCK):
-            e = fx.Int32(k) + tid
-            _lds_st(run, _lds(run, e) + _lds(start, e), e)
-        gpu.barrier()
-        begin = bid * chunk
-        end = begin + chunk
-        end = (end < n).select(end, n)
-        begin = (begin < end).select(begin, end)
-        _rank_and_scatter(
-            run,
-            tbl,
-            mask_lds,
-            tid,
-            ids_it,
-            w_it,
-            _it(sorted_ids),
-            _it(sorted_w),
-            begin,
-            end,
-            n,
-            E,
-            topk,
-            has_mask,
-            key_bits,
-            e_cap,
-        )
 
     @flyc.jit
     def launch_oneshot(
@@ -867,9 +884,12 @@ def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
         mask: fx.Tensor,
         ltok: fx.Tensor,
         counts: fx.Tensor,
+        zbuf: fx.Tensor,
         m_cap: fx.Int32,
         chunk: fx.Int32,
         n_chunks: fx.Int32,
+        row_v4: fx.Int32,
+        grid: fx.Int32,
         stream: fx.Stream = None,
     ):
         scatter_kernel(
@@ -884,9 +904,11 @@ def build(num_experts, topk, tile_m, has_mask, has_local, rounds=STAGE_ROUNDS):
             mask,
             ltok,
             counts,
+            zbuf,
             m_cap,
             chunk,
             n_chunks,
-        ).launch(grid=(n_chunks, 1, 1), block=(BLOCK, 1, 1), stream=stream)
+            row_v4,
+        ).launch(grid=(grid, 1, 1), block=(BLOCK, 1, 1), stream=stream)
 
     return launch_oneshot, launch_count, launch_scatter

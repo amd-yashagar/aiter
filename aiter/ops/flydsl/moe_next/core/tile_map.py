@@ -18,6 +18,9 @@ ONESHOT_MAX_ROUTES = 2048
 CHUNK_MIN_ROUTES = 1024
 MAX_CHUNKS = 128
 ZERO_BYTES_PER_WG = 64 * 1024
+# A zero-fill this large runs in the count launch (it would compete with long
+# scatter chunks); a smaller one overlaps the scatter launch.
+ZERO_IN_COUNT_BYTES = 512 << 20
 
 
 @dataclass
@@ -179,6 +182,7 @@ def route_to_tiles(
     chunk = -(-per_chunk // 256) * 256
     n_chunks = -(-n_routes // chunk)
     counts = torch.empty(n_chunks * num_experts, dtype=torch.int32, device=dev)
+    early = zero_v4 * 16 >= ZERO_IN_COUNT_BYTES
     _launch(
         count,
         ids,
@@ -189,8 +193,8 @@ def route_to_tiles(
         m,
         chunk,
         n_chunks,
-        row_v4,
-        max(n_chunks, z_wg),
+        row_v4 if early else 0,
+        max(n_chunks, z_wg) if early else n_chunks,
         stream,
         device=dev,
     )
@@ -207,9 +211,12 @@ def route_to_tiles(
         mask,
         ltok,
         counts,
+        zbuf,
         m,
         chunk,
         n_chunks,
+        0 if early else row_v4,
+        n_chunks if early else n_chunks + z_wg,
         stream,
         device=dev,
     )

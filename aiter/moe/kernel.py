@@ -91,7 +91,9 @@ class MoeKernel:
     epilogue: ClassVar[str] = "atomic"
     # Rounding points, e.g. {"act_quant": "per_1x128_fp8", "inter":
     # "bf16_then_per_1x128_fp8", "combine": "bf16_atomic"}; None means "same as
-    # aiter's dispatched path". A kernel may round less than, never more than,
+    # aiter's dispatched path". act_quant: none, per_token_fp8, per_1x128_fp8,
+    # mx_fp4, mx_fp8; inter: bf16, fp32_direct, bf16_then_<quant>; combine:
+    # bf16_atomic, fp32_atomic, bf16_rows_fp32_sum, fp32_reduce. A kernel may round less than, never more than,
     # the least-rounding aiter path for its family and arch.
     numerics: ClassVar[dict | None] = None
     # Not-yet-covered layer keywords (router.NOT_YET_COVERED) this kernel
