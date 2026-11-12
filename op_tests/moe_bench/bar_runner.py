@@ -352,6 +352,37 @@ def check_discarded_sources(out_dir, tier, prefix):
     return sorted(bad)
 
 
+def mark_router_discards(bar_csv, candidates_csv, reason):
+    """Add/extend ``bar_incomplete`` on the cases of an existing bar that have a candidate
+    the router discarded and no other candidate of that backend that ran (bars taken
+    before the whole-graph naming fix). Returns the case ids marked."""
+    from . import routes
+
+    bad = {}
+    with open(candidates_csv, newline="") as f:
+        for r in csv.DictReader(f):
+            be = routes.backend_of((r.get("kernels") or "").split(" ")[0]) or "?"
+            t = bad.setdefault((r["case_id"], be), [0, 0])
+            t[0] += r.get("status") == "router-discarded"
+            t[1] += r.get("status") == "ok"
+    hit = {c for (c, _), (d, ok) in bad.items() if d and not ok}
+    with open(bar_csv, newline="") as f:
+        rd = csv.DictReader(f)
+        cols = list(rd.fieldnames)
+        rows = list(rd)
+    if "bar_incomplete" not in cols:
+        cols.append("bar_incomplete")
+    for r in rows:
+        if r["case_id"] in hit:
+            old = r.get("bar_incomplete") or ""
+            r["bar_incomplete"] = f"{old}; {reason}" if old else reason
+    with open(bar_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        w.writerows({c: r.get(c, "") for c in cols} for r in rows)
+    return sorted(hit)
+
+
 def cmd_bar(args):
     """bar mode, or new mode: routing on, routing off (AITER_MOE_DISABLE), first calls."""
     if args.kind != "new":
