@@ -109,6 +109,40 @@ def _reference_and_output(inter_dim, num_experts, topk, a8):
 
 
 @_GPU
+@pytest.mark.parametrize("quant_dtype", [dtypes.fp8, dtypes.fp4x2], ids=["fp8", "fp4"])
+@pytest.mark.parametrize("cols", [640, 384, 512])
+def test_moe_sort_quant_zeroes_the_padded_scale_groups(cols, quant_dtype):
+    from aiter.ops.quant import fused_dynamic_mx_quant_moe_sort
+
+    token, topk, block_m, group = 64, 1, 32, 32
+    valid = cols // group
+    padded = (valid + 7) // 8 * 8
+    x = torch.randn(token, cols, dtype=dtypes.bf16, device="cuda")
+    sorted_ids = torch.arange(token, dtype=torch.int32, device="cuda")
+    num_valid_ids = torch.tensor([token, token], dtype=torch.int32, device="cuda")
+    rows = (token + 31) // 32 * 32
+    poison = torch.full((rows * padded,), 0xFF, dtype=torch.uint8, device="cuda")
+    del poison
+    _, scale = fused_dynamic_mx_quant_moe_sort(
+        x, sorted_ids, num_valid_ids, token, topk, block_m, quant_dtype=quant_dtype
+    )
+    flat = scale.view(torch.uint8).flatten().clone()
+    r = torch.arange(token)[:, None]
+    g = torch.arange(valid)[None, :]
+    # Flat index of each valid (row, group) in the MX shuffled scale layout.
+    used = (
+        (r // 32 * padded) * 32
+        + (g // 8) * 256
+        + (g % 4) * 64
+        + (r % 16) * 4
+        + (g % 8) // 4 * 2
+        + (r % 32) // 16
+    )
+    flat[used.flatten().cuda()] = 0
+    assert not flat.any().item()
+
+
+@_GPU
 @pytest.mark.parametrize("a8", [False, True], ids=["a16w4", "a8w4"])
 @pytest.mark.parametrize(("num_experts", "topk"), [(1, 1), (8, 2)])
 @pytest.mark.parametrize("inter_dim", [256, 384, 512, 640])
