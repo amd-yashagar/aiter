@@ -1170,9 +1170,13 @@ def resolve_activation_dtype(
             else:
                 q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
-            q_dtype_a = _bound_split(
-                M, _SWIGLU_MXFP4_BF16_BOUND, dtypes.bf16, dtypes.fp4x2
-            )
+            # gfx942 has no fp4 activation kernels: stay a16w4 at every M.
+            if gfx == "gfx942":
+                q_dtype_a = dtypes.bf16
+            else:
+                q_dtype_a = _bound_split(
+                    M, _SWIGLU_MXFP4_BF16_BOUND, dtypes.bf16, dtypes.fp4x2
+                )
         elif activation == ActivationType.Relu2:
             q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
@@ -1693,6 +1697,18 @@ def _fused_moe_impl(
         q_dtype_a = quant_dtype_a
     elif _q_dtype_a is not None:
         q_dtype_a = _q_dtype_a
+
+    if (
+        quant_type == QuantType.per_1x32
+        and get_gfx() == "gfx942"
+        and q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
+        and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
+    ):
+        raise NotImplementedError(
+            f"MXFP4/MXFP8 MoE with {q_dtype_a} activations is not supported on "
+            "gfx942 (no kernel runs there); bf16 activations with MXFP4 weights "
+            "(a16w4) are supported."
+        )
 
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
@@ -5320,8 +5336,11 @@ def get_2stage_cfgs(
         and not doweight_stage1
     )
     _is_a16w4 = _is_a16w4_situv2 or _is_a16w4_swiglu_rerouted
+    # The a4w4 / a8w4 / mxfp8 FlyDSL kernels do not compile on gfx942 (LLVM ERROR
+    # at the first call); only the bf16-activation a16w4 port runs there.
     use_mxfp4_flydsl = _is_a16w4 or (
-        dtype in [dtypes.bf16, dtypes.fp16]
+        get_gfx() != "gfx942"
+        and dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and (
             activation in (ActivationType.Swiglu, ActivationType.Situv2)
