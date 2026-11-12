@@ -32,6 +32,41 @@ def _configs(gpu: str) -> dict:
         return json.load(f)
 
 
+_COUNTERS = {}
+# Split-K target: about this many stage-1 workgroups in flight at decode, with at
+# most _SPLITK_MAX splits (the range measured).
+_SPLITK_WGS = 256
+_SPLITK_MAX = 8
+
+
+def _splits(cfg, spec, m, topk):
+    """The config's split count; "auto" fills about _SPLITK_WGS workgroups from the
+    live (tile, block) bound min(routes, experts) x I/128, with an even number of K
+    tiles per split."""
+    s = cfg.get("splits", 1)
+    if s != "auto":
+        return s
+    kb = spec.model_dim // 128
+    wgs = min(m * topk, spec.experts) * (spec.inter_dim // 128)
+    best = 1
+    for c in range(2, min(_SPLITK_MAX, _SPLITK_WGS // max(wgs, 1)) + 1):
+        if kb % c == 0 and (kb // c) % 2 == 0:
+            best = c
+    return best
+
+
+def _splitk_counters(device, n):
+    """Split-K arrival counters for the current stream: zeroed once, and the last split
+    of each (tile, block) puts its counter back to zero, so later calls (and graph
+    replays) find them zero without a memset."""
+    key = (device, torch.cuda.current_stream(device).cuda_stream)
+    cnt = _COUNTERS.get(key)
+    if cnt is None or cnt.numel() < n:
+        cnt = torch.zeros(max(n, 1024), dtype=torch.int32, device=device)
+        _COUNTERS[key] = cnt
+    return cnt
+
+
 def _tile_config(gpu, config, m, topk, experts):
     table = _configs(gpu)
     if config:
@@ -108,13 +143,11 @@ class _Fp8BlockGfx950(MoeKernel):
         return None
 
     def warmup(self, weights, m, topk, config):
-        self._launchers(
-            topk,
-            weights.spec,
-            _tile_config(weights.gpu, config, m, topk, weights.spec.experts),
-        )
+        spec = weights.spec
+        cfg = _tile_config(weights.gpu, config, m, topk, spec.experts)
+        self._launchers(topk, spec, cfg, _splits(cfg, spec, m, topk))
 
-    def _launchers(self, topk, spec, cfg):
+    def _launchers(self, topk, spec, cfg, splits):
         from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage1 import (
             compile_stage1,
         )
@@ -141,6 +174,7 @@ class _Fp8BlockGfx950(MoeKernel):
                 tile_m=cfg["tile_m"],
                 act=_ACTS[spec.act],
                 doweight_stage1=spec.doweight_stage1,
+                splits=splits,
             )
         s2 = compile_stage2(
             model_dim=spec.model_dim,
@@ -169,7 +203,8 @@ class _Fp8BlockGfx950(MoeKernel):
         w2s = call.w2_scale.view(-1)
         cfg = _tile_config(weights.gpu, call.config, call.m, call.topk, spec.experts)
         tm = cfg["tile_m"]
-        s1, s2 = self._launchers(call.topk, spec, cfg)
+        splits = _splits(cfg, spec, call.m, call.topk)
+        s1, s2 = self._launchers(call.topk, spec, cfg, splits)
         combine = cfg.get("combine", "atomic_bf16")
         x = call.hidden_states
         M, D, I = call.m, spec.model_dim, spec.inter_dim
@@ -213,10 +248,27 @@ class _Fp8BlockGfx950(MoeKernel):
                 output=zero,
                 accumulate=zero is not None,
             )
-        rows, tiles = sorted_ids.numel(), sorted_e.numel()
+        rows = sorted_ids.numel()
+        # The sort gives each expert with routes ceil(routes / tile_m) tiles, so at most
+        # routes // tile_m + (experts with routes) are live: a grid bound from shapes
+        # alone (graph-safe) that drops most of the dead tiles at decode.
+        routes = M * call.topk
+        tiles = min(sorted_e.numel(), routes // tm + min(spec.experts, routes) + 1)
         inter = Layout.for_spec(spec, M, call.topk, tm).alloc(x.device)
         inter, inter_s = inter.values, inter.scales
         stream = fx.Stream(torch.cuda.current_stream(x.device))
+        splitk = ()
+        if splits > 1:
+            from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage1 import (
+                splitk_workspace_floats,
+            )
+
+            ws = torch.empty(
+                splitk_workspace_floats(tm, tiles, I, splits),
+                dtype=torch.float32,
+                device=x.device,
+            )
+            splitk = (ws, _splitk_counters(x.device, tiles * (I // 128)))
         _run_compiled(
             s1,
             inter.view(torch.int8),
@@ -229,6 +281,7 @@ class _Fp8BlockGfx950(MoeKernel):
             sorted_e,
             sorted_w,
             nvalid,
+            *splitk,
             M,
             rows,
             tiles,
