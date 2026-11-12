@@ -10,11 +10,13 @@ the sorted-index gather/scatter and the pk-bf16 buffer atomics.
 """
 
 import flydsl.expr as fx
+import numpy as np
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
 FP8_MAX = 448.0  # OCP e4m3fn on gfx950
+FP8_MAX_RCP = float(np.float32(1.0) / np.float32(FP8_MAX))
 
 
 def reps(tensor, mode):
