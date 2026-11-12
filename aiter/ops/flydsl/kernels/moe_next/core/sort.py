@@ -751,29 +751,47 @@ def _oneshot_body(
             )
 
 
-@flyc.jit
-def _sum_counts(hist, run, c_it, tid, bid, n_chunks, num_experts, e_cap):
-    """hist[e] = counts over all chunks, run[e] = counts over chunks before bid;
-    COUNT_BATCH chunks' loads are issued together."""
+def _count_batch(c_it, tid, g0, n_chunks, num_experts, e_cap):
+    """Loads of one COUNT_BATCH of chunk counts from chunk ``g0``: per expert
+    slot of this thread, [(chunk, count)]."""
     c0, cE = fx.Int32(0), fx.Int32(num_experts)
+    out = []
+    for k in range_constexpr(0, e_cap, BLOCK):
+        e = fx.Int32(k) + tid
+        live = e < cE
+        es = live.select(e, c0)
+        vals = []
+        for q in range_constexpr(COUNT_BATCH):
+            g = g0 + fx.Int32(q)
+            ok = live & (g < n_chunks)
+            vals.append((g, ok.select(_ld(c_it, ok.select(g * cE + es, c0)), c0)))
+        out.append(vals)
+    return out
+
+
+def _add_batch(hist, run, tid, bid, batch, e_cap):
+    c0 = fx.Int32(0)
+    for i, k in enumerate(range_constexpr(0, e_cap, BLOCK)):
+        e = fx.Int32(k) + tid
+        tot, pre = c0, c0
+        for g, c in batch[i]:
+            tot = tot + c
+            pre = pre + (g < bid).select(c, c0)
+        _lds_st(hist, _lds(hist, e) + tot, e)
+        _lds_st(run, _lds(run, e) + pre, e)
+
+
+@flyc.jit
+def _sum_counts(hist, run, c_it, tid, bid, n_chunks, num_experts, e_cap, first):
+    """hist[e] = counts over all chunks, run[e] = counts over chunks before bid.
+    ``first`` holds the first COUNT_BATCH chunks' loads, issued early by the
+    caller (their latency overlaps the route loads); later batches load here."""
+    _add_batch(hist, run, tid, bid, first, e_cap)
     batches = (n_chunks + fx.Int32(COUNT_BATCH - 1)) // fx.Int32(COUNT_BATCH)
-    for bt in range(c0, batches, fx.Int32(1)):
+    for bt in range(fx.Int32(1), batches, fx.Int32(1)):
         g0 = fx.Int32(bt) * fx.Int32(COUNT_BATCH)
-        for k in range_constexpr(0, e_cap, BLOCK):
-            e = fx.Int32(k) + tid
-            live = e < cE
-            es = live.select(e, c0)
-            tot, pre = c0, c0
-            vals = []
-            for q in range_constexpr(COUNT_BATCH):
-                g = g0 + fx.Int32(q)
-                ok = live & (g < n_chunks)
-                vals.append((g, ok.select(_ld(c_it, ok.select(g * cE + es, c0)), c0)))
-            for g, c in vals:
-                tot = tot + c
-                pre = pre + (g < bid).select(c, c0)
-            _lds_st(hist, _lds(hist, e) + tot, e)
-            _lds_st(run, _lds(run, e) + pre, e)
+        batch = _count_batch(c_it, tid, g0, n_chunks, num_experts, e_cap)
+        _add_batch(hist, run, tid, bid, batch, e_cap)
     gpu.barrier()
 
 
@@ -1075,6 +1093,8 @@ def build(
             end = (end < n).select(end, n)
             begin = (begin < end).select(begin, end)
             raw0 = _stage_routes(ids_it, w_it, begin, tid, end, n, topk)
+            counts0 = _count_batch(_it(counts), tid, c0, n_chunks, E, e_cap)
+            pad_mine = (tid % n_chunks) == bid
             mask_lds = lds.mask.ptr
             if has_mask:
                 _load_mask(mask_lds, mask_it, tid, E, e_cap)
@@ -1085,7 +1105,7 @@ def build(
             routes0 = _stage_check(
                 raw0, mask_lds, begin, tid, E, has_mask, topk, key_bits
             )
-            _sum_counts(hist, run, _it(counts), tid, bid, n_chunks, E, e_cap)
+            _sum_counts(hist, run, _it(counts), tid, bid, n_chunks, E, e_cap, counts0)
             total = _expert_scan(
                 hist,
                 start,
@@ -1097,7 +1117,8 @@ def build(
                 tile_m,
                 ept,
                 has_mask,
-                _pad_arg(pad, _it(sorted_ids), _it(sorted_w), topk, tokens, bid == c0),
+                # each thread's experts are padded by workgroup tid % n_chunks
+                _pad_arg(pad, _it(sorted_ids), _it(sorted_w), topk, tokens, pad_mine),
             )
             if bid == c0:
                 _write_meta(_it(num_valid), _it(num_live), tid, tokens, total, tile_m)
