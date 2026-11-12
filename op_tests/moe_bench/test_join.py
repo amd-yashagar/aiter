@@ -101,3 +101,23 @@ def test_shim_is_repointed_and_harness_checked(tmp_path):
     tree = tmp_path / "tree"
     (tree / "op_tests" / "moe_bench").mkdir(parents=True)  # a stale copy of the harness
     assert runner.needs_shim(str(tree))
+
+
+def test_large_case_times_through_graph_replay():
+    """5000 queued events plus graph replays crashed torch.cuda.Event.record on MI355X
+    (MOEBUG-004, fixed by timing in chunks); a long timed run must complete."""
+    import pytest
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    from op_tests.moe_bench.timing import Timer
+
+    a = torch.randn(1024, 4096, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(4096, 4096, dtype=torch.bfloat16, device="cuda")
+    t = Timer(lambda: a @ b)
+    t.prepare_graph()
+    ts = t._measure(2500, cold=True)
+    assert len(ts) == 2500 and min(ts) > 0
+    st = t.time(cold=False)
+    assert st["iters"] >= 50 and st["median_us"] > 0

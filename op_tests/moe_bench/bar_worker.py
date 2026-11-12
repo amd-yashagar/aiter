@@ -61,6 +61,13 @@ class DispatchCandidate:
         pass
 
 
+def _is_gpu_fault(msg):
+    return any(
+        k in msg
+        for k in ("AcceleratorError", "HIP error", "invalid StreamId", "hipError")
+    )
+
+
 def _parse_route(v):
     """aiter.moe.last_route() -> (kernel id or "aiter", reason). Tuple, dict or str."""
     if v is None:
@@ -111,11 +118,32 @@ class Measurer:
         self.rows, self.pool = rows, pool
         self.ref_ctx = ref_ctx or {}
         self._path_cache = {}
+        self.stats = (
+            {}
+        )  # "source:backend" -> {"total", "ok", "fail", "compile", "error"}
         self.fh, self.case_id = fh, case_id
         self.records = []  # confirmed results for the bar
 
     def measure(self, cand, quick=False, modes=("warm",)):
-        """Returns {"ok", "us", ...}; emits one ``cand`` event per mode."""
+        """Returns {"ok", "us", "outcome", ...}; emits one ``cand`` event per mode."""
+        res = self._measure(cand, quick, modes)
+        self._tally(cand, res)
+        return res
+
+    def _tally(self, cand, res):
+        from . import routes
+
+        kernels = getattr(cand, "kernels", "") or ""
+        key = f"{cand.source}:{routes.backend_of(kernels.split(' ')[0]) or 'dispatch'}"
+        t = self.stats.setdefault(
+            key, {"total": 0, "ok": 0, "fail": 0, "compile": 0, "error": 0}
+        )
+        t["total"] += 1
+        t[res.get("outcome") or ("ok" if res.get("ok") else "error")] = (
+            t.get(res.get("outcome") or ("ok" if res.get("ok") else "error"), 0) + 1
+        )
+
+    def _measure(self, cand, quick=False, modes=("warm",)):
         import torch
 
         from aiter import dtypes
@@ -193,6 +221,7 @@ class Measurer:
                 )
                 return res
             if not acc["pass"]:
+                res["outcome"] = "fail"
                 self._emit(base, modes, status="fail", detail="accuracy rule", **cols)
                 return res
             timer = Timer(call, ctx.hidden_static, self.pool)
@@ -220,10 +249,23 @@ class Measurer:
                     route_key=route.get("route_key", ""),
                 )
             res["ok"] = True
+            res["outcome"] = "ok"
             res["us"] = res["by_mode"][modes[0]]["median_us"]
             return res
         except Exception as e:  # noqa: BLE001
             status = "unsupported" if isinstance(e, NotImplementedError) else "error"
+            msg = _err(e)
+            if _is_gpu_fault(msg):
+                # The HIP context may be poisoned (every later call fails "invalid
+                # StreamId"): exit so the parent marks this candidate crashed and starts
+                # a fresh worker for the rest.
+                emit(self.fh, {"event": "log", "msg": f"gpu fault in {cand.id}: {msg}"})
+                os._exit(70)
+            res["outcome"] = (
+                "compile"
+                if any(k in msg for k in ("DSLCompileError", "lld", "ompile"))
+                else "error"
+            )
             self._emit(
                 base,
                 modes,
@@ -447,6 +489,7 @@ def run_bar_group(cases, spec, fh):
         )
         results = {}
         skipped = []
+        enum_counts, enum_errors = {}, []
         emit(fh, {"event": "case_start", "case_id": c.id, "phase": "run"})
         if mode_kind == "bar":
             if "dispatch" in bad.get(c.id, ()):
@@ -511,6 +554,12 @@ def run_bar_group(cases, spec, fh):
                         "detail": msg,
                     },
                 )
+            for x in cands:
+                b = routes.backend_of((x.kernels or "").split(" ")[0]) or "dispatch"
+                k = f"{src.name}:{b}"
+                enum_counts[k] = enum_counts.get(k, 0) + 1
+            enum_counts.setdefault(f"{src.name}:*", len(cands))
+            enum_errors += getattr(ctx, "enum_errors", [])
             emit(
                 fh,
                 {"event": "log", "msg": f"{c.id} {src.name}: {len(cands)} candidates"},
@@ -521,9 +570,19 @@ def run_bar_group(cases, spec, fh):
                 keep = cands
             for cand in keep:
                 results[cand.id] = meas.measure(cand, quick=False, modes=modes)
+        acct, incomplete = _accounting(enum_counts, meas.stats, enum_errors, mode_kind)
         for m in modes:
             _emit_summary(
-                fh, c, S, m, results, ident, skipped, mode_kind, main_failures.get(c.id)
+                fh,
+                c,
+                S,
+                m,
+                results,
+                ident,
+                skipped,
+                mode_kind,
+                main_failures.get(c.id),
+                (acct, incomplete),
             )
         from .candidates.fused_cfg import unforce
 
@@ -564,7 +623,38 @@ def _gate(who, acc, numerics=""):
     return out
 
 
-def _emit_summary(fh, c, S, mode, results, ident, skipped, kind, main_failure=None):
+def _accounting(enum_counts, stats, enum_errors, kind):
+    """Per source and backend: candidates enumerated, tried, passed, failed to compile.
+
+    A case whose fused_moe source gave nothing, whose generators raised, or whose
+    backend had every tried candidate fail to compile is ``bar_incomplete``: its bar
+    cannot be trusted and stays out of "won" verdicts until it is rerun.
+    """
+    acct, reasons = {}, []
+    for k in sorted(set(enum_counts) | set(stats)):
+        t = dict(stats.get(k, {}))
+        acct[k] = {"enumerated": enum_counts.get(k, 0), **t}
+    if kind != "bar":
+        return acct, ""
+    if enum_counts.get("fused_moe:*", 0) == 0:
+        reasons.append("fused_moe enumerated zero candidates")
+    if enum_errors:
+        reasons.append("generator errors: " + "; ".join(enum_errors)[:300])
+    for k, t in acct.items():
+        total = t.get("total", 0)
+        if (
+            t.get("enumerated", 0) > 0
+            and total > 0
+            and t.get("ok", 0) == 0
+            and t.get("compile", 0) == total
+        ):
+            reasons.append(f"{k}: all {total} tried candidates failed to compile")
+    return acct, "; ".join(reasons)
+
+
+def _emit_summary(
+    fh, c, S, mode, results, ident, skipped, kind, main_failure=None, accounting=None
+):
     from . import roofline
 
     ok = {
@@ -581,6 +671,8 @@ def _emit_summary(fh, c, S, mode, results, ident, skipped, kind, main_failure=No
         "skipped_sources": "; ".join(n for n, _ in skipped),
         "gpu": ident["gpu"],
         "main_failure": main_failure or "",
+        "cand_accounting": json.dumps(accounting[0]) if accounting else "",
+        "bar_incomplete": accounting[1] if accounting else "",
     }
     disp = results.get("dispatch")
     if disp is not None:

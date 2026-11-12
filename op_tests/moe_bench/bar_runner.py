@@ -15,7 +15,7 @@ import socket
 import tempfile
 import time
 
-from . import accuracy, runner, schema
+from . import accuracy, preflight, runner, schema
 
 BAR_COLS = (
     [
@@ -56,6 +56,8 @@ BAR_COLS = (
         "n_correct",
         "skipped_sources",
         "main_failure",
+        "bar_incomplete",
+        "cand_accounting",
         "new_us",
         "new_id",
         "new_kernel_id",
@@ -479,6 +481,31 @@ def _run_pass(args, kind):
         key=("case_id", "cand_id", "mode", "phase"),
     )
     meta = runner.probe_meta(tree, node, args.launcher, tmpdir)
+    if kind in ("bar", "new"):
+        shimmed = runner.needs_shim(tree)
+        pf = preflight.ensure(
+            tree,
+            tmpdir,
+            args.launcher,
+            runner.worker_env(
+                tree, tmpdir, extra_path=runner.make_shim(tmpdir) if shimmed else None
+            ),
+            pkg="moe_bench_shim" if shimmed else "op_tests.moe_bench",
+        )
+        meta["preflight"] = {
+            "rocm_path_env": pf["rocm_path_env"],
+            "flydsl_version": pf["versions"].get("flydsl"),
+            "flydsl_compile_probe": next(
+                (
+                    c["detail"]
+                    for c in pf["checks"]
+                    if c["name"] == "flydsl compile probe"
+                ),
+                "",
+            ),
+            "versions": pf["versions"],
+            "checks": {c["name"]: c["ok"] for c in pf["checks"]},
+        }
     with open(os.path.join(args.out_dir, f"{prefix}-{tier}.meta.json"), "w") as f:
         json.dump(meta, f, indent=1)
 

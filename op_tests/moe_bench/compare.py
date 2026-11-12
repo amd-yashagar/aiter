@@ -318,6 +318,7 @@ def bar_view(rows, bar_rows, new_rows, weights):
                 "new_acc_pass": (n or {}).get("new_acc_pass", ""),
                 "acc_ok": "" if err_ok is None else err_ok,
                 "acc_form": acc_form,
+                "bar_incomplete": b.get("bar_incomplete", ""),
                 "bar_numerics": b.get("bar_numerics", ""),
                 "new_numerics": (n or {}).get("new_numerics", ""),
                 "dispatch_exact_rel_l2_mean": b.get("dispatch_exact_rel_l2_mean", ""),
@@ -326,6 +327,7 @@ def bar_view(rows, bar_rows, new_rows, weights):
                     gap is not None
                     and gap < -band_v
                     and err_ok is not False
+                    and not b.get("bar_incomplete")
                     and (err_ok is True or not bar_us or b.get("status") == "no-bar")
                     and not (n and n.get("new_kernel_id") == "aiter")
                 ),

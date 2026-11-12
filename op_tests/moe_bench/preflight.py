@@ -12,7 +12,6 @@ orchestrator (``ensure``) stops with a message naming the source and the fix.
 
 import json
 import os
-import subprocess
 import sys
 
 REQUIRED_VERSIONS = ("einops", "pandas", "numpy", "flydsl", "torch", "triton")
@@ -31,7 +30,13 @@ def _check(name, fn, fix, required=True):
         return {"name": name, "ok": True, "detail": detail or "", "required": required}
     except Exception as e:  # noqa: BLE001
         msg = f"{type(e).__name__}: {str(e).strip().splitlines()[0][:300] if str(e).strip() else ''}"
-        return {"name": name, "ok": False, "detail": msg, "fix": fix, "required": required}
+        return {
+            "name": name,
+            "ok": False,
+            "detail": msg,
+            "fix": fix,
+            "required": required,
+        }
 
 
 def _rocm():
@@ -63,10 +68,9 @@ def _triton_moe():
 
 def _flydsl_probe():
     """Compile and run FlyDSL's simplest kernel (examples/00-simple-vecadd-universal.py)."""
-    import torch
-
     import flydsl.compiler as flyc
     import flydsl.expr as fx
+    import torch
 
     @flyc.kernel
     def vadd_kernel(
@@ -96,7 +100,7 @@ def _flydsl_probe():
         B: fx.Tensor,
         C: fx.Tensor,
         n: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         block_dim = 64
         grid_x = (n + block_dim - 1) // block_dim
@@ -135,10 +139,27 @@ def run_probe():
             "set ROCM_PATH to a ROCm install that has llvm/bin/ld.lld and amdgcn/bitcode "
             "(for example ROCM_PATH=/opt/rocm-7.2.4)",
         ),
-        _check("einops", lambda: __import__("einops").__version__, "pip install einops into the GM-123 venv"),
-        _check("tuner generators (fused_moe source)", _tuner_generators, "pip install einops into the GM-123 venv; the tree needs csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py"),
-        _check("flydsl compile probe", _flydsl_probe, "set ROCM_PATH (see the rocm check) and pip install flydsl==0.5.0 into the GM-123 venv"),
-        _check("triton moe api", _triton_moe, "pip install triton for this ROCm (the Triton MoE source is not wired yet, so this is only a warning)", required=False),
+        _check(
+            "einops",
+            lambda: __import__("einops").__version__,
+            "pip install einops into the GM-123 venv",
+        ),
+        _check(
+            "tuner generators (fused_moe source)",
+            _tuner_generators,
+            "pip install einops into the GM-123 venv; the tree needs csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+        ),
+        _check(
+            "flydsl compile probe",
+            _flydsl_probe,
+            "set ROCM_PATH (see the rocm check) and pip install flydsl==0.5.0 into the GM-123 venv",
+        ),
+        _check(
+            "triton moe api",
+            _triton_moe,
+            "pip install triton for this ROCm (the Triton MoE source is not wired yet, so this is only a warning)",
+            required=False,
+        ),
     ]
     return {
         "checks": checks,
@@ -148,24 +169,30 @@ def run_probe():
     }
 
 
-def ensure(tree, tmpdir, launcher="none", worker_env=None, pkg="op_tests.moe_bench", cwd=None):
+def ensure(
+    tree, tmpdir, launcher="none", worker_env=None, pkg="op_tests.moe_bench", cwd=None
+):
     """Run the probe on the run's GPU; raise SystemExit naming the source and the fix."""
     cmd = [sys.executable, "-m", f"{pkg}.preflight"]
-    out = subprocess.run(  # noqa: S603
-        cmd, env=worker_env, cwd=cwd or tree, capture_output=True, text=True, check=False
-    )
+    from . import runner
+
+    stdout = runner._launch(cmd, launcher, worker_env, capture=True, wait=600) or ""
     result = None
-    for line in out.stdout.splitlines():
+    for line in stdout.splitlines():
         if line.startswith("PREFLIGHT "):
             result = json.loads(line[len("PREFLIGHT ") :])
     if result is None:
         raise SystemExit(
-            "preflight did not run (no result line); stderr tail:\n" + out.stderr[-800:]
+            "preflight did not run (no result line): the probe subprocess died, run "
+            f"`{' '.join(cmd)}` by hand on a claimed GPU to see why"
         )
     bad = [c for c in result["checks"] if not c["ok"] and c["required"]]
     for c in result["checks"]:
         if not c["ok"] and not c["required"]:
-            print(f"preflight warning: {c['name']}: {c['detail']} -- {c['fix']}", flush=True)
+            print(
+                f"preflight warning: {c['name']}: {c['detail']} -- {c['fix']}",
+                flush=True,
+            )
     if bad:
         lines = [f"  - {c['name']}: {c['detail']}\n    fix: {c['fix']}" for c in bad]
         raise SystemExit(
