@@ -294,11 +294,13 @@ def _expert_scan(
     ept,
     has_mask,
     pad=None,
+    tile_e=None,
 ):
     """hist (raw counts) -> start[e] (padded exclusive prefix) and local[e]
     (local expert id); returns the padded total. ``pad`` = (sids_it, sw_it,
     sentinel, weight, on) also writes each expert's padding rows (_pad_tail) from the
-    values in registers."""
+    values in registers. ``tile_e`` (LDS) also gets each tile's expert, for
+    _write_tile_table."""
     cE, cT, c0, c1 = fx.Int32(num_experts), fx.Int32(tile_m), fx.Int32(0), fx.Int32(1)
     base = tid * fx.Int32(ept)
     vals = []
@@ -320,6 +322,8 @@ def _expert_scan(
         _lds_st(local, lacc, e)
         if pad is not None:
             _pad_tail(*pad, acc + cnt, acc + p, tile_m)
+        if tile_e is not None:
+            _mark_tiles(tile_e, e, acc // cT, p // cT)
         acc, lacc = acc + p, lacc + l1
     gpu.barrier()
     return total
@@ -376,6 +380,34 @@ def _write_tile_list(
         _st(live_it, lid, t * fx.Int32(3))
         _st(live_it, row, t * fx.Int32(3) + c1)
         _st(live_it, (rows < cT).select(rows, cT), t * fx.Int32(3) + fx.Int32(2))
+
+
+@flyc.jit
+def _mark_tiles(tile_e, e, t0, nt):
+    """tile_e[t0 : t0 + nt] = e (the expert's tiles; a skewed expert loops)."""
+    for j in range(fx.Int32(0), nt, fx.Int32(1)):
+        _lds_st(tile_e, e, t0 + fx.Int32(j))
+
+
+@flyc.jit
+def _write_tile_table(hist, start, local, tile_e, seid_it, live_it, total, tid, tile_m):
+    """One-shot sorted_expert_ids and live_tiles from the tile -> expert
+    table (one LDS read per tile, no search); live_tiles in one 3-dword
+    store per tile."""
+    c0, c1, cT = fx.Int32(0), fx.Int32(1), fx.Int32(tile_m)
+    n_tiles = total // cT
+    iters = (n_tiles - tid + fx.Int32(BLOCK) - c1) // fx.Int32(BLOCK)
+    for j in range(c0, iters, c1):
+        t = tid + fx.Int32(j) * fx.Int32(BLOCK)
+        e = _lds(tile_e, t)
+        row = t * cT
+        rows = _lds(start, e) + _lds(hist, e) - row
+        lid = _lds(local, e)
+        _st(seid_it, lid, t)
+        rec = fx.Vector.from_elements(
+            [lid, row, (rows < cT).select(rows, cT)], fx.Int32
+        )
+        fx.ptr_store(rec, live_it + fx.Int64(t * fx.Int32(3)))
 
 
 POISON_ID = 0x7FFFFFFF  # slot 127, token 0xFFFFFF: past any real route
@@ -640,6 +672,7 @@ def _oneshot_body(
     loc_it,
     with_loc,
     pad,
+    tile_e,
 ):
     """The whole sort in one workgroup, for at most ``rounds`` * BLOCK routes
     (``rounds`` from the static token count, up to 12): every route's id
@@ -687,21 +720,10 @@ def _oneshot_body(
         ept,
         has_mask,
         _pad_arg(pad, sids_it, sw_it, topk, tokens, fx.Boolean(True)),
+        tile_e,
     )
     _write_meta(nv_it, nlive_it, tid, tokens, total, tile_m)
-    _write_tile_list(
-        hist,
-        start,
-        local,
-        seid_it,
-        live_it,
-        total,
-        tid,
-        fx.Int32(BLOCK),
-        num_experts,
-        tile_m,
-        key_bits,
-    )
+    _write_tile_table(hist, start, local, tile_e, seid_it, live_it, total, tid, tile_m)
     for k in range_constexpr(0, e_cap, BLOCK):
         e = fx.Int32(k) + tid
         _lds_st(run, _lds(start, e), e)
@@ -791,6 +813,10 @@ def build(
     ept = -(-E // BLOCK)  # experts per thread in the expert scan
     e_cap = ept * BLOCK
 
+    # one-shot tile -> expert table, for at most rounds * BLOCK routes
+    te_tiles = -(-(rounds * BLOCK + E * (tile_m - 1)) // tile_m)
+    te_cap = -(-te_tiles // BLOCK) * BLOCK
+
     @fx.struct
     class Lds:
         hist: fx.Array[fx.Int32, e_cap, 16]
@@ -801,6 +827,7 @@ def build(
         mask: fx.Array[fx.Int32, e_cap, 16]
         scan: fx.Array[fx.Int32, 2 * WAVES + 1, 16]
         red: fx.Array[fx.Float32, 8, 16]
+        tile_e: fx.Array[fx.Int32, te_cap, 16]
 
     dyn_tensor = quant is not None and quant[0] == "per_tensor_fp8_dynamic"
 
@@ -907,6 +934,7 @@ def build(
                 _it(loc_ids),
                 with_loc,
                 pad,
+                lds.tile_e.ptr,
             )
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
