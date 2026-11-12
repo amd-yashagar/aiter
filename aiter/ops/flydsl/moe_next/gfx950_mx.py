@@ -219,7 +219,7 @@ class _MxGfx950(MoeKernel):
             swiglu_limit=spec.swiglu_limit,
             situ_beta=float(beta),
             situ_linear_beta=float(lbeta),
-            round_bf16=self.round_bf16 or bool(cfg.get("rb", 0)),
+            round_bf16=bool(cfg.get("rb", int(self.round_bf16))),
             tile_n=tn,
             ahead=la,
             read_ahead=cfg.get("ra", 1),
