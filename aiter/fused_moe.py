@@ -4032,6 +4032,13 @@ def _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled):
         )
 
 
+def _cfg_asm_mode(cfg):
+    try:
+        return AsmMoeMode(int(cfg.get("flat", AsmMoeMode.SORTED)))
+    except (TypeError, ValueError):  # a blank (NaN) cell
+        return AsmMoeMode.SORTED
+
+
 def _swiglu_limit_is_active(swiglu_limit) -> bool:
     """True only when the caller asked for a finite positive clamp bound.
 
@@ -4507,6 +4514,21 @@ def get_2stage_cfgs(
                     "[fused_moe] discarding tuned inline-sort config with "
                     "incomplete metadata"
                 )
+
+    # NO_SORT and EMSORT asm kernels read the raw top-k ids and skip the host
+    # sort, which is what maps global expert ids to local ones under an expert
+    # mask: they index past the local experts and fault.
+    if (
+        cfg is not None
+        and is_ep
+        and cfg.get("run_1stage", False)
+        and _cfg_asm_mode(cfg) in (AsmMoeMode.NO_SORT, AsmMoeMode.EMSORT)
+    ):
+        cfg = None
+        logger.warning(
+            f"[fused_moe] discarding tuned flat 1-stage asm config for {keys}: "
+            "it can't take an expert mask; using default heuristics"
+        )
 
     if (
         cfg is not None
