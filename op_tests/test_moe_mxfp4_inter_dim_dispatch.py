@@ -21,6 +21,15 @@ _SKIP = pytest.mark.skipif(
     reason="CDNA (gfx942/gfx950) required for MXFP4 MoE dispatch",
 )
 
+
+@pytest.fixture(autouse=True)
+def _gfx950_routing(monkeypatch):
+    # CK-Tile and FlyDSL fp4/fp8-activation MXFP4 kernels exist for gfx950 only
+    # (gfx942 runs a16w4 on the FlyDSL port), so these dispatch-only checks pin
+    # the gfx950 routing whatever GPU they run on.
+    monkeypatch.setattr(fused_moe_module, "get_gfx", lambda: "gfx950")
+
+
 MODEL_DIM = 6144
 INTER_DIM = 384
 E = 32
