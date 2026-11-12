@@ -10,9 +10,12 @@ import torch
 
 import aiter.fused_moe as _aiter_fused_moe
 from aiter import ActivationType, QuantType, dtypes
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .gpu import gpu_name
+from .handles import lookup as lookup_handle
+from .handles import register as register_handle
 from .kernel import MoeCall
 from .log import log_once
 from .routes import resolve_table
@@ -59,11 +62,15 @@ CALL_KWARGS = (
     "a2_scale",
     "stage2_scatter",
 )
-# Prepare-level keywords only aiter's path implements (FHMoE shared experts,
-# HERD routing, forced activation dtypes): set to a non-default value, they
-# keep the whole layer on aiter's path. block_size_M, splitk and
-# moe_sorting_dispatch_policy are tuning hints a new kernel may ignore.
-AITER_ONLY_KWARGS = {
+# Prepare-level keywords no new kernel covers yet. Set to a non-default value,
+# each one makes every kernel decline unless it lists the keyword in its
+# ``handles_kwargs``. Shared experts (shared_w*, shared_expert_id, clamp_shared:
+# FHMoE, gfx950) become their own family; the forced activation dtypes
+# (quant_type_a, quant_dtype_a, quant_dtype_a2) are served by the families they
+# apply to; HERD routing (herd_*) is gfx1250-only and stays on aiter's path on
+# gfx942 and gfx950. block_size_M, splitk and moe_sorting_dispatch_policy are
+# tuning hints a kernel may ignore.
+NOT_YET_COVERED_KWARGS = {
     "shared_w1": None,
     "shared_w2": None,
     "shared_w1_scale": None,
@@ -143,14 +150,12 @@ def prepare(
         table=resolve_table(gpu, routes),
         topk=topk,
     )
-    extra = sorted(
+    weights.handle = register_handle(weights)
+    weights.uncovered = frozenset(
         k
-        for k, d in AITER_ONLY_KWARGS.items()
+        for k, d in NOT_YET_COVERED_KWARGS.items()
         if k in kw and (kw[k] is not None if d is None else kw[k] != d)
     )
-    if extra:
-        weights.failed.add("*")
-        log_once(f"aiter.moe: {extra} set; only aiter's path implements them")
     if topk is not None and not disabled():
         for m in warmup_m:
             _warmup(weights, int(m), int(topk))
@@ -192,8 +197,6 @@ def explain(
     out = {"route": "aiter", "family": "", "gpu": weights.gpu, "reason": ""}
     if disabled():
         out["reason"] = "AITER_MOE_DISABLE=1"
-    elif "*" in weights.failed:
-        out["reason"] = "prepare-level arguments only aiter implements"
     elif topk is None:
         out["reason"] = "topk unknown: pass topk= or call forward first"
     else:
@@ -223,6 +226,8 @@ def forward(
 
     Raises only where fused_moe itself would. Graph-capture safe: the route is
     chosen on the host from shapes and dtypes; nothing here reads device memory.
+    Under torch.compile it is the custom op ``torch.ops.aiter.moe_forward_``,
+    which takes ``weights`` as an integer handle.
     """
     unknown = set(call_kwargs) - set(CALL_KWARGS)
     if unknown:
@@ -230,6 +235,93 @@ def forward(
             f"forward() got keywords that are not call-level: {sorted(unknown)}"
             f"; prepare-level ones go to prepare(): {PREPARE_KWARGS}"
         )
+    if call_kwargs.get("stage2_scatter") is not None:
+        # Not a tensor, so it cannot cross the op boundary; fused_moe flattens
+        # it itself, and no new kernel implements it yet.
+        return _forward_impl(
+            hidden_states,
+            weights,
+            topk_weight,
+            topk_ids,
+            expert_mask,
+            num_local_tokens,
+            output,
+            a1_scale,
+            a2_scale,
+            call_kwargs,
+        )
+    return moe_forward_(
+        hidden_states,
+        topk_weight,
+        topk_ids,
+        weights.handle,
+        expert_mask,
+        num_local_tokens,
+        output,
+        a1_scale,
+        a2_scale,
+    )
+
+
+def moe_forward_fake(
+    hidden_states: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    handle: int,
+    expert_mask: torch.Tensor | None = None,
+    num_local_tokens: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if output is not None:
+        return output
+    spec = lookup_handle(handle).spec
+    return torch.empty(
+        (hidden_states.shape[0], spec.model_dim),
+        dtype=spec.out_dtype or hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+
+@torch_compile_guard(gen_fake=moe_forward_fake)
+def moe_forward_(
+    hidden_states: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    handle: int,
+    expert_mask: torch.Tensor | None = None,
+    num_local_tokens: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return _forward_impl(
+        hidden_states,
+        lookup_handle(handle),
+        topk_weight,
+        topk_ids,
+        expert_mask,
+        num_local_tokens,
+        output,
+        a1_scale,
+        a2_scale,
+        {},
+    )
+
+
+def _forward_impl(
+    hidden_states,
+    weights: MoeWeights,
+    topk_weight,
+    topk_ids,
+    expert_mask,
+    num_local_tokens,
+    output,
+    a1_scale,
+    a2_scale,
+    call_kwargs,
+) -> torch.Tensor:
     m = hidden_states.shape[0]
     topk = topk_ids.shape[1] if topk_ids.dim() == 2 else -1
     weights.topk = topk
@@ -247,7 +339,7 @@ def forward(
         a2_scale=a2_scale,
         extra=call_kwargs,
     )
-    if disabled() or "*" in weights.failed or topk < 1:
+    if disabled() or topk < 1:
         return fallback(call)
     res = weights.resolve(m, topk, hidden_states.dtype, a1_scale is not None)
     kernel = res.kernel

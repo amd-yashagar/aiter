@@ -186,8 +186,17 @@ def test_router():
                 moe.explain(w, 3, topk=2)["route"] == "test.probe"
             ), "defaults are unset"
             w = moe.prepare(w1, w2, routes="test.probe", quant_dtype_a=dtypes.bf16)
-            assert moe.explain(w, 3, topk=2)["route"] == "aiter", "aiter-only kwarg"
-            results.append({"check": "aiter-only prepare kwargs"})
+            assert moe.explain(w, 3, topk=2)["route"] == "aiter", "not yet covered"
+            assert "quant_dtype_a" in moe.explain(w, 3, topk=2)["reason"]
+            ProbeKernel.handles_kwargs = frozenset({"quant_dtype_a"})
+            try:
+                w = moe.prepare(w1, w2, routes="test.probe", quant_dtype_a=dtypes.bf16)
+                assert (
+                    moe.explain(w, 3, topk=2)["route"] == "test.probe"
+                ), "handles_kwargs"
+            finally:
+                ProbeKernel.handles_kwargs = frozenset()
+            results.append({"check": "not-yet-covered prepare kwargs"})
 
             for bad in (
                 lambda: moe.prepare(w1, w2, expert_mask=None),
@@ -291,12 +300,19 @@ def test_fallback_parity(family, token, model_dim, inter_dim, E, topk, ep, outbu
         assert got is out
     equal = torch.equal(got, ref)
     assert equal or not stable, f"{family} M={token}: fallback differs from fused_moe"
+    # Where fused_moe is not run-to-run stable (atomic combine), parity is the
+    # structural check in test_fallback_args plus this tolerance, the one
+    # test_moe_2stage's blockscale test uses.
+    a, b = got.double(), ref.double()
+    logits_diff = float(1 - 2 * (a * b).sum() / (a.square() + b.square()).sum())
+    assert logits_diff < 1e-3, f"{family} M={token}: logits diff {logits_diff}"
     return {
         "gfx": get_gfx_runtime(),
         "gpu": w.gpu,
         "fused_moe stable": stable,
         "bit-identical": equal,
         "max abs diff": float((got.float() - ref.float()).abs().max()),
+        "logits diff": logits_diff,
     }
 
 
@@ -319,6 +335,42 @@ def test_graph_capture(token=8):
     torch.cuda.synchronize()
     assert torch.equal(out, eager), "graph replay differs from eager"
     return [{"check": f"graph capture M={token}"}]
+
+
+def test_torch_compile(token=8):
+    """forward under torch.compile (fullgraph), eager and under graph capture."""
+    hidden, w1, w2, tw, ti = _small_case(token=token)
+    w = moe.prepare(w1, w2, routes="aiter")
+    eager = moe.forward(hidden, w, tw, ti)
+
+    def layer(h, a, b):
+        return moe.forward(h, w, a, b) * 1.0
+
+    compiled = torch.compile(layer, fullgraph=True)
+    got = compiled(hidden, tw, ti)
+    assert torch.equal(got, eager), "torch.compile result differs from eager"
+    out = torch.empty_like(hidden)
+
+    def layer_out(h, a, b, o):
+        return moe.forward(h, w, a, b, output=o)
+
+    compiled_out = torch.compile(layer_out, fullgraph=True)
+    assert torch.equal(compiled_out(hidden, tw, ti, out), eager)
+    g = torch.cuda.CUDAGraph()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        compiled_out(hidden, tw, ti, out)
+    torch.cuda.current_stream().wait_stream(s)
+    with torch.cuda.graph(g):
+        compiled_out(hidden, tw, ti, out)
+    out.fill_(-7.0)
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, eager), "compiled graph replay differs from eager"
+    fake = moe.entry.moe_forward_fake(hidden, tw, ti, w.handle)
+    assert fake.shape == eager.shape and fake.dtype == eager.dtype
+    return [{"check": f"torch.compile fullgraph + graph capture M={token}"}]
 
 
 PARITY_CASES = [
@@ -346,7 +398,12 @@ def main():
     if gfx not in SUPPORTED_GFX:
         aiter.logger.info("skipped: %s not in %s", gfx, SUPPORTED_GFX)
         return
-    checks = test_router() + test_fallback_args() + test_graph_capture()
+    checks = (
+        test_router()
+        + test_fallback_args()
+        + test_graph_capture()
+        + test_torch_compile()
+    )
     aiter.logger.info(
         "contract checks:\n%s", pd.DataFrame(checks).to_markdown(index=False)
     )

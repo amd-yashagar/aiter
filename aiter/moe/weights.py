@@ -3,6 +3,7 @@
 
 """Weights of one MoE layer, prepared once, with their per-M routes."""
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,16 +45,32 @@ class MoeWeights:
     gpu: str
     table: RouteTable
     topk: int | None = None
+    handle: int = 0
+    uncovered: frozenset = frozenset()
     state: dict[str, Any] = field(default_factory=dict)
     failed: set = field(default_factory=set)
     _routes: dict = field(default_factory=dict, repr=False)
+    _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
-    def __getattr__(self, name):
-        # w1_scale, w2_scale, bias1, ... read back as given to prepare.
-        kwargs = self.__dict__.get("fused_moe_kwargs", {})
-        if name in kwargs:
-            return kwargs[name]
-        raise AttributeError(name)
+    def kwarg(self, name: str, default=None):
+        """A prepare-level fused_moe argument as given (``default`` if unset)."""
+        return self.fused_moe_kwargs.get(name, default)
+
+    @property
+    def w1_scale(self):
+        return self.fused_moe_kwargs.get("w1_scale")
+
+    @property
+    def w2_scale(self):
+        return self.fused_moe_kwargs.get("w2_scale")
+
+    @property
+    def bias1(self):
+        return self.fused_moe_kwargs.get("bias1")
+
+    @property
+    def bias2(self):
+        return self.fused_moe_kwargs.get("bias2")
 
     def resolve(
         self,
@@ -66,8 +83,11 @@ class MoeWeights:
         key = (m, topk, hidden_dtype, has_a1_scale)
         hit = self._routes.get(key)
         if hit is None:
-            hit = self._resolve(*key)
-            self._routes[key] = hit
+            with self._lock:
+                hit = self._routes.get(key)
+                if hit is None:
+                    hit = self._resolve(*key)
+                    self._routes[key] = hit
         return hit
 
     def _resolve(self, m, topk, hidden_dtype, has_a1_scale) -> Resolved:
@@ -82,6 +102,10 @@ class MoeWeights:
             return Resolved(None, route, family, reason)
         if kernel.id in self.failed:
             return Resolved(None, route, family, f"{kernel.id} failed earlier")
+        missing = self.uncovered - kernel.handles_kwargs
+        if missing:
+            reason = f"{kernel.id} does not implement {sorted(missing)}"
+            return Resolved(None, route, family, reason)
         reason = kernel.supports(self.spec, m, topk)
         if reason:
             log_once(f"aiter.moe: {kernel.id} declines {self.spec} at M={m}: {reason}")
@@ -93,9 +117,10 @@ class MoeWeights:
     def mark_failed(self, kernel: MoeKernel, exc: BaseException, where: str) -> None:
         """Send every later call this weight set's ``kernel`` would serve to
         aiter's path."""
-        self.failed.add(kernel.id)
-        self.state.pop(kernel.id, None)
-        self._routes.clear()
+        with self._lock:
+            self.failed.add(kernel.id)
+            self.state.pop(kernel.id, None)
+            self._routes.clear()
         log_once(
             f"aiter.moe: {kernel.id} failed at {where} for {self.spec}; "
             f"using aiter's path from now on: {exc!r}"

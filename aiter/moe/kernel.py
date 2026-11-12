@@ -61,6 +61,9 @@ class MoeKernel:
     id: ClassVar[str] = ""
     family: ClassVar[str] = ""
     archs: ClassVar[tuple[str, ...]] = ()
+    # Not-yet-covered prepare keywords (entry.NOT_YET_COVERED_KWARGS) this
+    # kernel implements; any other one set on a layer makes it decline.
+    handles_kwargs: ClassVar[frozenset] = frozenset()
 
     def supports(
         self, spec: MoeSpec, m: int, topk: int, call: MoeCall | None = None
