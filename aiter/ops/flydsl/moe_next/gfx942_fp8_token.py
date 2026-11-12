@@ -7,9 +7,9 @@ Prefill, same quantization points as aiter's 2-stage path: the core sort (with
 the output zero-fill fused in), aiter's per-token / per-tensor activation quant,
 Gate/Up (fp8 MFMA, scales and activation in the epilogue, bf16 intermediate),
 aiter's quant of the intermediate, and Down with the scales and route weight in
-the epilogue into one bf16 row per route, summed per token in fp32 (a config
-can switch Down to packed bf16 atomics into the output instead). Tile configs
-are data: configs/<gpu>/fp8-token.json.
+the epilogue, added into the sort-zeroed output with coalesced packed bf16
+atomics (config ``rows``: one bf16 row per route, summed per token in fp32).
+Tile configs are data: configs/<gpu>/fp8-token.json.
 """
 
 import functools
@@ -47,7 +47,7 @@ def _tile(config, gpu, model_dim):
     block_k = int(cfg.get("gateup_block_k", 256))
     while block_k > 64 and model_dim % (2 * block_k):
         block_k //= 2
-    return block_n, block_k, cfg.get("combine", "rows") == "atomic"
+    return block_n, block_k, cfg.get("combine", "atomic") == "atomic"
 
 
 @functools.cache
@@ -96,18 +96,6 @@ def _launch(fn, *args):
     _run_compiled(fn, *args, torch.cuda.current_stream())
 
 
-def _route_rows(tm, m, topk):
-    """[M, topk] sorted row of every route, -1 where the sort dropped it."""
-    sid = tm.sorted_token_ids
-    rows = torch.arange(sid.numel(), device=sid.device, dtype=torch.int32)
-    tok, slot = sid & 0xFFFFFF, sid >> 24
-    valid = (tok < m) & (slot < topk) & (rows < tm.num_valid_ids[0])
-    loc = torch.full((m * topk + 1,), -1, dtype=torch.int32, device=sid.device)
-    dst = torch.where(valid, tok * topk + slot, m * topk).long()
-    loc.scatter_(0, dst, rows)
-    return loc[: m * topk].view(m, topk)
-
-
 def _swiglu_limit(spec):
     if spec.act != ActivationType.Swiglu:
         return None
@@ -120,11 +108,11 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
     family = "fp8-token"
     archs = ("gfx942",)
     routing = "tiles"
-    epilogue = "reduce"
+    epilogue = "atomic"
     numerics: ClassVar[dict] = {
         "act_quant": "per_token_fp8",
         "inter": "bf16_then_per_token_fp8",
-        "combine": "bf16_rows_fp32_sum",
+        "combine": "bf16_atomic",
     }
 
     def supports(self, spec, m, topk, call=None):
@@ -163,8 +151,9 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
                 return "contiguous fp32 weight scales only"
             if call.w1_scale.dtype != torch.float32:
                 return "fp32 weight scales only"
-            if call.expert_mask is not None or call.num_local_tokens is not None:
-                return "EP and num_local_tokens not implemented yet"
+            if spec.quant == QuantType.per_Tensor and call.num_local_tokens is not None:
+                # aiter's per-tensor quant asserts on num_rows.
+                return "per-tensor with num_local_tokens"
             if spec.quant == QuantType.per_Token and call.a1_scale is not None:
                 return "prequantized activations"
             if call.a2_scale is not None:
@@ -208,7 +197,7 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
             dn(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
 
     def __call__(self, call):
-        from aiter.ops.flydsl.moe_next.core.tile_map import route_to_tiles
+        from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
 
         spec = call.spec
         x = call.hidden_states
@@ -217,24 +206,33 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
         quant = _QUANTS[spec.quant]
         block_n, block_k, atomic = _tile(call.config, self._gpu(call.weights), D)
         dev = x.device
+        nlt = call.num_local_tokens
 
         out = call.output
         if out is None:
             out = torch.empty((M, D), dtype=torch.bfloat16, device=dev)
-        tm = route_to_tiles(
-            call.topk_ids.to(torch.int32),
-            call.topk_weight.to(torch.float32),
-            num_experts=call.global_experts,
-            tile_m=TILE_M,
-            zero_output=out if atomic else None,
+        sort = moe_sorting(
+            call.topk_ids,
+            call.topk_weight,
+            call.global_experts,
+            D,
+            torch.bfloat16,
+            TILE_M,
+            call.expert_mask,
+            nlt,
+            0,
+            accumulate=atomic,
+            output_aux=None if atomic else AUX_SORT_OPUS,
+            output=out if atomic else None,
         )
-        tasks = tm.max_tiles
+        sorted_ids, sorted_w, sorted_eids, num_valid = sort[:4]
+        tasks = int(sorted_eids.shape[0])
 
         quant_fn = aiter.get_hip_quant(spec.quant)
         if per_tensor:
             xq, xs = quant_fn(x, scale=call.a1_scale, quant_dtype=dtypes.fp8)
         else:
-            xq, xs = quant_fn(x, quant_dtype=dtypes.fp8)
+            xq, xs = quant_fn(x, quant_dtype=dtypes.fp8, num_rows=nlt)
         xs = xs.to(torch.float32).contiguous()
 
         # The dynamic per-tensor quant of the intermediate reads every row,
@@ -255,16 +253,24 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
             xq,
             call.w1,
             inter,
-            tm.sorted_token_ids,
-            tm.sorted_weights,
-            tm.sorted_expert_ids,
-            tm.num_valid_ids,
+            sorted_ids,
+            sorted_w,
+            sorted_eids,
+            num_valid,
             call.w1_scale,
             xs,
             M,
             tasks,
         )
-        aq, as_ = quant_fn(inter.view(M * topk, I), quant_dtype=dtypes.fp8)
+        if per_tensor:
+            aq, as_ = quant_fn(inter.view(M * topk, I), quant_dtype=dtypes.fp8)
+        else:
+            aq, as_ = quant_fn(
+                inter.view(M * topk, I),
+                quant_dtype=dtypes.fp8,
+                num_rows=nlt,
+                num_rows_factor=topk,
+            )
         rows = out
         if not atomic:
             rows = torch.empty((tasks * TILE_M, D), dtype=torch.bfloat16, device=dev)
@@ -273,15 +279,15 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
             aq,
             call.w2,
             rows,
-            tm.sorted_token_ids,
-            tm.sorted_weights,
-            tm.sorted_expert_ids,
-            tm.num_valid_ids,
+            sorted_ids,
+            sorted_w,
+            sorted_eids,
+            num_valid,
             call.w2_scale,
             as_.to(torch.float32).contiguous(),
             M,
             tasks,
         )
         if not atomic:
-            _sorted_sum(topk, D)(_route_rows(tm, M, topk), rows, out, M)
+            _sorted_sum(topk, D)(sort[6], rows, out, M)
         return out

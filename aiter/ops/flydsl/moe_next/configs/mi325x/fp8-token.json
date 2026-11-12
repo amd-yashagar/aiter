@@ -2,7 +2,7 @@
   "default": {
     "gateup_block_n": 128,
     "gateup_block_k": 256,
-    "combine": "rows"
+    "combine": "atomic"
   },
   "bn256_bk128": {
     "gateup_block_n": 256,
@@ -12,7 +12,7 @@
     "gateup_block_n": 128,
     "gateup_block_k": 128
   },
-  "atomic": {
-    "combine": "atomic"
+  "rows": {
+    "combine": "rows"
   }
 }
