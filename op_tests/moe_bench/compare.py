@@ -40,7 +40,9 @@ def load(path):
         if "new_us" in r and not r.get("median_us"):
             r["median_us"] = r["new_us"]
             r.setdefault("ref_pass", "")
-            if r["status"] == "no-correct-candidate":
+            if (
+                r["status"] == "no-correct-candidate"
+            ):  # no-reference stays its own state
                 r["status"] = "fail"
     return rows
 
@@ -234,6 +236,48 @@ def gpu_key(name):
     return roofline.sku_of(name) or (name or "unknown").replace(" ", "_")
 
 
+INTER_ROUNDING = {"bf16": 0, "fp32_direct": 1}  # bf16_then_<quant> ranks 2
+COMBINE_ROUNDING = {
+    "fp32_reduce": 0,
+    "fp32_atomic": 0,
+    "bf16_rows_fp32_sum": 1,
+    "bf16_atomic": 2,
+}
+
+
+def _numerics_fields(key):
+    return dict(p.split("=", 1) for p in (key or "").split(";") if "=" in p)
+
+
+def rounds_more(bar_key, new_key):
+    """What the new kernel rounds more than the bar's path, from fewest roundings up.
+
+    act_quant: none < quantized. inter: bf16 (unquantized) < fp32_direct < bf16_then_<q>.
+    combine: fp32_reduce = fp32_atomic < bf16_rows_fp32_sum < bf16_atomic. Informational:
+    the verdict stays on the error against the bar; bf16_atomic matches aiter's own paths.
+    """
+    b, n = _numerics_fields(bar_key), _numerics_fields(new_key)
+    out = []
+    if (
+        b.get("act_quant")
+        and n.get("act_quant")
+        and (n["act_quant"] != "none") > (b["act_quant"] != "none")
+    ):
+        out.append("act_quant")
+
+    def inter_rank(v):
+        return 2 if v.startswith("bf16_then_") else INTER_ROUNDING.get(v)
+
+    bi, ni = inter_rank(b.get("inter", "")), inter_rank(n.get("inter", ""))
+    if bi is not None and ni is not None and ni > bi:
+        out.append("inter")
+    bc = COMBINE_ROUNDING.get(b.get("combine", ""))
+    nc = COMBINE_ROUNDING.get(n.get("combine", ""))
+    if bc is not None and nc is not None and nc > bc:
+        out.append("combine")
+    return ",".join(out)
+
+
 ACC_GATE = [f"{ref}_{k}" for ref in ("path", "exact") for k in ("rel_l2", "max_norm")]
 
 
@@ -324,6 +368,9 @@ def bar_view(rows, bar_rows, new_rows, weights):
                 "bar_incomplete": b.get("bar_incomplete", ""),
                 "bar_numerics": b.get("bar_numerics", ""),
                 "new_numerics": (n or {}).get("new_numerics", ""),
+                "rounds_more": rounds_more(
+                    b.get("bar_numerics", ""), (n or {}).get("new_numerics", "")
+                ),
                 "dispatch_exact_rel_l2_mean": b.get("dispatch_exact_rel_l2_mean", ""),
                 "bar_exact_rel_l2_mean_": b.get("bar_exact_rel_l2_mean", ""),
                 "won_mode": bool(

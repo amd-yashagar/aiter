@@ -57,6 +57,8 @@ BAR_COLS = (
         "skipped_sources",
         "main_failure",
         "bar_incomplete",
+        "gate_fail",
+        "gate_fail",
         "cand_accounting",
         "new_us",
         "new_id",
@@ -465,6 +467,18 @@ def summarize_new(args):
     summary = {"tier": tier, "cases": len({r["case_id"] for r in new_rows})}
     routed = [r for r in new_rows if r.get("new_kernel_id") not in ("", "aiter")]
     summary["served_by_kernel"] = len({r["case_id"] for r in routed})
+    noref = [r for r in new_rows if r.get("status") == "no-reference"]
+    summary["no_reference"] = len(noref)
+    summary["no_reference_routed_gate_fail"] = sorted(
+        {r["case_id"] for r in noref if r.get("gate_fail") == "1"}
+    )
+    summary["gate_pass"] = not summary["no_reference_routed_gate_fail"]
+    if noref:
+        print(
+            f"GATE: {len(noref)} rows have no reference (never a pass); routed rows that "
+            f"fail the gate: {summary['no_reference_routed_gate_fail']}",
+            flush=True,
+        )
     summary["route_changed_in_capture"] = [
         r["case_id"] for r in new_rows if r.get("route_changed") == "1"
     ]

@@ -316,6 +316,25 @@ def same_rounding(key_a, key_b):
     return key_a.split(";")[:2] == key_b.split(";")[:2]
 
 
+def combine_of_route(route):
+    """FlyDSL stage 2 names its epilogue (``_reduce``: per-route bf16 rows summed in
+    fp32, ``_atomic``); aiter's CK, ck_tile and ASM stage 2 accumulate with bf16 atomics.
+    "n/a" where the route says nothing (1-stage ASM, whole-graph)."""
+    route = route or {}
+    k2 = route.get("kernel2", "") or ""
+    if route.get("stages") != "2-stage":
+        return "n/a"
+    if k2.startswith("flydsl_moe2"):
+        if k2.endswith("_reduce"):
+            return "bf16_rows_fp32_sum"
+        if k2.endswith("_atomic"):
+            return "bf16_atomic"
+        return "n/a"
+    if route.get("backend2") in ("ck", "ck_tile", "asm"):
+        return "bf16_atomic"
+    return "n/a"
+
+
 def numerics_from_route(S, route):
     """Rounding points of the aiter path that served a call (the ref_path it is scored on).
 
@@ -339,7 +358,7 @@ def numerics_from_route(S, route):
         act, inter = qn, "fp32_direct"
     else:
         act, inter = qn, then
-    return {"act_quant": act, "inter": inter, "combine": "n/a"}
+    return {"act_quant": act, "inter": inter, "combine": combine_of_route(route)}
 
 
 def numerics_of(S, cand, route, ctx=None):

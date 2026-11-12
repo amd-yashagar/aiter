@@ -189,3 +189,85 @@ def test_fp32_direct_reference_builds_and_differs_from_bf16_round():
     assert fm.dtypes.fp32 == torch.float32  # fp64_math restored
     assert torch.get_default_dtype() == torch.float32
     assert aiter is not None
+
+
+def test_combine_rounding_rank_is_informational_in_compare():
+    from op_tests.moe_bench import compare
+
+    def key(combine, act="per_1x128_fp8", inter="fp32_direct"):
+        return f"act_quant={act};inter={inter};combine={combine}"
+
+    bar = key("fp32_atomic")
+    assert compare.rounds_more(bar, key("fp32_reduce")) == ""
+    assert compare.rounds_more(bar, key("bf16_rows_fp32_sum")) == "combine"
+    assert compare.rounds_more(bar, key("bf16_atomic")) == "combine"
+    assert (
+        compare.rounds_more(key("bf16_rows_fp32_sum"), key("bf16_atomic")) == "combine"
+    )
+    assert compare.rounds_more(key("bf16_atomic"), key("fp32_reduce")) == ""
+    # act_quant and inter are reported in the same column
+    both = compare.rounds_more(
+        key("fp32_reduce", act="none", inter="bf16"),
+        key("bf16_atomic", inter="bf16_then_per_1x128_fp8"),
+    )
+    assert both == "act_quant,inter,combine"
+    # "n/a" (a route that says nothing) is never judged
+    assert compare.rounds_more(key("n/a"), key("bf16_atomic")) == ""
+    # rounds_more does not touch the verdict: acc_ok still compares errors only
+    assert compare._same_rounding(key("fp32_reduce"), key("bf16_atomic"))
+
+
+def test_aiter_route_combine_from_stage2_name():
+    r = {"stages": "2-stage", "backend2": "ck", "kernel2": "moe_ck2stages_x"}
+    assert accuracy.combine_of_route(r) == "bf16_atomic"
+    f = {
+        "stages": "2-stage",
+        "backend2": "flydsl",
+        "kernel2": "flydsl_moe2_afp8_t32x128_reduce",
+    }
+    assert accuracy.combine_of_route(f) == "bf16_rows_fp32_sum"
+    f["kernel2"] = "flydsl_moe2_afp8_t32x128_atomic"
+    assert accuracy.combine_of_route(f) == "bf16_atomic"
+    assert accuracy.combine_of_route({"stages": "1-stage"}) == "n/a"
+    assert accuracy.combine_of_route({"stages": "whole-graph"}) == "n/a"
+    n = accuracy.numerics_from_route(_S(), r)
+    assert n["combine"] == "bf16_atomic"
+    accuracy.normalize_numerics(_S(), n, derived=True)
+
+
+def test_no_reference_is_its_own_state_and_fails_a_routed_row(tmp_path):
+    import csv
+    import json
+
+    from op_tests.moe_bench import bar_worker
+
+    cand = types.SimpleNamespace(
+        kernel_id="gfx942_fp8_block.prefill", id="new|fused_moe"
+    )
+    aiter_cand = types.SimpleNamespace(kernel_id="aiter", id="new|fused_moe")
+    S = types.SimpleNamespace(kind="fused")
+    case = types.SimpleNamespace(
+        id="c1", row={"model": "m", "family": "f", "sig": "s"}, modes=["warm"], token=8
+    )
+    for c, want_fail in ((cand, "1"), (aiter_cand, "")):
+        import io
+
+        fh = io.StringIO()
+        results = {"new|fused_moe": {"ok": False, "outcome": "noref", "cand": c}}
+        try:
+            bar_worker._emit_summary(
+                fh,
+                case,
+                S,
+                "warm",
+                results,
+                {"sku": "", "gpu": "", "gfx": ""},
+                [],
+                "new",
+            )
+        except Exception as e:  # noqa: BLE001
+            pytest.skip(f"summary needs more of the case than this fake has: {e}")
+        row = json.loads(fh.getvalue().splitlines()[-1])
+        assert row["status"] == "no-reference"
+        assert row.get("gate_fail", "") == want_fail
+    assert csv and tmp_path

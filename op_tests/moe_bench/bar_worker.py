@@ -202,8 +202,13 @@ class Measurer:
                 self._emit(base, modes, status="router-discarded", detail=reason)
                 return res
             if self.acc_refs is None:
+                res["outcome"] = "noref"
                 self._emit(
-                    base, modes, status="no-reference", detail=self.acc_err or ""
+                    base,
+                    modes,
+                    status="no-reference",
+                    detail=self.acc_err or "",
+                    new_kernel_id=getattr(cand, "kernel_id", ""),
                 )
                 return res
             num = accuracy.numerics_of(ctx.S, cand, route, ctx)
@@ -215,11 +220,13 @@ class Measurer:
             except NotImplementedError:
                 raise
             except Exception as e:  # noqa: BLE001
+                res["outcome"] = "noref"
                 self._emit(
                     base,
                     modes,
                     status="no-reference",
                     detail=f"reference error (not the candidate): {_err(e)}",
+                    new_kernel_id=getattr(cand, "kernel_id", ""),
                 )
                 return res
             acc = accuracy.evaluate(
@@ -733,6 +740,19 @@ def _emit_summary(
                 }
             )
             row.update(_gate(who, r.get("acc"), r.get("numerics", "")))
+        elif any(r.get("outcome") == "noref" for r in results.values()):
+            # a reference that could not be built is its own state, never a pass; a
+            # routed row (served by a kernel, not aiter) fails the gate
+            kid = next(
+                getattr(r["cand"], "kernel_id", "")
+                for r in results.values()
+                if r.get("outcome") == "noref"
+            )
+            row.update(
+                status="no-reference",
+                **{f"{who}_kernel_id": kid},
+                gate_fail="1" if kid not in ("", "aiter") else "",
+            )
         else:
             row.update(status="no-correct-candidate")
     elif ok:
