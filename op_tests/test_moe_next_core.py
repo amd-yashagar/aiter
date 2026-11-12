@@ -147,7 +147,9 @@ def test_graph_capture(token=256, E=256, topk=8, tile_m=32):
 QUANT_TYPES = {
     "per_token_fp8": QuantType.per_Token,
     "per_1x128_fp8": QuantType.per_1x128,
+    "per_tensor_fp8": QuantType.per_Tensor,
 }
+STATIC_SCALE = 0.0173  # the 400 outlier saturates
 
 
 def _quant_input(token, K, seed, specials=False):
@@ -178,12 +180,25 @@ def _mx_lane_native(rs, m, k):
     return out
 
 
-def _check_quant(tm, x, mode, local):
+def _check_quant(tm, x, mode, local, scale=None):
     rows = x.shape[0]
     nr = None
     if local is not None:
         nr = torch.tensor([local], dtype=torch.int32)
         rows = local
+    if mode == "per_tensor_fp8":
+        # aiter's per-tensor quant takes no num_rows; compare the rows below it
+        rq, _ = aiter.get_hip_quant(QuantType.per_Tensor)(
+            x, scale=scale, quant_dtype=dtypes.fp8
+        )
+        bad = []
+        if not torch.equal(
+            tm.a_q[:rows].view(torch.uint8), rq[:rows].view(torch.uint8)
+        ):
+            bad.append("a_q")
+        if tm.a_scale.data_ptr() != scale.data_ptr():
+            bad.append("a_scale is not the given scale")
+        return bad
     if mode in MX_TYPES:
         from aiter.ops.quant import per_1x32_mx_quant_hip
 
@@ -320,11 +335,21 @@ def test_fused_quant():
             out_a = torch.full((token, 1024), 3.0, dtype=dtypes.bf16)
             out_b = out_a.clone()
             kw = {"num_experts": E, "tile_m": 32, "num_local_tokens": nl}
+            scale = None
+            if mode == "per_tensor_fp8":
+                scale = torch.tensor([STATIC_SCALE], dtype=torch.float32)
             a = route_to_tiles(
-                ti, tw, zero_output=out_a, quant_input=x, quant_mode=mode, **kw
+                ti,
+                tw,
+                zero_output=out_a,
+                quant_input=x,
+                quant_mode=mode,
+                quant_scale=scale,
+                **kw,
             )
             b = reference_tile_map(ti, tw, zero_output=out_b, **kw)
-            bad = compare(a, b, 32, out_a, out_b) + _check_quant(a, x, mode, local)
+            bad = compare(a, b, 32, out_a, out_b)
+            bad += _check_quant(a, x, mode, local, scale)
             assert not bad, f"{mode} M={token} K={K}: {bad}"
             rows.append(
                 {
@@ -336,37 +361,34 @@ def test_fused_quant():
                     "exact": True,
                 }
             )
-    # graph capture: replay with new activations written into the same input
-    x = _quant_input(256, 7168, 1)
+    # graph capture: replay with new activations (and a new static scale)
+    # written into the same inputs
     ti, tw, _ = routing(256, 256, 8)
-    route_to_tiles(
-        ti, tw, num_experts=256, tile_m=32, quant_input=x, quant_mode="per_1x128_fp8"
-    )
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        tm = route_to_tiles(
-            ti,
-            tw,
-            num_experts=256,
-            tile_m=32,
-            quant_input=x,
-            quant_mode="per_1x128_fp8",
+    for mode in ("per_1x128_fp8", "per_tensor_fp8"):
+        x = _quant_input(256, 7168, 1)
+        scale = torch.tensor([STATIC_SCALE], dtype=torch.float32)
+        kw = {"num_experts": 256, "tile_m": 32, "quant_input": x, "quant_mode": mode}
+        kw["quant_scale"] = scale if mode == "per_tensor_fp8" else None
+        route_to_tiles(ti, tw, **kw)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            tm = route_to_tiles(ti, tw, **kw)
+        x.copy_(_quant_input(256, 7168, 9))
+        scale.fill_(0.5)
+        g.replay()
+        torch.cuda.synchronize()
+        bad = _check_quant(tm, x, mode, None, scale)
+        assert not bad, f"{mode} graph replay: {bad}"
+        rows.append(
+            {
+                "mode": f"{mode} graph replay",
+                "token": 256,
+                "E": 256,
+                "K": 7168,
+                "local": None,
+                "exact": True,
+            }
         )
-    x.copy_(_quant_input(256, 7168, 9))
-    g.replay()
-    torch.cuda.synchronize()
-    bad = _check_quant(tm, x, "per_1x128_fp8", None)
-    assert not bad, f"graph replay: {bad}"
-    rows.append(
-        {
-            "mode": "per_1x128_fp8 graph replay",
-            "token": 256,
-            "E": 256,
-            "K": 7168,
-            "local": None,
-            "exact": True,
-        }
-    )
     return rows
 
 

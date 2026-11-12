@@ -62,6 +62,7 @@ class TileMap:
 QUANT_MODES = {
     "per_token_fp8": (8, None),
     "per_1x128_fp8": (128, None),
+    "per_tensor_fp8": (8, None),
     "mx_fp4_round_up": (32, ("gfx950",)),
     "mx_fp8_round_up": (32, ("gfx950",)),
     # tests only: MX addressing with tagged output dwords in place of values
@@ -94,10 +95,13 @@ def _quant_buffers(mode, m, k, dev):
             s.view(torch.int8),
             0.0,
         )
-    cols = 1 if mode == "per_token_fp8" else k // 128
     a_q = torch.empty((m, k), dtype=dtypes.fp8, device=dev)
+    fp8_max = float(torch.finfo(dtypes.fp8).max)
+    if mode == "per_tensor_fp8":
+        return a_q, None, a_q.view(torch.int32), None, fp8_max
+    cols = 1 if mode == "per_token_fp8" else k // 128
     s = torch.empty((m, cols), dtype=torch.float32, device=dev)
-    return a_q, s, a_q.view(torch.int32), s, float(torch.finfo(dtypes.fp8).max)
+    return a_q, s, a_q.view(torch.int32), s, fp8_max
 
 
 def max_sorted_rows(m: int, topk: int, num_experts: int, tile_m: int) -> int:
@@ -148,14 +152,18 @@ def route_to_tiles(
     with_loc_ids: bool = False,
     quant_input: torch.Tensor | None = None,
     quant_mode: str | None = None,
+    quant_scale: torch.Tensor | None = None,
 ) -> TileMap:
     """Sort routes into tiles of ``tile_m`` rows and zero ``zero_output``'s rows
     below the token count (``num_local_tokens`` when given), as aiter's sort does.
 
     ``num_experts`` is the global expert count (the size of ``expert_mask``
     under EP). ``zero_output`` is the output an atomic epilogue accumulates
-    into; pass None for a reduce epilogue. Graph-capture safe: launch shape
-    depends only on shapes; every buffer is a per-call ``torch.empty``.
+    into; pass None for a reduce epilogue. ``quant_input`` / ``quant_mode``
+    quantize the token rows in the same launch; ``per_tensor_fp8`` takes its
+    static scale as ``quant_scale`` (fp32, one value; ``a_scale`` is that
+    tensor). Graph-capture safe: launch shape depends only on shapes; every
+    buffer is a per-call ``torch.empty``.
     """
     from aiter.ops.flydsl.kernels.moe_next.core.sort import build
 
@@ -206,6 +214,12 @@ def route_to_tiles(
                 f"quant_input must be contiguous bf16 [M, K], K % {mult} == 0"
             )
         tm.a_q, tm.a_scale, qq, qs, fp8_max = _quant_buffers(quant_mode, m, k, dev)
+        if quant_mode == "per_tensor_fp8":
+            if quant_scale is None:
+                raise NotImplementedError("per_tensor_fp8 needs a static quant_scale")
+            if quant_scale.dtype != torch.float32 or quant_scale.numel() != 1:
+                raise ValueError("quant_scale must be one fp32 value")
+            tm.a_scale = qs = quant_scale.view(1)
         quant = (quant_mode, k, fp8_max)
         qw = blocks(quant_mode, m, k)
         qx = quant_input.view(torch.int32)

@@ -17,6 +17,9 @@ token, scale = RoundUp e8m0 of amax / max_pos (6 for fp4, 448 for fp8), values
 by the hardware scaled conversion, as aiter's per_1x32_mx_quant_hip; scales
 lane-native (quant_mx_block).
 
+per_tensor_fp8 (static, a given scale): as aiter's static_per_tensor_quant,
+q = cvt_pk_fp8_f32(med3(x * rcp(scale), -fp8_max, fp8_max)).
+
 The helpers take a workgroup-relative block index, so a quant pass can run as
 standalone kernels or in extra workgroups of the sort launch.
 """
@@ -158,6 +161,23 @@ def quant_token_block(x_it, q_it, s_it, red, row, n_rows, cols, fp8_max):
     fx.ptr_store(scale, s_it + fx.Int64(s))
 
 
+@flyc.jit
+def quant_static_block(x_it, q_it, s_it, blk, n_rows, cols, fp8_max):
+    """Static per-tensor fp8 (aiter's static_per_tensor_quant): q =
+    cvt(med3(x * rcp(scale[0]))), 8 columns per thread, 2048 per workgroup
+    from element blk * 2048, over the first n_rows token rows."""
+    elem = (blk * fx.Int32(BLOCK) + gpu.thread_idx.x) * fx.Int32(8)
+    live = elem < n_rows * fx.Int32(cols)
+    inv = fx.Float32(rocdl.rcp(T.f32, _raw(fx.ptr_load(s_it))))
+    x = _bf16x8_f32(_load8(x_it, live.select(elem, fx.Int32(0))))
+    d0 = _fp8x4(x[0:4], inv, fp8_max)
+    d1 = _fp8x4(x[4:8], inv, fp8_max)
+    if live:
+        q = elem >> fx.Int32(2)
+        fx.ptr_store(d0, q_it + fx.Int64(q))
+        fx.ptr_store(d1, q_it + fx.Int64(q + fx.Int32(1)))
+
+
 def _e8m0_round_up(amax, max_pos):
     """aiter's MxScaleRoundMode RoundUp: the biased exponent of
     ceil_pow2(amax / max_pos); 0xFF for inf and nan."""
@@ -288,6 +308,8 @@ def build_standalone(mode, cols, fp8_max, has_local):
             )
         elif mode in MX_MODES:
             quant_mx_block(_it(x), _it(q), _it(s), bid, rows, cols, *MX_MODES[mode])
+        elif mode == "per_tensor_fp8":
+            quant_static_block(_it(x), _it(q), _it(s), bid, rows, cols, fp8_max)
         else:
             quant_token_block(
                 _it(x), _it(q), _it(s), lds.red.ptr, bid, rows, cols, fp8_max
@@ -316,4 +338,6 @@ def blocks(mode, m, cols):
         return -(-(m * (cols // 128)) // (BLOCK // GROUP_LANES))
     if mode in MX_MODES:
         return -(-(m * mx_scale_cols(cols)) // BLOCK)
+    if mode == "per_tensor_fp8":
+        return -(-(m * cols) // (BLOCK * 8))
     return m

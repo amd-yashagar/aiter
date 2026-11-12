@@ -34,7 +34,13 @@ import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from .quant import MX_MODES, quant_1x128_block, quant_mx_block, quant_token_block
+from .quant import (
+    MX_MODES,
+    quant_1x128_block,
+    quant_mx_block,
+    quant_static_block,
+    quant_token_block,
+)
 
 BLOCK = 256
 WAVE = 64
@@ -694,6 +700,8 @@ def build(
             )
         elif mode in MX_MODES:
             quant_mx_block(_it(qx), _it(qq), _it(qs), blk, rows, cols, *MX_MODES[mode])
+        elif mode == "per_tensor_fp8":
+            quant_static_block(_it(qx), _it(qq), _it(qs), blk, rows, cols, fp8_max)
         else:
             quant_token_block(
                 _it(qx), _it(qq), _it(qs), lds.red.ptr, blk, rows, cols, fp8_max
