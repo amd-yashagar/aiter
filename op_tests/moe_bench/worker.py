@@ -239,6 +239,19 @@ def run_fused_group(cases, modes_req, fh, timeout_info):
         )
         try:
             timer.prepare_graph()
+            status = "ok" if corr.get("ref_pass") is not False else "fail"
+            detail = sentinel_note
+            if (
+                status == "fail"
+                and gfx != "gfx950"
+                and family in UNSUPPORTED_FAMILIES_NON_GFX950
+            ):
+                status = "unsupported"
+                detail = (
+                    f"ran but wrong result on {gfx} (err_ratio={corr['err_ratio']:.4f}, "
+                    f"logits_diff={corr['logits_diff']:.4g}); aiter's own test_moe_2stage "
+                    "skips per_1x32 off gfx950"
+                )
             for m in modes:
                 st = timer.time(cold=(m == "cold"))
                 us = st["median_us"]
@@ -247,8 +260,8 @@ def run_fused_group(cases, modes_req, fh, timeout_info):
                     dict(
                         common,
                         mode=m,
-                        status="ok" if corr.get("ref_pass") is not False else "fail",
-                        detail=sentinel_note,
+                        status=status,
+                        detail=detail,
                         timing_mode=timer.mode,
                         capture_error=timer.capture_error,
                         tflops=flop / (us * 1e-6) / 1e12,

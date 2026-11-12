@@ -22,6 +22,7 @@ from pathlib import Path
 
 from . import gpu_claim, schema
 from .routes import ENV_KEYS, ROUTE_COLS
+from .worker import UNSUPPORTED_FAMILIES_NON_GFX950
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RESULT_COLS = (
@@ -315,13 +316,12 @@ class GroupJob:
     def _drain(self):
         if not self.outfile or not os.path.exists(self.outfile):
             return
-        with open(self.outfile) as f:
+        with open(self.outfile, "rb") as f:
             f.seek(self.pos)
             data = f.read()
-        lines = data.split("\n")
-        if not data.endswith("\n"):
-            lines = lines[:-1]
-        self.pos += sum(len(x) + 1 for x in lines)
+        end = data.rfind(b"\n") + 1
+        self.pos += end
+        lines = data[:end].decode().split("\n")
         for line in lines:
             if not line.strip():
                 continue
@@ -354,12 +354,21 @@ class GroupJob:
             c = self.pending.get(cid)
             if c is None:
                 continue
+            st, det = status, detail
+            if (
+                status == "crash"
+                and self.phase == "probe"
+                and self.meta.get("gfx") != "gfx950"
+                and c["family"] in UNSUPPORTED_FAMILIES_NON_GFX950
+            ):
+                st = "unsupported"
+                det = "aiter aborted the process on this arch: " + detail
             for m in [m for m in c.modes if m in self.modes]:
                 if (c.id, m) not in self.results.done:
                     self.results.add(
                         make_row(
                             c,
-                            {"mode": m, "status": status, "detail": detail},
+                            {"mode": m, "status": st, "detail": det},
                             self.meta,
                         )
                     )
@@ -394,8 +403,13 @@ class GroupJob:
             if self.pending:
                 tail = ""
                 try:
-                    tail = Path(self.outfile + ".log").read_text()[-400:]
-                    tail = tail.replace("\n", " | ")
+                    text = Path(self.outfile + ".log").read_text()
+                    errs = [
+                        x for x in text.splitlines() if "ERROR" in x or "Error" in x
+                    ]
+                    tail = (errs[-1] if errs else text[-400:])[:400].replace(
+                        "\n", " | "
+                    )
                 except OSError:
                     tail = "(no log)"
                 self._fail("crash", f"worker exit {rc} in phase {self.phase}: {tail}")
