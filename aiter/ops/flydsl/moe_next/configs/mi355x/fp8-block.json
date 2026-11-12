@@ -3,7 +3,7 @@
   "configs": {
     "d16": {
       "tile_m": 16,
-      "tile_n2": 64,
+      "tile_n2": 128,
       "splits": "auto"
     },
     "d32": {
@@ -77,6 +77,12 @@
       "tile_m": 128,
       "tile_n2": 128,
       "combine": "rows_f32"
+    },
+    "d16g": {
+      "tile_m": 16,
+      "tile_n2": 128,
+      "splits": "auto",
+      "stage1": "general"
     }
   },
   "default": [

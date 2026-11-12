@@ -167,7 +167,11 @@ class _Fp8BlockGfx950(MoeKernel):
                 act=_ACTS[spec.act],
             )
         else:
-            if cfg["tile_m"] == 16:
+            # The decode stage 1 wins at inter_dim <= 256 (DSV3 / Qwen3.5 M=8: 84.4 vs 93.5 us
+            # warm, 88.9 vs 113.9 cold) and loses to stage1.py at 1024-2048 (synthetic M=128
+            # 103.8 vs 85.9, GLM-5.1 M=64 344 vs 293).
+            if (cfg["tile_m"] == 16 and cfg.get("stage1") != "general"
+                    and spec.inter_dim <= 256):
                 from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage1_decode import (
                     compile_stage1,
                 )
