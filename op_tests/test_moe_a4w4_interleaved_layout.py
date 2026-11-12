@@ -145,9 +145,11 @@ _ACTS = [ActivationType.Situv2, ActivationType.Silu, ActivationType.Swiglu]
 @pytest.mark.parametrize("inter_dim", [256, 384, 512])
 @pytest.mark.parametrize("token", [16, 512])
 def test_interleaved_a4w4_is_refused(act, inter_dim, token):
-    # Swiglu at inter_dim % 256 != 0 is already refused by the CK-Tile stage-2 check.
+    # Swiglu at inter_dim % 256 != 0 is already refused by the CK-Tile stage-2 check,
+    # and Situv2 by the CK 2-stage guard once it falls through to CK.
     with pytest.raises(
-        NotImplementedError, match="a4w4.*interleaved gate/up|No safe MXFP4"
+        NotImplementedError,
+        match="a4w4.*interleaved gate/up|No safe MXFP4|Situv2 has no CK 2-stage",
     ):
         _case(act, token, 1024, inter_dim, 8, 2, True)
 
