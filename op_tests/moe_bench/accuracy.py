@@ -416,19 +416,13 @@ def combine_of_route(route):
     atomics. "bf16" reads as the output dtype (see ``out_dtype``).
     """
     route = route or {}
-    k1 = route.get("kernel1", "") or ""
     k2 = route.get("kernel2", "") or ""
     if route.get("stages") == "whole-graph":
         try:
-            from aiter.ops.flydsl.fused_moe_gfx942 import Config
-
-            cs = k1.split("__", 2)[2]
             return (
-                "bf16_rows_fp32_sum"
-                if Config.from_string(cs).use_prefill
-                else "bf16_atomic"
+                "bf16_rows_fp32_sum" if whole_graph_is_prefill(route) else "bf16_atomic"
             )
-        except Exception:  # noqa: BLE001
+        except NumericsError:
             return "n/a"
     if route.get("stages") == "1-stage":
         return "bf16_atomic (inferred)"
@@ -443,6 +437,20 @@ def combine_of_route(route):
     if route.get("backend2") in ("ck", "ck_tile", "asm"):
         return "bf16_atomic (inferred)"
     return "n/a"
+
+
+def whole_graph_is_prefill(route):
+    """Whether a ``impl__flydsl_gfx942__<config>`` route runs the prefill sub-path, read
+    from the config in its name. Raises when the name does not carry one: guessing puts
+    the path on the wrong ref_path (the dell300x bar rejected every prefill config at
+    ``ref_exact``'s 0.155 that way)."""
+    from aiter.ops.flydsl.fused_moe_gfx942 import Config
+
+    k1 = (route or {}).get("kernel1", "") or ""
+    try:
+        return bool(Config.from_string(k1.split("__", 2)[2]).use_prefill)
+    except Exception as e:
+        raise NumericsError(f"whole-graph route {k1!r} carries no config: {e}") from e
 
 
 def mx_rule_of_route(fam):
@@ -504,7 +512,15 @@ def numerics_from_route(S, route):
         return f"{qn}_{mx_rule_of_route(qn)}"
 
     if "flydsl_gfx942" in full:
-        act, inter, iq = "none", "bf16", "none"
+        # two numerics by sub-path (measured at 04df8dd46, MOEBUG-043): prefill quantizes
+        # the activations per token and re-quantizes the intermediate to fp8 per token;
+        # batch1 / decode keeps bf16 activations and has no intermediate requant
+        if whole_graph_is_prefill(route):
+            act = qn or "none"
+            iq = qn or "none"
+            inter = f"bf16_then_{iq}" if iq != "none" else "bf16"
+        else:
+            act, inter, iq = "none", "bf16", "none"
     elif one_stage and "flydsl_gfx942" not in full:
         a16 = bool(route.get("flat")) or "a16" in k1 or "xbf16" in k1
         act = "none" if a16 else q(in_kernel=True)

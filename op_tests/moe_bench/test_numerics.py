@@ -473,3 +473,61 @@ def test_in_kernel_path_must_pass_the_strict_rule_against_ref_exact():
         accuracy.rule({"per_seed": [{}], "nan_inf": 0, "sentinel_ok": True, "mean": {}})
         is None
     )
+
+
+def _whole_graph_routes():
+    pytest.importorskip("aiter.ops.flydsl.fused_moe_gfx942")
+    from aiter.ops.flydsl.fused_moe_gfx942 import Config, get_tune_space
+
+    out = {True: None, False: None}
+    for cs in get_tune_space():
+        c = Config.from_string(cs)
+        if out[bool(c.use_prefill)] is None:
+            name = f"impl__flydsl_gfx942__{cs}"
+            out[bool(c.use_prefill)] = {
+                "stages": "whole-graph",
+                "kernel1": name,
+                "full_impl": name,
+                "backend1": "flydsl-graph",
+            }
+    return out
+
+
+def test_whole_graph_numerics_follow_the_sub_path_on_minimax_m3_ptpc():
+    """MiniMax-M3 PTPC (fp8-token, per_Token, Swiglu): the prefill sub-path quantizes
+    activations per token and re-quantizes the intermediate to fp8 per token; batch1 and
+    decode keep bf16 activations and do not re-quantize (MOEBUG-043)."""
+    S = _S("per_Token", "fp8")
+    routes = _whole_graph_routes()
+    pre = accuracy.numerics_from_route(S, routes[True])
+    assert pre["act_quant"] == "per_token_fp8"
+    assert pre["inter"] == "bf16_then_per_token_fp8"
+    assert pre["inter_quant"] == "per_token_fp8"
+    assert pre["combine"] == "bf16_rows_fp32_sum"
+    dec = accuracy.numerics_from_route(S, routes[False])
+    assert dec["act_quant"] == "none"
+    assert dec["inter"] == "bf16" and dec["inter_quant"] == "none"
+    assert dec["combine"] == "bf16_atomic"
+    # both round-trip through the validator that path_ref applies
+    for n in (pre, dec):
+        accuracy.normalize_numerics(S, n, derived=True)
+    # the two score against different references: they must not share a key
+    assert accuracy.numerics_key(pre) != accuracy.numerics_key(dec)
+
+
+def test_whole_graph_without_a_config_in_its_name_is_an_error():
+    S = _S("per_Token", "fp8")
+    bad = {
+        "stages": "whole-graph",
+        "kernel1": "impl__flydsl_gfx942__nonsense",
+        "full_impl": "impl__flydsl_gfx942__nonsense",
+    }
+    with pytest.raises(accuracy.NumericsError, match="carries no config"):
+        accuracy.numerics_from_route(S, bad)
+
+
+def test_whole_graph_on_a_bf16_case_has_no_quant_in_either_sub_path():
+    S = _S("No", "bf16")
+    for route in _whole_graph_routes().values():
+        n = accuracy.numerics_from_route(S, route)
+        assert n["act_quant"] == "none" and n["inter"] == "bf16"
