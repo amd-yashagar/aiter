@@ -90,14 +90,23 @@ def compile_decode_gateup(
     swiglu_limit=None,
     CHUNK=8,
     WAVES=4,
+    GLOBAL_E=None,
+    HAS_MASK=False,
+    HAS_NLT=False,
 ):
     """N = 2 * inter_dim, K = model_dim; grid (I / 16, routes). CHUNK K steps of
-    weight loads are issued before any of them is used; WAVES waves split K."""
+    weight loads are issued before any of them is used; WAVES waves split K.
+
+    Each route's local expert id (the count of expert_mask ones below its global
+    id under EP; -1 for a -1 id, a masked expert or a token at or past
+    num_local_tokens) is written to local_ids by the first channel group, and
+    Down reads it from there."""
     assert activation in ("silu", "swiglu")
     I = N // 2
     assert I % 16 == 0
     KB = K // 16
     assert WAVES in (4, 8) and KB % (4 * WAVES) == 0
+    assert not HAS_MASK or GLOBAL_E, "EP needs the global expert count"
     assert (K // 2) % (4 * 64 * WAVES) == 0, "the x row is staged 16 bytes per lane"
     NTHR = 64 * WAVES
     STEPS = KB // (4 * WAVES)
@@ -117,6 +126,7 @@ def compile_decode_gateup(
     @fx.struct
     class SharedStorage:
         red: fx.Array[fx.Float32, 32 * WAVES, 16]
+        cnt: fx.Array[fx.Int32, WAVES, 16]
         x: fx.Array[fx.Int32, K // 2, 16]
 
     @flyc.kernel
@@ -126,6 +136,9 @@ def compile_decode_gateup(
         p_output: fx.Pointer,
         p_topk_ids: fx.Pointer,
         p_w_scale: fx.Pointer,
+        p_local_ids: fx.Pointer,
+        p_mask: fx.Pointer,
+        p_nlt: fx.Pointer,
         M: fx.Int32,
         E: fx.Int32,
     ):
@@ -133,17 +146,45 @@ def compile_decode_gateup(
         gi = gpu.block_idx.x
         r = gpu.block_idx.y
         tok = r // TOPK
-        e = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))[r]
-        if e >= 0:
-            lane = tid % 64
-            wave = tid // 64
+        lane = tid % 64
+        wave = tid // 64
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        e_g = fx.recast_iter(fx.Int32, fxh._as_ptr(p_topk_ids))[r]
+        valid = e_g >= 0
+        if const_expr(HAS_NLT):
+            valid = valid & (tok < fx.recast_iter(fx.Int32, fxh._as_ptr(p_nlt))[0])
+        e = e_g
+        if const_expr(HAS_MASK):
+            mask = fx.recast_iter(fx.Int32, fxh._as_ptr(p_mask))
+            e_c = valid.select(e_g, fx.Int32(0))
+            valid = valid & (mask[e_c] != 0)
+            below = fx.Int32(0)
+            for j in range_constexpr(-(-GLOBAL_E // NTHR)):
+                i = fx.Int32(j * NTHR) + tid
+                ic = (i < GLOBAL_E).select(i, fx.Int32(0))
+                below = below + ((i < e_c) & (mask[ic] != 0)).select(
+                    fx.Int32(1), fx.Int32(0)
+                )
+            for sh in range_constexpr(6):
+                below = below + below.shuffle_xor(fx.Int32(1 << sh), fx.Int32(64))
+            cnt = fx.make_view(lds.cnt.ptr, fx.make_layout(WAVES, 1))
+            if lane == 0:
+                cnt[wave] = below
+            gpu.barrier()
+            e = cnt[0]
+            for w in range_constexpr(1, WAVES):
+                e = e + cnt[w]
+        if (gi == 0) & (tid == 0):
+            fx.recast_iter(fx.Int32, fxh._as_ptr(p_local_ids))[r] = valid.select(
+                e, fx.Int32(-1)
+            )
+        if valid:
             c = lane % 16
             q = lane // 16
             w_rsrc = _rsrc(fxh._as_ptr(p_weight, fx.Uint8) + fx.Int64(e) * (N * K))
             x_rsrc = _rsrc(fxh._as_ptr(p_input, fx.BFloat16) + fx.Int64(tok) * K)
             g_row = gi * (16 * K) + c * 16
             u_row = (I // 16 + gi) * (16 * K) + c * 16
-            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
             x_lds = fx.make_view(lds.x.ptr, fx.make_layout(K // 2, 1))
             for i in range_constexpr(K // 2 // (4 * NTHR)):
                 xw = _load_dwords(x_rsrc, (fx.Int32(i * 4 * NTHR) + tid * 4) * 4)
@@ -206,22 +247,35 @@ def compile_decode_gateup(
         p_output: fx.Pointer,
         p_topk_ids: fx.Pointer,
         p_w_scale: fx.Pointer,
+        p_local_ids: fx.Pointer,
+        p_mask: fx.Pointer,
+        p_nlt: fx.Pointer,
         M: fx.Int32,
         E: fx.Int32,
         stream: fx.Stream,
     ):
         CompilationContext.get_current()
-        decode_gateup(p_input, p_weight, p_output, p_topk_ids, p_w_scale, M, E).launch(
-            grid=(I // 16, M * TOPK, 1), block=(NTHR, 1, 1), stream=stream
-        )
+        decode_gateup(
+            p_input,
+            p_weight,
+            p_output,
+            p_topk_ids,
+            p_w_scale,
+            p_local_ids,
+            p_mask,
+            p_nlt,
+            M,
+            E,
+        ).launch(grid=(I // 16, M * TOPK, 1), block=(NTHR, 1, 1), stream=stream)
 
     return launch
 
 
 def compile_decode_down(*, N, K, TOPK, PER_TENSOR=False, ROUTE_LOADS=24):
-    """N = model_dim, K = inter_dim; grid (N / 64, M). Up to ROUTE_LOADS loads per
-    lane (whole routes) are issued before any is used; an invalid route (-1 id) loads
-    expert 0 and adds it with factor 0."""
+    """N = model_dim, K = inter_dim; grid (N / 64, M); expert ids are Gate/Up's
+    local_ids (a -1 route adds nothing). Up to ROUTE_LOADS loads per
+    lane (whole routes) are issued before any is used; a dropped route (-1) loads
+    expert 0 and is selected away."""
     assert N % 64 == 0 and K % 64 == 0
     KB = K // 16
     STEPS = KB // 4
@@ -269,9 +323,8 @@ def compile_decode_down(*, N, K, TOPK, PER_TENSOR=False, ROUTE_LOADS=24):
                     sc = ws[e]
                 else:
                     sc = ws[e * N + n]
-                fac = (e_raw >= 0).select(rws[r] * sc, fx.Float32(0.0))
-                loaded.append((lw, la, fac))
-            for lw, la, fac in loaded:
+                loaded.append((lw, la, rws[r] * sc, e_raw >= 0))
+            for lw, la, fac, ok in loaded:
                 part = Vec.filled(16, 0.0, fx.Float32)
                 for s in range_constexpr(STEPS):
                     av = Vec.from_elements(
@@ -281,7 +334,9 @@ def compile_decode_down(*, N, K, TOPK, PER_TENSOR=False, ROUTE_LOADS=24):
                     part = fx.fma(
                         Vec.from_elements(_fp8x16_to_f32(lw[s]), fx.Float32), av, part
                     )
-                acc = acc + fac * _lane_reduce(_sum16(part))
+                # A dropped route's intermediate row is never written, so it is
+                # selected away rather than scaled by zero (it may hold NaN).
+                acc = acc + ok.select(fac * _lane_reduce(_sum16(part)), fx.Float32(0.0))
         accn = acc.shuffle_xor(fx.Int32(1), fx.Int32(64))
         pair = _f32_to_bf16(Vec.from_elements([acc, accn], fx.Float32))
         word = pair.bitcast(fx.Int32)[0]
