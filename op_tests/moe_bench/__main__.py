@@ -329,8 +329,11 @@ def main(argv=None):
         if a.mode == "prebuild" or a.prebuild_only:
             from . import prebuild
 
+            prebuild.use_tree(a.aiter)
             res = prebuild.run_prebuild(
                 _runner.select_cases(a.cases.split(","), a.filter),
+                tree=a.aiter,
+                tmpdir=a.tmpdir,
                 jobs=a.prebuild_jobs,
                 min_free_gb=a.min_free_gb,
                 cores=a.prebuild_cores,

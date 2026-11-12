@@ -148,3 +148,32 @@ def test_only_compile_failures_are_remembered_and_built_modules_are_forgotten(
     monkeypatch.setattr(prebuild.subprocess, "run", build_it)
     res = prebuild.run_prebuild([], jobs=1, log=lambda *_: None, retry_failed=True)
     assert res["built"] == [target] and prebuild.known_failed() == {}
+
+
+def test_children_need_the_chip_identity_and_the_target_tree_first(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GPU_ARCHS", "gfx950")
+    monkeypatch.setenv("CU_NUM", "256")
+    env = prebuild._child_env(8, tree="/some/aiter", shim=str(tmp_path))
+    assert env["GPU_ARCHS"] == "gfx950" and env["CU_NUM"] == "256"
+    # the --aiter tree first, then the harness shim, as the runner's workers have it
+    assert env["PYTHONPATH"].split(":")[:2] == ["/some/aiter", str(tmp_path)]
+
+
+def test_without_a_readable_chip_prebuild_asks_for_arch_and_cu_num(monkeypatch):
+    monkeypatch.delenv("GPU_ARCHS", raising=False)
+    monkeypatch.delenv("CU_NUM", raising=False)
+    import aiter.jit.utils.chip_info as chip
+
+    def boom():
+        raise RuntimeError("No gfx arch found in rocminfo output.")
+
+    monkeypatch.setattr(chip, "get_gfx", boom)
+    with pytest.raises(SystemExit, match="GPU_ARCHS.*CU_NUM"):
+        prebuild.gpu_identity()
+
+
+def test_use_tree_refuses_an_aiter_already_imported_from_elsewhere(tmp_path):
+    with pytest.raises(SystemExit, match="already imported"):
+        prebuild.use_tree(str(tmp_path))

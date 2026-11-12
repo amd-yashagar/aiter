@@ -228,10 +228,51 @@ def build_one(spec):
     return os.path.exists(module_path(md))
 
 
-def _child_env(max_jobs):
-    from aiter.jit.utils.chip_info import get_gfx
+def gpu_identity():
+    """(GPU_ARCHS, CU_NUM) of the target chip, from the environment or from the chip.
 
+    With no GPU visible aiter cannot ask the chip (rocminfo shows nothing), so a build
+    host with its GPU hidden must name both: ``GPU_ARCHS=gfx950 CU_NUM=256``.
+    """
+    arch, cu = os.environ.get("GPU_ARCHS"), os.environ.get("CU_NUM")
+    if arch and cu:
+        return arch, cu
+    try:
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+        return arch or get_gfx(), cu or str(get_cu_num())
+    except Exception as e:
+        raise SystemExit(
+            "prebuild cannot read the GPU's identity with no GPU visible: set "
+            "GPU_ARCHS (e.g. gfx950) and CU_NUM (e.g. 256 on MI355X, 304 on MI300X). "
+            f"({type(e).__name__}: {str(e)[:100]})"
+        ) from e
+
+
+def use_tree(tree):
+    """Make this process import aiter from ``tree`` (the --aiter tree), as the runner's
+    workers do: put it first on sys.path before aiter is imported."""
+    tree = os.path.abspath(tree)
+    mod = sys.modules.get("aiter")
+    if mod is not None:
+        have = os.path.realpath(os.path.dirname(os.path.dirname(mod.__file__)))
+        if have != os.path.realpath(tree):
+            raise SystemExit(
+                f"aiter was already imported from {have}, not the --aiter tree {tree}"
+            )
+        return tree
+    sys.path.insert(0, tree)
+    return tree
+
+
+def _child_env(max_jobs, tree=None, shim=None):
+    arch, cu = gpu_identity()
     env = dict(os.environ)
+    if tree:
+        paths = [tree] + ([shim] if shim else [])
+        env["PYTHONPATH"] = (
+            os.pathsep.join(paths) + os.pathsep + env.get("PYTHONPATH", "")
+        )
     # Empty values hide the GPU on every ROCm stack; "-1" aborts the runtime on TheRock
     # wheels ("Sequence '-1' not recognized"). With ROCR_VISIBLE_DEVICES empty rocminfo
     # sees no chip, so the arch is named explicitly and the child never has to look.
@@ -239,7 +280,8 @@ def _child_env(max_jobs):
         HIP_VISIBLE_DEVICES="",
         ROCR_VISIBLE_DEVICES="",
         CUDA_VISIBLE_DEVICES="",
-        GPU_ARCHS=os.environ.get("GPU_ARCHS") or get_gfx(),
+        GPU_ARCHS=arch,
+        CU_NUM=cu,
         MAX_JOBS=str(max_jobs),
     )
     env.pop(NO_BUILD_ENV, None)
@@ -254,6 +296,8 @@ def run_prebuild(
     timeout=3 * 3600,
     cores=None,
     retry_failed=False,
+    tree=None,
+    tmpdir=None,
 ):
     """Build every missing module of ``cases``, ``jobs`` at a time, GPU hidden.
 
@@ -261,6 +305,8 @@ def run_prebuild(
     ``MAX_JOBS = cores // jobs`` for its own compile parallelism. Waits
     while the disk has under ``min_free_gb`` free. Returns {"built", "present", "failed"}.
     """
+    if tree:
+        tree = use_tree(tree)
     need = plan(cases)
     bad = {} if retry_failed else known_failed()
     todo = [need[m] for m in missing(need) if m not in bad]
@@ -269,7 +315,7 @@ def run_prebuild(
             log(
                 f"prebuild: skip {m}: failed before ({bad[m][:80]!r}); --prebuild-retry"
             )
-    present = sorted(set(need) - {s["md_name"] for s in todo})
+    present = sorted(m for m in need if os.path.exists(module_path(m)))
     log(
         f"prebuild: {len(need)} modules needed, {len(present)} present, "
         f"{len(todo)} to build in {jit_dir()}"
@@ -277,6 +323,14 @@ def run_prebuild(
     cores = cores or os.cpu_count() or 8
     jobs = max(1, min(jobs or max(1, cores // 16), len(todo) or 1))
     per = max(4, cores // jobs)
+    shim = pkg = None
+    if tree:
+        from . import runner
+
+        if runner.needs_shim(tree):
+            shim = runner.make_shim(tmpdir or os.environ.get("TMPDIR") or "/tmp")
+            pkg = "moe_bench_shim"
+    pkg = pkg or "op_tests.moe_bench"
     built, failed, tails = [], [], {}
     t0 = time.time()
 
@@ -291,11 +345,11 @@ def run_prebuild(
             [
                 sys.executable,
                 "-m",
-                "op_tests.moe_bench.prebuild",
+                f"{pkg}.prebuild",
                 "--build",
                 json.dumps(spec),
             ],
-            env=_child_env(per),
+            env=_child_env(per, tree, shim),
             capture_output=True,
             text=True,
             timeout=timeout,
