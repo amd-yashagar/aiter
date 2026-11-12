@@ -104,9 +104,16 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                                    FlatmmConfig::TileParitionerGroupNum,
                                                    FlatmmConfig::TileParitionerM01>;
 
+    // MXFP4 stage 2 reduces over K = inter_dim, which is only a multiple of 128 for some models
+    // (384, 640): pad A's K up to whole K tiles so the last tile reads zeros. Weights and scales
+    // need no padding: A's zeros null the extra products and the scales are padded in memory.
+    constexpr bool kPadK_v = FlatmmConfig::kPadK ||
+                             (std::is_same_v<BDataType, ck_tile::pk_fp4_t> &&
+                              moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm2);
+
     using Traits = ck_tile::TileGemmTraits<FlatmmConfig::kPadM,
                                            FlatmmConfig::kPadN,
-                                           FlatmmConfig::kPadK,
+                                           kPadK_v,
                                            ALayout,
                                            BLayout,
                                            ELayout,
@@ -114,7 +121,7 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
 
     using CodegenGemmTraits = ck_tile::TileGemmUniversalTraits<FlatmmConfig::kPadM,
                                                                FlatmmConfig::kPadN,
-                                                               FlatmmConfig::kPadK,
+                                                               kPadK_v,
                                                                FlatmmConfig::DoubleSmemBuffer,
                                                                ALayout,
                                                                BLayout,

@@ -596,6 +596,10 @@ def moe_cktile2stages_gemm2(
     )
 
 
+@compile_ops("module_moe_cktile2stages", fc_name="cktile_moe_padded_scale_k")
+def moe_cktile2stages_padded_scale_k() -> bool: ...
+
+
 dtype2str_dict = {
     dtypes.fp16: "f16",
     dtypes.bf16: "b16",

@@ -1931,6 +1931,7 @@ def _fused_moe_impl(
         q_dtype_w == dtypes.fp4x2
         and inter_dim % 256 != 0
         and stage2_func is cktile_moe_stage2
+        and _cktile_mxfp4_stage2_unsafe(inter_dim)
     ):
         raise NotImplementedError(
             "No safe MXFP4 MoE backend for this shape and layout: CK-Tile "
@@ -4105,6 +4106,24 @@ def _a4w4_silu_asm_flat_kernel(
     return None
 
 
+@functools.lru_cache(maxsize=1)
+def _cktile_mxfp4_padded_scale_k():
+    """Whether the CK-Tile module reads MXFP4 weight scales with the padded-K layout."""
+    try:
+        return bool(aiter.moe_cktile2stages_padded_scale_k())
+    except Exception:  # noqa: BLE001  (a module built before the capability existed)
+        return False
+
+
+def _cktile_mxfp4_stage2_unsafe(inter_dim):
+    """CK-Tile MXFP4 stage 2 mis-indexes scales unless inter_dim is 256-aligned.
+
+    Builds with the padded-K scale layout also take multiples of 128."""
+    if inter_dim % 256 == 0:
+        return False
+    return not (inter_dim % 128 == 0 and _cktile_mxfp4_padded_scale_k())
+
+
 def _swiglu_limit_is_active(swiglu_limit) -> bool:
     """True only when the caller asked for a finite positive clamp bound.
 
@@ -4729,7 +4748,11 @@ def get_2stage_cfgs(
 
     if cfg is not None:
         kn2 = str(cfg.get("kernelName2", "") or "").strip()
-        if cktile_mxfp4_unsafe and _is_cktile_mxfp4_stage2_name(kn2):
+        if (
+            cktile_mxfp4_unsafe
+            and _cktile_mxfp4_stage2_unsafe(inter_dim)
+            and _is_cktile_mxfp4_stage2_name(kn2)
+        ):
             cfg = None
             logger.warning(
                 "[fused_moe] discarding unsafe CK-Tile MXFP4 stage2 config "
@@ -7051,7 +7074,7 @@ def cktile_moe_stage2(
 ):
     _, _, inter_dim = get_inter_dim(w1.shape, w2.shape)
     # Defense in depth for direct callers and tuned metadata.
-    if w2.dtype == dtypes.fp4x2 and inter_dim % 256 != 0:
+    if w2.dtype == dtypes.fp4x2 and _cktile_mxfp4_stage2_unsafe(inter_dim):
         raise NotImplementedError(
             "CK-Tile MXFP4 stage2 requires inter_dim to be a multiple of 256; "
             f"got {inter_dim}"

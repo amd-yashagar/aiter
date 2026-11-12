@@ -151,6 +151,7 @@ def test_mxfp4_takeover_requires_both_weights_shuffled():
     ["cktile_test", "swiglu_mxfp4_bf16_cktile"],
 )
 def test_unsafe_tuned_cktile_stage2_is_discarded(monkeypatch, kernel_name2):
+    monkeypatch.setattr(fused_moe_module, "_cktile_mxfp4_padded_scale_k", lambda: False)
     key = (
         fused_moe_module.get_gfx_runtime(),
         fused_moe_module.get_cu_num(),
@@ -193,6 +194,7 @@ def test_unsafe_tuned_cktile_stage2_is_discarded(monkeypatch, kernel_name2):
 
 @_SKIP
 def test_cktile_stage2_rejects_unsafe_mxfp4_shape(monkeypatch):
+    monkeypatch.setattr(fused_moe_module, "_cktile_mxfp4_padded_scale_k", lambda: False)
     monkeypatch.setattr(
         aiter,
         "moe_cktile2stages_gemm2",

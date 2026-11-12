@@ -121,3 +121,7 @@ cktile_moe_gemm2(torch::Tensor& XQ,
                  std::optional<int> block_m,
                  std::optional<int> split_k,
                  std::string kernel_name = "");
+
+// True when the CK-Tile MoE flatmm kernel reads MXFP4 weight scales with the padded-K layout
+// e8m0_shuffle writes, which makes K = inter_dim a multiple of 128 (not only 256) safe.
+__attribute__((visibility("default"))) bool cktile_moe_padded_scale_k();

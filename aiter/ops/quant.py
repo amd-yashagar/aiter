@@ -1234,11 +1234,15 @@ def fused_dynamic_mx_quant_moe_sort(
     # `N/group_size` not divisible by 8 (e.g. inter_dim=384 -> scaleN=12)
     # trigger OOB writes in the kernel that uses the padded stride.
     # Padding columns `[scaleN_valid, scaleN_pad)` are NOT written by the
-    # kernel (guarded by `scale_k < scaleN_valid`) and contain allocator
-    # garbage; production GEMM consumers don't read them so this is safe.
-    # Tests comparing byte-level equality must mask out those positions.
-    scaleN_pad = ((N + group_size - 1) // group_size + 7) // 8 * 8
-    scale = torch.empty(
+    # kernel (guarded by `scale_k < scaleN_valid`). Zero them: a GEMM whose K
+    # loop covers the padded groups (CK-Tile with padded scale K) multiplies the
+    # zero-filled A tail by these bytes, and an allocator-garbage 0xFF (e8m0 NaN)
+    # turns that into NaN. Tests comparing byte-level equality must still mask
+    # out those positions.
+    scaleN_valid = (N + group_size - 1) // group_size
+    scaleN_pad = (scaleN_valid + 7) // 8 * 8
+    scale_alloc = torch.zeros if scaleN_pad != scaleN_valid else torch.empty
+    scale = scale_alloc(
         (sorted_ids.shape[0] + 31) // 32 * 32,
         scaleN_pad,
         dtype=dtypes.fp8_e8m0,
