@@ -26,8 +26,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Float4E2M1FN, Float8E4M3FN, T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.moe_next.core.direct import group_routes, lds_words
-from aiter.ops.flydsl.kernels.moe_next.core.direct import offsets as gr_offsets
+from aiter.ops.flydsl.kernels.moe_next.core.direct import route_slot
 from aiter.ops.flydsl.kernels.moe_next.core.intermediate import scale_offset_mfma
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
     _activation_mul_batch,
@@ -80,7 +79,6 @@ def _build_stage1(
     xcd=False,
     waves=4,
     sched_pin=False,
-    core_group=False,
 ):
     K = int(model_dim)
     INTER = int(inter_dim)
@@ -141,8 +139,7 @@ def _build_stage1(
     assert not INLINE or (A_RESIDENT and BM == 16), "inline quant: BM 16, resident A"
     assert not DIRECT or BM == 16, "direct mode needs BM 16"
     assert not DIRECT or NW == 4, "direct mode runs 4 waves"
-    CORE_GROUP = DIRECT and bool(core_group)
-    GR_WORDS = -(-lds_words(experts_total) // 256) * 256 if CORE_GROUP else 1
+    GR_WORDS = BM + 16 if DIRECT else 1  # core route_slot: tile_m + 11 words
     NX = -(-INTER // BNH)
     ZCPW = -(-K // (8 * max(TOPK, 1) * NX))  # zero-fill 16 B chunks per workgroup
     G = K // 32
@@ -202,112 +199,6 @@ def _build_stage1(
 
     def _direct_prologue(
         lds_base,
-        tid,
-        nblk,
-        mblk,
-        tokens,
-        arg_tids,
-        arg_tw,
-        arg_zero,
-        arg_sid_out,
-        arg_eid_out,
-        arg_sw_out,
-    ):
-        """Zero this workgroup's slice of the output, then find whether route slot
-        r = mblk leads a tile of its expert (its rank among that expert's routes is
-        a multiple of BM) and list the tile's routes in LDS. Repeated experts in one
-        token keep the last slot, as aiter's sort does. Stores that only some lanes
-        make go to a dump word, so no lane-dependent branch is needed."""
-        c0 = fx.Int32(0)
-        routes = tokens * fx.Int32(TOPK)
-        zc = (mblk * fx.Int32(NX) + nblk) * fx.Int32(ZCPW) + tid
-        zlive = (tid < fx.Int32(ZCPW)) & (zc < tokens * fx.Int32(K // 8))
-        _zero16_if(zlive, arg_zero, fx.Int64(zc) * fx.Int64(16))
-        tids = cm.global_ptr(arg_tids, T.i32)
-        u = tid
-        inb = u < routes
-        uc = inb.select(u, c0)
-        id_u = inb.select(tids[uc], fx.Int32(-1))
-        t_u = uc // fx.Int32(TOPK)
-        s_u = uc - t_u * fx.Int32(TOPK)
-        dup = u < c0
-        for k in range_constexpr(1, TOPK):
-            sk = s_u + fx.Int32(k)
-            ok = inb & (sk < fx.Int32(TOPK))
-            idk = tids[t_u * fx.Int32(TOPK) + ok.select(sk, s_u)]
-            dup = dup | (ok & (idk == id_u))
-        valid_u = inb & (id_u >= c0) & (id_u < fx.Int32(experts_total)) & ~dup
-        e_r = fx.Int32(rocdl.readfirstlane(T.i32, cm._raw(tids[mblk])))
-        match = valid_u & (id_u == e_r)
-        peers = fx.Uint64(rocdl.ballot(T.i64, cm._raw(match)))
-        lo = fx.Uint32(peers)
-        hi = fx.Uint32(peers >> fx.Uint64(32))
-        below = fx.Int32(
-            rocdl.mbcnt_hi(
-                T.i32,
-                cm._raw(hi),
-                cm._raw(rocdl.mbcnt_lo(T.i32, cm._raw(lo), cm._raw(c0))),
-            )
-        )
-        cnt = fx.Int32(fx.math.ctpop(lo)) + fx.Int32(fx.math.ctpop(hi))
-        w = tid // fx.Int32(64)
-        lane = tid % fx.Int32(64)
-        cnt_off = fx.Int32(rl_off + BM * 4)
-        dump = cnt_off + fx.Int32(24)
-        rl = fx.Int32(rl_off)
-        fx.ptr_store(
-            cnt,
-            _lds_i32(lds_base, (lane == c0).select(cnt_off + w * fx.Int32(4), dump)),
-        )
-        fx.ptr_store(
-            fx.Int32(-1),
-            _lds_i32(
-                lds_base, (tid < fx.Int32(BM)).select(rl + tid * fx.Int32(4), dump)
-            ),
-        )
-        fx.ptr_store(
-            valid_u.select(fx.Int32(1), c0),
-            _lds_i32(lds_base, (tid == mblk).select(cnt_off + fx.Int32(16), dump)),
-        )
-        gpu.barrier()
-        off = c0
-        for i in range_constexpr(4):
-            ci = _lds_ld(lds_base, cnt_off + fx.Int32(4 * i))
-            off = off + (w > fx.Int32(i)).select(ci, c0)
-        rank_u = off + below
-        fx.ptr_store(
-            rank_u,
-            _lds_i32(lds_base, (tid == mblk).select(cnt_off + fx.Int32(20), dump)),
-        )
-        gpu.barrier()
-        r_valid = _lds_ld(lds_base, cnt_off + fx.Int32(16))
-        my_rank = _lds_ld(lds_base, cnt_off + fx.Int32(20))
-        leader = (r_valid != c0) & ((my_rank & fx.Int32(BM - 1)) == c0)
-        slot_i = rank_u - my_rank
-        put = match & (slot_i >= c0) & (slot_i < fx.Int32(BM))
-        fx.ptr_store(u, _lds_i32(lds_base, put.select(rl + slot_i * fx.Int32(4), dump)))
-        gpu.barrier()
-        # Route rows for stage 2, written once, by the first channel block.
-        ur = _lds_ld(lds_base, rl + (tid & fx.Int32(BM - 1)) * fx.Int32(4))
-        _rowmap_if(
-            (nblk == c0) & (tid < fx.Int32(BM)),
-            ur,
-            mblk * fx.Int32(BM) + tid,
-            tokens,
-            arg_tw,
-            arg_sid_out,
-            arg_sw_out,
-        )
-        _eid_if(
-            (nblk == c0) & (tid == c0),
-            mblk,
-            leader.select(e_r, fx.Int32(-1)),
-            arg_eid_out,
-        )
-        return e_r, leader
-
-    def _core_group_prologue(
-        lds_base,
         gr,
         tid,
         nblk,
@@ -320,71 +211,29 @@ def _build_stage1(
         arg_eid_out,
         arg_sw_out,
     ):
-        """_direct_prologue on core's group_routes: route slot r = mblk is a
-        position in aiter's sort order, and leads a tile when its rank in its
-        expert's group is a multiple of BM."""
+        """Zero this workgroup's slice of the output, then core's route_slot: does
+        route slot r = mblk lead a tile of its expert (rank a multiple of BM), and
+        the tile's routes (sort order, -1 padded), copied to the route list."""
         c0 = fx.Int32(0)
         zc = (mblk * fx.Int32(NX) + nblk) * fx.Int32(ZCPW) + tid
         zlive = (tid < fx.Int32(ZCPW)) & (zc < tokens * fx.Int32(K // 8))
         _zero16_if(zlive, arg_zero, fx.Int64(zc) * fx.Int64(16))
-
-        def view(arg, ty):
-            return fx.Tensor(
-                fx.make_view(cm.global_ptr(arg, ty, 4), fx.make_layout((1, 1), (1, 1)))
+        ids = fx.Tensor(
+            fx.make_view(
+                cm.global_ptr(arg_tids, T.i32, 4), fx.make_layout((1, 1), (1, 1))
             )
-
-        ids_t = view(arg_tids, T.i32)
-        group_routes(
-            gr,
-            ids_t,
-            view(arg_tw, T.f32),
-            ids_t,
-            ids_t,
-            tokens,
-            experts_total,
-            TOPK,
-            False,
-            False,
         )
-        o_order, _, o_ge, o_gs, o_meta = gr_offsets(experts_total)[:5]
-
-        def grd(i):
-            return fx.ptr_load(gr + fx.Int64(i))
-
-        n_valid = grd(fx.Int32(o_meta))
-        n_groups = grd(fx.Int32(o_meta + 1))
-        cnt_off = fx.Int32(rl_off + BM * 4)
-        dump = cnt_off + fx.Int32(24)
-        rl = fx.Int32(rl_off)
-        # group of position mblk: thread k tests group k
-        k = tid
-        gs_k = grd(fx.Int32(o_gs) + (k < n_groups).select(k, c0))
-        gs_k1 = grd(fx.Int32(o_gs + 1) + (k < n_groups).select(k, c0))
-        own = (k < n_groups) & (gs_k <= mblk) & (mblk < gs_k1)
-        fx.ptr_store(k, _lds_i32(lds_base, own.select(cnt_off, dump)))
-        gpu.barrier()
-        g = _lds_ld(lds_base, cnt_off)
-        inb = mblk < n_valid
-        gc = inb.select(g, c0)
-        start = grd(fx.Int32(o_gs) + gc)
-        end = grd(fx.Int32(o_gs + 1) + gc)
-        e_r = grd(fx.Int32(o_ge) + gc)
-        leader = inb & (((mblk - start) & fx.Int32(BM - 1)) == c0)
-        pos = mblk + (tid & fx.Int32(BM - 1))
-        packed = grd(fx.Int32(o_order) + (pos < end).select(pos, c0))
-        tok = packed & fx.Int32(0xFFFFFF)
-        slot = packed.shrui(fx.Int32(24))
-        u = (pos < end).select(tok * fx.Int32(TOPK) + slot, fx.Int32(-1))
-        fx.ptr_store(
-            u,
-            _lds_i32(
-                lds_base, (tid < fx.Int32(BM)).select(rl + tid * fx.Int32(4), dump)
-            ),
+        e_r, _, leader = route_slot(
+            gr, ids, ids, ids, tokens, mblk, experts_total, TOPK, BM, False, False
         )
+        r_own = tid & fx.Int32(BM - 1)
+        ur = fx.ptr_load(gr + fx.Int64(r_own))
+        fx.ptr_store(ur, _lds_i32(lds_base, fx.Int32(rl_off) + r_own * fx.Int32(4)))
         gpu.barrier()
+        # Route rows for stage 2, written once, by the first channel block.
         _rowmap_if(
             (nblk == c0) & (tid < fx.Int32(BM)),
-            u,
+            ur,
             mblk * fx.Int32(BM) + tid,
             tokens,
             arg_tw,
@@ -492,35 +341,20 @@ def _build_stage1(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base = fx.Int32(fx.ptrtoint(lds.buf.ptr))
         if const_expr(DIRECT):
-            if const_expr(CORE_GROUP):
-                e, cond = _core_group_prologue(
-                    lds_base,
-                    lds.gr.ptr,
-                    tid,
-                    nblk,
-                    mblk,
-                    i32_tokens,
-                    arg_tids,
-                    arg_tw,
-                    arg_zero,
-                    arg_stids,
-                    arg_eids,
-                    arg_nvalid,
-                )
-            else:
-                e, cond = _direct_prologue(
-                    lds_base,
-                    tid,
-                    nblk,
-                    mblk,
-                    i32_tokens,
-                    arg_tids,
-                    arg_tw,
-                    arg_zero,
-                    arg_stids,
-                    arg_eids,
-                    arg_nvalid,
-                )
+            e, cond = _direct_prologue(
+                lds_base,
+                lds.gr.ptr,
+                tid,
+                nblk,
+                mblk,
+                i32_tokens,
+                arg_tids,
+                arg_tw,
+                arg_zero,
+                arg_stids,
+                arg_eids,
+                arg_nvalid,
+            )
         else:
             nvalid = cm.global_ptr(arg_nvalid, T.i32)[0]
             cond = m_row < nvalid
@@ -586,22 +420,16 @@ def _build_stage1(
             ]
             stage_tok = [] if INLINE else [row_token(r) for r in stage_rows]
 
-            # Buffer loads: the K tile offset rides in the descriptor, so the lane
-            # offsets (32-bit) are the only per-tile state kept across the
-            # unrolled loop.
-            a_lane_dw = (
-                []
-                if INLINE
-                else [
-                    t * fx.Int32(A_ROW // 4) + a_chunk * fx.Int32(4) for t in stage_tok
-                ]
-            )
-
             def load_a_tile(kt):
-                return [
-                    cm.buffer_load16(arg_aq, fx.Int32(kt * TILE_RB // 4), a_lane_dw[p])
-                    for p in range_constexpr(a_passes)
-                ]
+                regs = []
+                for p in range_constexpr(a_passes):
+                    off = (
+                        fx.Int64(stage_tok[p]) * fx.Int64(A_ROW)
+                        + fx.Int64(kt * TILE_RB)
+                        + fx.Int64(a_chunk * fx.Int32(16))
+                    )
+                    regs.append(cm.global_vec_load(arg_aq, off, 4))
+                return regs
 
             def store_a_tile(regs, slot):
                 for p in range_constexpr(a_passes):
@@ -684,20 +512,19 @@ def _build_stage1(
                 sc_row = [(e_tile0 + t) // fx.Int32(2) for t in tiles]
                 sc_shift = [(t & fx.Int32(1)) * fx.Int32(8) for t in tiles]
 
-            w_lane_dw = lane * fx.Int32(4)
-            w_lane_hi = w_lane_dw + fx.Int32(256)
-
             def load_w(kt):
-                # Every K offset is wave-uniform and rides in the descriptor; the
-                # lane offsets are the same two registers for all K tiles.
                 frags = []
                 for t in range_constexpr(NT):
                     per_ks = []
                     for ks in range_constexpr(2):
-                        base = w_base_dw[t] + fx.Int32((2 * kt + ks) * W_KSTEP // 4)
-                        v = cm.buffer_load16(arg_w, base, w_lane_dw, nt)
+                        ldw = lane * fx.Int32(4) + fx.Int32(
+                            (2 * kt + ks) * W_KSTEP // 4
+                        )
+                        v = cm.buffer_load16(arg_w, w_base_dw[t], ldw, nt)
                         if const_expr(w_f8):
-                            hi = cm.buffer_load16(arg_w, base, w_lane_hi, nt)
+                            hi = cm.buffer_load16(
+                                arg_w, w_base_dw[t], ldw + fx.Int32(256), nt
+                            )
                             v = v.shuffle(hi, list(range(8)))
                         f = fx.make_rmem_tensor(W_NDW, fx.Int32)
                         f.store(v)
@@ -705,26 +532,16 @@ def _build_stage1(
                     frags.append(per_ks)
                 scales = []
                 for q in range_constexpr(len(sc_row)):
-                    v = cm.buffer_load4(
-                        arg_ws,
+                    off = fx.Int64(
                         scale_offset_mfma(
                             sc_row[q] * fx.Int32(32), fx.Int32(kt * 8), GP8
                         )
-                        // fx.Int32(4),
-                        lane,
-                    )
+                    ) + fx.Int64(lane * fx.Int32(4))
+                    v = cm.global_vec_load(arg_ws, off, 1)
                     if const_expr(sc_shift[q] is not None):
                         v = v.shrui(sc_shift[q])
                     scales.append(v)
                 return frags, scales
-
-            as_lane_dw = (
-                []
-                if INLINE
-                else [
-                    t * fx.Int32(GP // 4) + lgrp * fx.Int32(GQ // 4) for t in mfma_tok
-                ]
-            )
 
             def load_a_scales(kt):
                 if const_expr(INLINE):
@@ -744,7 +561,13 @@ def _build_stage1(
                         for j in range_constexpr(MT)
                     ]
                 return [
-                    cm.buffer_load4(arg_as, fx.Int32(kt // 2), as_lane_dw[j])
+                    cm.global_vec_load(
+                        arg_as,
+                        fx.Int64(mfma_tok[j]) * fx.Int64(GP)
+                        + fx.Int64(lgrp * fx.Int32(GQ))
+                        + fx.Int64(4 * (kt // 2)),
+                        1,
+                    )
                     for j in range_constexpr(MT)
                 ]
 

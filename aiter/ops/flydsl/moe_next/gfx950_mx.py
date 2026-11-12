@@ -70,7 +70,6 @@ def parse_config(config):
             "xc",
             "nw",
             "sp",
-            "cg",
         )
         if key in keys and tok[len(key) :]:
             out[key] = int(tok[len(key) :])
@@ -178,8 +177,11 @@ class _MxGfx950(MoeKernel):
         tn = cfg.get("tn") or (
             128 if spec.inter_dim % 128 == 0 or spec.inter_dim % 64 else 64
         )
+        # fp8 weights in prefill: two tiles ahead no longer fit 512 VGPRs (spills).
         la = cfg.get("la") or (
-            (3 if self.prefill else 4) if spec.w_dtype != dtypes.fp8 else 2
+            (3 if self.prefill else 4)
+            if spec.w_dtype != dtypes.fp8
+            else (1 if self.prefill else 2)
         )
         routes = m * topk
         per_expert = -(-routes // spec.experts)
@@ -227,7 +229,6 @@ class _MxGfx950(MoeKernel):
             xcd=xcd,
             waves=4 if direct else cfg.get("nw", 4),
             sched_pin=bool(cfg.get("sp", 0)),
-            core_group=bool(cfg.get("cg", 0)),
         )
         s2 = compile_stage2(
             model_dim=spec.model_dim,

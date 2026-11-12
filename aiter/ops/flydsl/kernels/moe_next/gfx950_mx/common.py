@@ -158,19 +158,6 @@ def buffer_load16(addr_i64, base_dw, lane_dw, nt=False):
     return fx.Vector(frag.load())
 
 
-def buffer_load4(addr_i64, base_dw, lane_dw):
-    """One dword per lane by buffer load (wave-uniform dword base in the descriptor)."""
-    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import flat_buffer_view
-
-    view = flat_buffer_view(
-        addr_i64, _raw(base_dw), T.i32, align=4, elem_bytes=4, fold=True
-    )
-    atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 32)
-    frag = fx.make_rmem_tensor(1, fx.Int32)
-    fx.copy(atom, view[lane_dw, None], frag)
-    return fx.Vector(frag.load())[0]
-
-
 def xcd_tile(bx, by, nx):
     """(column block, tile) for a grid of nx column blocks by a multiple of 8 tiles,
     so every column block of tile m runs on XCD m % 8 (workgroup id w is dispatched
