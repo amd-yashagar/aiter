@@ -1943,10 +1943,7 @@ def _fused_moe_impl(
         quant_type == QuantType.per_1x32
         and q_dtype_a == dtypes.fp4x2
         and q_dtype_w == dtypes.fp4x2
-        and (
-            gate_mode == GateMode.INTERLEAVE
-            or getattr(w1, "gate_up_interleave", None) is True
-        )
+        and getattr(w1, "gate_up_interleave", None) is True
         and (
             metadata.run_1stage
             or stage1_func in (ck_moe_stage1, cktile_moe_stage1, asm_stage1)
@@ -4507,9 +4504,10 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding FlyDSL tuned config for unsupported "
                 f"activation {activation}; using default heuristics"
             )
-        elif kn1.startswith(("flydsl_moe1_abf16_wfp4", "flydsl_moe1_afp4_wfp4")) and (
-            gate_mode == GateMode.INTERLEAVE or gate_up_interleave is True
-        ):
+        elif (
+            kn1.startswith("flydsl_moe1_abf16_wfp4")
+            and (gate_mode == GateMode.INTERLEAVE or gate_up_interleave is True)
+        ) or (kn1.startswith("flydsl_moe1_afp4_wfp4") and gate_up_interleave is True):
             cfg = None
             logger.warning(
                 f"[fused_moe] discarding FlyDSL tuned config for {keys}: its "

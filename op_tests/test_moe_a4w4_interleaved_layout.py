@@ -77,7 +77,9 @@ def test_tuned_mixed_rows_are_skipped_for_interleaved_weights(token):
     assert not _kernel(meta.stage1).startswith("flydsl_moe1_afp4_wfp4")
 
 
-def _case(act, token, model_dim, inter_dim, experts, topk, interleave, seed=0):
+def _case(
+    act, token, model_dim, inter_dim, experts, topk, interleave, seed=0, gate_mode=None
+):
     torch.manual_seed(seed)
     dev, dtype = "cuda", dtypes.bf16
     x = torch.randn(token, model_dim, dtype=dtype, device=dev)
@@ -128,7 +130,9 @@ def _case(act, token, model_dim, inter_dim, experts, topk, interleave, seed=0):
         quant_type=QuantType.per_1x32,
         activation=act,
         quant_dtype_a=dtypes.fp4x2,
-        gate_mode=(GateMode.INTERLEAVE if interleave else GateMode.SEPARATED).value,
+        gate_mode=(
+            gate_mode or (GateMode.INTERLEAVE if interleave else GateMode.SEPARATED)
+        ).value,
     )
     return ref.double(), out.double()
 
@@ -166,6 +170,25 @@ def test_separated_a4w4_still_matches_the_reference(act, inter_dim):
     ref, out = _case(act, 16, 1024, inter_dim, 8, 2, False)
     assert torch.isfinite(out).all()
     # fp4 activation and intermediate quantization put the reference at 0.04 to 0.11
+    assert _logits_diff(ref, out) < 0.2
+
+
+@_GPU
+@pytest.mark.parametrize("inter_dim", [256, 512])
+def test_separated_weights_with_interleave_gate_mode_still_run_on_ck(inter_dim):
+    # gate_mode=INTERLEAVE with untagged separated weights (the SGLang DSv4 FP4
+    # catalogue rows, tier1-00508 and -00514) runs on CK, which ignores gate_mode.
+    ref, out = _case(
+        ActivationType.Silu,
+        16,
+        1024,
+        inter_dim,
+        8,
+        2,
+        False,
+        gate_mode=GateMode.INTERLEAVE,
+    )
+    assert torch.isfinite(out).all()
     assert _logits_diff(ref, out) < 0.2
 
 
