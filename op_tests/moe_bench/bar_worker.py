@@ -97,6 +97,15 @@ def assert_no_route():
             f"aiter.moe served an aiter-side measurement with {kid!r} ({reason}); "
             "routes are not disabled (AITER_MOE_DISABLE)"
         )
+    # a core that records every call while routing is off (router._INACTIVE) must say so;
+    # an older one keeps the previous call's record, so only the kernel id can be judged
+    if hasattr(getattr(moe, "router", None), "_INACTIVE") and not reason.startswith(
+        "routing inactive"
+    ):
+        raise RuntimeError(
+            f"aiter.moe last_route() says {reason!r}, not 'routing inactive': the hook "
+            "looked at this call (AITER_MOE_DISABLE not in effect)"
+        )
 
 
 def not_prebuilt_row(md_name):

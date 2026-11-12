@@ -46,6 +46,20 @@ def test_assert_no_route_raises_when_a_kernel_served_the_call(monkeypatch):
         bar_worker.assert_no_route()
 
 
+def test_a_core_that_records_inactive_routing_must_say_so(monkeypatch):
+    inactive = ("aiter", "", "", "routing inactive (AITER_MOE_DISABLE=1, ...)", None)
+    moe = _fake_moe(monkeypatch, inactive)
+    moe.router = types.SimpleNamespace(_INACTIVE=inactive)
+    bar_worker.assert_no_route()
+    # the hook looked at the call and declined: routing was not off
+    moe.last_route = lambda: ("aiter", "fp8-block", "gfx942", "declined: x", None)
+    with pytest.raises(RuntimeError, match="routing inactive"):
+        bar_worker.assert_no_route()
+    # an older core has no _INACTIVE: only the kernel id is judged
+    moe.router = types.SimpleNamespace()
+    bar_worker.assert_no_route()
+
+
 def test_enumerate_names_a_routed_dispatch_instead_of_a_typeerror():
     from op_tests.moe_bench.candidates.fused_cfg import FusedCfgSource
 
@@ -95,6 +109,12 @@ class _Finder:
 
 sys.meta_path.insert(0, _Finder())
 """
+
+
+def core_records_inactive_routing():
+    """Core f197997b3 on: last_route() records every call while routing is off."""
+    src = os.path.join(ROUTED_TREE, "aiter", "moe", "router.py")
+    return os.path.isfile(src) and "_INACTIVE = " in open(src).read()
 
 
 def _dummy_route_dir(tmp_path):
@@ -191,7 +211,7 @@ def call():
     with routes.RouteRecorder() as rec:
         fm.fused_moe(hs.clone(), aw["w1"], aw["w2"], tw, ti, **kw)
     torch.cuda.synchronize()
-    return moe.last_route()[0], bool(rec.records)
+    return moe.last_route()[0], bool(rec.records), moe.last_route()[3]
 moe.refresh()
 before = call()
 bar_worker.disable_routes()
@@ -218,3 +238,5 @@ print("RESULT " + json.dumps({"before": before, "after": after}))
     # aiter's own path ran (the recorder saw get_2stage_cfgs). last_route() is not checked:
     # an inactive hook leaves the previous call's record in place.
     assert res["after"][1] is True
+    if core_records_inactive_routing():
+        assert res["after"][0] == "aiter" and "routing inactive" in res["after"][2]
