@@ -357,6 +357,142 @@ class Gfx942Fp8TokenPrefill(MoeKernel):
         return out
 
 
+@functools.cache
+def _decode_gateup(N, K, topk, per_tensor, act, swiglu_limit, waves=4):
+    from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token.decode import (
+        compile_decode_gateup,
+    )
+
+    return compile_decode_gateup(
+        N=N,
+        K=K,
+        TOPK=topk,
+        activation=act,
+        PER_TENSOR=per_tensor,
+        swiglu_limit=swiglu_limit,
+        WAVES=waves,
+    )
+
+
+@functools.cache
+def _decode_down(N, K, topk, per_tensor):
+    from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token.decode import (
+        compile_decode_down,
+    )
+
+    return compile_decode_down(N=N, K=K, TOPK=topk, PER_TENSOR=per_tensor)
+
+
+@register_kernel
+class Gfx942Fp8TokenDecode(Gfx942Fp8TokenPrefill):
+    """Sortless decode with aiter's whole-graph decode rounding points: bf16
+    activations against fp8 weights, bf16 intermediate, FP32 per-token sum."""
+
+    id = "gfx942_fp8_token.decode"
+    routing = "direct"
+    epilogue = "reduce"
+    numerics: ClassVar[dict] = {
+        "act_quant": "none",
+        "inter": "bf16",
+        "combine": "fp32_reduce",
+    }
+    combine: ClassVar[str | None] = None
+    MAX_ROUTES = 1024
+
+    def supports(self, spec, m, topk, call=None):
+        reason = super().supports(spec, m, topk, None)
+        if reason:
+            return reason
+        if spec.inter_dim % 16 or spec.model_dim % 256:
+            return "inter_dim % 16 and model_dim % 256"
+        if m * topk > self.MAX_ROUTES:
+            return "too many routes for direct decode"
+        if call is not None:
+            if call.hidden_states.dtype != torch.bfloat16:
+                return "bf16 hidden_states only"
+            if call.out_dtype != torch.bfloat16:
+                return "bf16 output only"
+            if call.w1_scale is None or call.w2_scale is None:
+                return "needs weight scales"
+            if not (call.w1_scale.is_contiguous() and call.w2_scale.is_contiguous()):
+                return "contiguous fp32 weight scales only"
+            if call.w1_scale.dtype != torch.float32:
+                return "fp32 weight scales only"
+            if call.expert_mask is not None or call.num_local_tokens is not None:
+                return "EP and num_local_tokens not implemented in decode yet"
+            if call.a1_scale is not None or call.a2_scale is not None:
+                return "prequantized activations"
+            if call.output is not None and not call.output.is_contiguous():
+                return "contiguous output only"
+            if call.extra:
+                return f"unsupported {sorted(call.extra)}"
+            if not call.hidden_states.is_contiguous():
+                return "contiguous hidden_states only"
+        return None
+
+    def warmup(self, weights, m, topk, config):
+        import flydsl.compiler as flyc
+        import flydsl.expr as fx
+
+        spec = weights.spec
+        D, I = spec.model_dim, spec.inter_dim
+        per_tensor = spec.quant == QuantType.per_Tensor
+        act, limit = _ACTS[spec.act], _swiglu_limit(spec)
+        with compile_only():
+            gu = _decode_gateup(
+                2 * I, D, topk, per_tensor, act, limit, self._waves_cfg(weights, config)
+            )
+            types = (fx.BFloat16, fx.Uint8, fx.BFloat16, fx.Int32, fx.Float32)
+            gu(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
+            dn = _decode_down(D, I, topk, per_tensor)
+            types = (fx.BFloat16, fx.Uint8, fx.BFloat16, fx.Int32, fx.Float32)
+            types += (fx.Float32,)
+            dn(*[flyc.from_c_void_p(t, 0) for t in types], m, fx.Stream(None))
+
+    def _waves_cfg(self, weights, config):
+        gpu = self._gpu(weights)
+        cfg = dict(_configs(gpu).get("default", {}))
+        cfg.update(_configs(gpu).get(config or "default", {}))
+        return int(cfg.get("decode_waves", 4))
+
+    def _waves(self, call):
+        return self._waves_cfg(call.weights, call.config)
+
+    def __call__(self, call):
+        spec = call.spec
+        x = call.hidden_states
+        M, D, I, topk = call.m, spec.model_dim, spec.inter_dim, call.topk
+        per_tensor = spec.quant == QuantType.per_Tensor
+        act, limit = _ACTS[spec.act], _swiglu_limit(spec)
+        ids = call.topk_ids.to(torch.int32).contiguous()
+        tw = call.topk_weight.to(torch.float32).contiguous()
+        inter = torch.empty((M * topk, I), dtype=torch.bfloat16, device=x.device)
+        out = call.output
+        if out is None:
+            out = torch.empty((M, D), dtype=torch.bfloat16, device=x.device)
+        _launch(
+            _decode_gateup(2 * I, D, topk, per_tensor, act, limit, self._waves(call)),
+            x,
+            call.w1,
+            inter,
+            ids,
+            call.w1_scale,
+            M,
+            spec.experts,
+        )
+        _launch(
+            _decode_down(D, I, topk, per_tensor),
+            inter,
+            call.w2,
+            out,
+            ids,
+            tw,
+            call.w2_scale,
+            M,
+        )
+        return out
+
+
 @register_kernel
 class Gfx942Fp8TokenPrefillRows(Gfx942Fp8TokenPrefill):
     """Deterministic variant: one bf16 row per route, summed per token in fp32."""
