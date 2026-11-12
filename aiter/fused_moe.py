@@ -1939,6 +1939,27 @@ def _fused_moe_impl(
             "FlyDSL fallback cannot accept this invocation."
         )
 
+    stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+    if (
+        quant_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and (
+            gate_mode == GateMode.INTERLEAVE
+            or getattr(w1, "gate_up_interleave", None) is True
+        )
+        and (
+            metadata.run_1stage
+            or stage1_func in (ck_moe_stage1, cktile_moe_stage1, asm_stage1)
+        )
+    ):
+        raise NotImplementedError(
+            "a4w4 (fp4 A x MXFP4 W) with interleaved gate/up weights has no CK, "
+            "CK-Tile or ASM kernel, and the FlyDSL stage-1 kernels for it read "
+            "separated rows. Use separated gate/up weights, or fp8 activations "
+            "(a8w4) with this layout."
+        )
+
     if (
         _enforce_metadata_block_size
         and block_size_M is not None
@@ -3977,12 +3998,13 @@ def _make_mxfp4_metadata(
 
 def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave=None):
     if gate_up_interleave is not None:
-        # The bf16-activation (a16w4) kernels read separated gate/up rows only;
-        # tagged interleaved weights would be computed as garbage.
+        # Only the fp8-activation kernels read interleaved gate/up rows; the
+        # bf16 and fp4 activation kernels read separated rows, so tagged
+        # interleaved weights would be computed as garbage.
         return (gate_up_interleave is False and gate_mode == GateMode.SEPARATED) or (
             gate_up_interleave is True
             and gate_mode == GateMode.INTERLEAVE
-            and q_dtype_a != dtypes.bf16
+            and q_dtype_a == dtypes.fp8
         )
     return (
         q_dtype_a in (dtypes.bf16, dtypes.fp4x2) and gate_mode == GateMode.SEPARATED
@@ -4577,14 +4599,14 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding FlyDSL tuned config for unsupported "
                 f"activation {activation}; using default heuristics"
             )
-        elif kn1.startswith("flydsl_moe1_abf16_wfp4") and (
+        elif kn1.startswith(("flydsl_moe1_abf16_wfp4", "flydsl_moe1_afp4_wfp4")) and (
             gate_mode == GateMode.INTERLEAVE or gate_up_interleave is True
         ):
             cfg = None
             logger.warning(
-                f"[fused_moe] discarding a16w4 FlyDSL tuned config for {keys}: "
-                "its stage 1 reads separated gate/up weights, not the "
-                "interleaved layout; using default heuristics"
+                f"[fused_moe] discarding FlyDSL tuned config for {keys}: its "
+                "stage 1 reads separated gate/up weights, not the interleaved "
+                "layout; using default heuristics"
             )
         elif _disable_inline_sort and _is_inline_sort_cfg(kn1, kn2):
             cfg = None
