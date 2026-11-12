@@ -3969,8 +3969,12 @@ def _make_mxfp4_metadata(
 
 def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave=None):
     if gate_up_interleave is not None:
+        # The bf16-activation (a16w4) kernels read separated gate/up rows only;
+        # tagged interleaved weights would be computed as garbage.
         return (gate_up_interleave is False and gate_mode == GateMode.SEPARATED) or (
-            gate_up_interleave is True and gate_mode == GateMode.INTERLEAVE
+            gate_up_interleave is True
+            and gate_mode == GateMode.INTERLEAVE
+            and q_dtype_a != dtypes.bf16
         )
     return (
         q_dtype_a in (dtypes.bf16, dtypes.fp4x2) and gate_mode == GateMode.SEPARATED
@@ -4480,6 +4484,15 @@ def get_2stage_cfgs(
             logger.warning(
                 f"[fused_moe] discarding FlyDSL tuned config for unsupported "
                 f"activation {activation}; using default heuristics"
+            )
+        elif kn1.startswith("flydsl_moe1_abf16_wfp4") and (
+            gate_mode == GateMode.INTERLEAVE or gate_up_interleave is True
+        ):
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding a16w4 FlyDSL tuned config for {keys}: "
+                "its stage 1 reads separated gate/up weights, not the "
+                "interleaved layout; using default heuristics"
             )
         elif _disable_inline_sort and _is_inline_sort_cfg(kn1, kn2):
             cfg = None
