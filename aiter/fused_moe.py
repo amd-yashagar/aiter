@@ -2570,23 +2570,12 @@ def fused_moe_1stage(
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
         else:
-            aiter.fmoe_int8_g1u0(
-                moe_buf,
-                a1,
-                w1,
-                w2,
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                topk,
-                a1_scale,
-                w1_scale,
-                w2_scale,
-                fc2_smooth_scale=None,
-                activation=activation,
+            # fmoe_int8_g1u0 needs a fc2 smooth-quant scale tensor and fused_moe has no
+            # argument to carry one (it used to fail on the None); aiter.asm_moe does.
+            raise NotImplementedError(
+                "int8 per-token g1u0 (non-gated) MoE needs fc2 smooth-quant scales, "
+                "which fused_moe cannot pass; use aiter.asm_moe or g1u1 weights."
             )
-            return moe_buf
 
         fmoe_func(
             moe_buf,
