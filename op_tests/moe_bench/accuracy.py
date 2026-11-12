@@ -454,29 +454,34 @@ def whole_graph_is_prefill(route):
 
 
 def in_kernel_variants(S, n):
-    """The numerics to try for a path that quantizes MX in-kernel: {rule: numerics}.
+    """The numerics to try for a path that quantizes MX in-kernel: {name: numerics}.
 
-    The scale rule of a 1-stage ASM kernel, or of the MXMOE g1 epilogue's intermediate,
-    is not named by the route, so ref_path is built under each rule (both quantizations
-    for a path that quantizes its activations in-kernel, the intermediate alone where the
-    activations go through the quant call) and the kernel is scored against the one it
-    matches. Neither matching means its rule is a third one: reported, not guessed.
+    Neither the scale rule nor the rounding before the quant of a 1-stage ASM kernel, or of
+    the MXMOE g1 epilogue's intermediate, is named by the route, so ref_path is built under
+    each combination (both quantizations for a path that quantizes its activations
+    in-kernel, the intermediate alone where the activations go through the quant call)
+    and the kernel is scored against the one it matches: ``round_up`` / ``even`` with the
+    activation output quantized from fp32 (``fp32_direct``), and ``<rule>+bf16`` with it
+    rounded to bf16 first (``bf16_then``). aiter's FlyDSL g1 epilogue is the latter: it
+    reads 0.023 (logits_diff) from the fp32_direct reference on a4w4 SwiGLU and 6e-6 from
+    the bf16_then one. Neither matching means another rule: reported, not guessed.
     """
     fam = quant_name(S)
     out = {}
     for rule in ("round_up", "even"):
-        v = dict(n)
-        if n["act_quant"].endswith("_in_kernel"):
-            v["act_quant"] = f"{fam}_{rule}"
-        if n["inter_quant"].endswith("_in_kernel"):
-            v["inter_quant"] = f"{fam}_{rule}"
-            if n["inter"] != "bf16":
-                v["inter"] = (
-                    f"bf16_then_{fam}_{rule}"
-                    if n["inter"].startswith("bf16_then_")
-                    else n["inter"]
-                )
-        out[rule] = v
+        for rounding in ("fp32_direct", "bf16_then"):
+            v = dict(n)
+            if n["act_quant"].endswith("_in_kernel"):
+                v["act_quant"] = f"{fam}_{rule}"
+            if n["inter_quant"].endswith("_in_kernel"):
+                v["inter_quant"] = f"{fam}_{rule}"
+                if n["inter"] != "bf16":
+                    v["inter"] = (
+                        f"bf16_then_{fam}_{rule}"
+                        if rounding == "bf16_then"
+                        else "fp32_direct"
+                    )
+            out[rule if rounding == "fp32_direct" else f"{rule}+bf16"] = v
     return out
 
 
@@ -821,7 +826,9 @@ def aggregate(per_seed):
     mean, std = {}, {}
     keys = {k for m in per_seed for k in m if k not in ("seed", "rep")}
     for k in keys:
-        vals = torch.tensor([m[k] for m in per_seed if k in m], dtype=torch.float64)
+        vals = torch.tensor(
+            [m[k] for m in per_seed if k in m], dtype=torch.float64, device="cpu"
+        )
         mean[k] = float(vals.mean())
         std[k] = float(vals.std(unbiased=False)) if len(vals) > 1 else 0.0
     return {"mean": mean, "std": std}

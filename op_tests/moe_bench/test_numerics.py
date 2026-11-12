@@ -544,16 +544,41 @@ def test_in_kernel_paths_are_scored_against_the_scale_rule_they_match():
     }
     assert accuracy.has_in_kernel(in_kernel)
     v = accuracy.in_kernel_variants(S, in_kernel)
-    assert set(v) == {"round_up", "even"}
-    # the activation went through the quant call: only the intermediate's rule varies
+    assert set(v) == {"round_up", "even", "round_up+bf16", "even+bf16"}
+    # the activation went through the quant call: only the intermediate varies
     assert v["even"]["act_quant"] == "mx_fp4_round_up"
     assert v["even"]["inter_quant"] == "mx_fp4_even"
+    assert v["even"]["inter"] == "fp32_direct"
+    # the activation output rounded to bf16 before the quant is its own variant
+    assert v["round_up+bf16"]["inter"] == "bf16_then_mx_fp4_round_up"
+    assert v["even+bf16"]["inter"] == "bf16_then_mx_fp4_even"
     assert not accuracy.has_in_kernel(v["even"])
     # a 1-stage kernel quantizes both in-kernel: both rules vary together
     one = dict(in_kernel, act_quant="mx_fp4_in_kernel")
     v1 = accuracy.in_kernel_variants(S, one)
     assert v1["even"]["act_quant"] == "mx_fp4_even"
-    assert v1["round_up"]["inter_quant"] == "mx_fp4_round_up"
+    assert v1["round_up+bf16"]["inter_quant"] == "mx_fp4_round_up"
+
+
+def test_fp32_direct_reference_does_not_round_the_activation_to_bf16():
+    """ref_path at fp32_direct hands the fp32 activation output to the MX quant, so it
+    differs from the bf16_then reference by the bf16 rounding (0.023 logits_diff on
+    a4w4 SwiGLU at tier1-00102, measured) and not from an fp32 emulation."""
+    import torch
+
+    x = torch.randn(4, 64, device="cpu") * 3
+    fp32 = accuracy._inter_values(
+        types.SimpleNamespace(dtype=torch.bfloat16), x.double(), "fp32_direct"
+    )
+    assert fp32.dtype == torch.float32 and torch.equal(
+        fp32.double(), x.double().float().double()
+    )
+    bf = accuracy._inter_values(
+        types.SimpleNamespace(dtype=torch.bfloat16),
+        x.double(),
+        "bf16_then_mx_fp4_round_up",
+    )
+    assert bf.dtype == torch.bfloat16 and not torch.equal(bf.float(), fp32)
 
 
 def test_match_rule_picks_the_closer_reference_and_applies_the_strict_rule():

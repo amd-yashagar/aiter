@@ -99,7 +99,18 @@ def _guard_builds(a, runner):
     miss = [m for m in prebuild.missing(prebuild.plan(cases)) if m not in bad]
     if a.launcher == "gpuq" and not a.allow_build:
         prebuild.require_prebuilt(cases)
+        fly = prebuild.flydsl_cases_missing(cases)
+        if fly:
+            raise SystemExit(
+                f"{len(fly)} cases have FlyDSL candidates that no host build covered "
+                f"(cache {prebuild.flydsl_cache_dir()}); a leased run must not compile. "
+                "Run `run --mode prebuild` first, or pass --allow-build:\n  "
+                + "\n  ".join(fly[:20])
+            )
         os.environ[prebuild.NO_BUILD_ENV] = "1"
+        prebuild.arm_flydsl_run_only()
+    elif os.path.exists(prebuild.manifest_path()):
+        os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = prebuild.flydsl_cache_dir()
     if not miss:
         return
     print(
@@ -192,6 +203,29 @@ def main(argv=None):
         "--prebuild-jobs",
         type=int,
         help="modules built at once (default cores/16; each gets MAX_JOBS=cores/jobs)",
+    )
+    p.add_argument(
+        "--no-flydsl-prebuild",
+        action="store_true",
+        help="prebuild: skip the FlyDSL host build (CK and static modules only)",
+    )
+    p.add_argument(
+        "--flydsl-only",
+        action="store_true",
+        help="prebuild: only the FlyDSL host build and the vecadd probe (no CK or static "
+        "JIT modules: those are built for GPU_ARCHS and must not be built for another "
+        "arch into a shared AITER_JIT_DIR)",
+    )
+    p.add_argument(
+        "--flydsl-procs",
+        type=int,
+        help="FlyDSL host-build processes at once (default cores/4)",
+    )
+    p.add_argument(
+        "--flydsl-per-proc",
+        type=int,
+        default=40,
+        help="FlyDSL candidates per host-build process slice",
     )
     p.add_argument(
         "--prebuild-retry",
@@ -335,16 +369,30 @@ def main(argv=None):
             from . import prebuild
 
             prebuild.use_tree(a.aiter)
-            res = prebuild.run_prebuild(
-                _runner.select_cases(a.cases.split(","), a.filter),
-                tree=a.aiter,
-                tmpdir=a.tmpdir,
-                jobs=a.prebuild_jobs,
-                min_free_gb=a.min_free_gb,
-                cores=a.prebuild_cores,
-                retry_failed=a.prebuild_retry,
-            )
-            return 1 if res["failed"] else 0
+            res = {"failed": []}
+            if not a.flydsl_only:
+                res = prebuild.run_prebuild(
+                    _runner.select_cases(a.cases.split(","), a.filter),
+                    tree=a.aiter,
+                    tmpdir=a.tmpdir,
+                    jobs=a.prebuild_jobs,
+                    min_free_gb=a.min_free_gb,
+                    cores=a.prebuild_cores,
+                    retry_failed=a.prebuild_retry,
+                )
+            bad = bool(res["failed"])
+            if not a.no_flydsl_prebuild:
+                cs = _runner.select_cases(a.cases.split(","), a.filter)
+                bad |= not prebuild.prebuild_probe(tree=a.aiter, tmpdir=a.tmpdir)
+                fly = prebuild.run_flydsl_prebuild(
+                    cs,
+                    procs=a.flydsl_procs,
+                    per_proc=a.flydsl_per_proc,
+                    tree=a.aiter,
+                    tmpdir=a.tmpdir,
+                )
+                bad |= any(not r["built"] for r in fly.values())
+            return 1 if bad else 0
         _guard_builds(a, _runner)
         if a.launcher == "gpuq" and not a.inner:
             from . import batch

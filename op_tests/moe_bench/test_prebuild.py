@@ -177,3 +177,37 @@ def test_without_a_readable_chip_prebuild_asks_for_arch_and_cu_num(monkeypatch):
 def test_use_tree_refuses_an_aiter_already_imported_from_elsewhere(tmp_path):
     with pytest.raises(SystemExit, match="already imported"):
         prebuild.use_tree(str(tmp_path))
+
+
+def test_children_follow_the_aiter_tree_whatever_the_cwd(monkeypatch, tmp_path):
+    """Run from a harness checkout that is itself a full aiter tree, a child's cwd leads
+    its sys.path: its own aiter, its JIT dir and its missing CK submodule. The children
+    run in the --aiter tree and are told the JIT dir the parent resolved."""
+    tree = tmp_path / "target-aiter"
+    tree.mkdir()
+    jit = tmp_path / "jit"
+    jit.mkdir()
+    monkeypatch.setattr(prebuild, "jit_dir", lambda: str(jit))
+    monkeypatch.setattr(prebuild, "use_tree", lambda t: str(t))
+    monkeypatch.delenv("AITER_JIT_DIR", raising=False)
+    need = prebuild.plan([PTPC])
+    target = min(m for m in need if m.startswith("module_moe_ck2stages"))
+    seen = []
+
+    class P:
+        stdout, stderr = "", ""
+
+    def fake_run(cmd, **kw):
+        seen.append(kw)
+        return P()
+
+    monkeypatch.setattr(prebuild.subprocess, "run", fake_run)
+    monkeypatch.setattr(prebuild, "plan", lambda cases: {target: need[target]})
+    prebuild.run_prebuild([], jobs=1, log=lambda *_: None, tree=str(tree))
+    assert seen and all(kw["cwd"] == str(tree) for kw in seen)
+    assert all(kw["env"]["AITER_JIT_DIR"] == str(jit) for kw in seen)
+    assert seen[0]["env"]["PYTHONPATH"].split(":")[0] == str(tree)
+    seen.clear()
+    prebuild.prebuild_probe(log=lambda *_: None, tree=str(tree))
+    assert seen and seen[0]["cwd"] == str(tree)
+    assert seen[0]["env"]["AITER_JIT_DIR"] == str(jit)

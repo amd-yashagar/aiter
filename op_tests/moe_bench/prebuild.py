@@ -265,7 +265,14 @@ def use_tree(tree):
     return tree
 
 
-def _child_env(max_jobs, tree=None, shim=None):
+def flydsl_cache_dir():
+    """Where FlyDSL artifacts go: the host build and the lease must use the same one."""
+    return os.environ.get("FLYDSL_RUNTIME_CACHE_DIR") or os.path.join(
+        jit_dir(), "flycache"
+    )
+
+
+def _child_env(max_jobs, tree=None, shim=None, flydsl=False):
     arch, cu = gpu_identity()
     env = dict(os.environ)
     if tree:
@@ -285,6 +292,17 @@ def _child_env(max_jobs, tree=None, shim=None):
         MAX_JOBS=str(max_jobs),
     )
     env.pop(NO_BUILD_ENV, None)
+    env.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
+    # the build lands where this process (which imports aiter from the --aiter tree) would
+    # put it, whatever the child's own import resolves to
+    env["AITER_JIT_DIR"] = jit_dir()
+    if flydsl:
+        env.update(
+            COMPILE_ONLY="1",
+            FLYDSL_GPU_ARCH=arch,
+            AITER_AOT_REPLAY="1",
+            FLYDSL_RUNTIME_CACHE_DIR=flydsl_cache_dir(),
+        )
     return env
 
 
@@ -354,6 +372,7 @@ def run_prebuild(
             text=True,
             timeout=timeout,
             check=False,
+            cwd=tree or None,
         )
         ok = os.path.exists(module_path(spec["md_name"]))
         return spec["md_name"], ok, time.time() - t, p.stdout[-400:] + p.stderr[-600:]
@@ -391,6 +410,222 @@ def run_prebuild(
         f"present, {time.time() - t0:.0f}s ({jobs} at a time, MAX_JOBS={per} each)"
     )
     return {"built": built, "present": present, "failed": failed}
+
+
+def manifest_path():
+    return os.path.join(flydsl_cache_dir(), "prebuilt.json")
+
+
+def read_manifest():
+    try:
+        with open(manifest_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def flydsl_cases_missing(cases):
+    """Case ids with FlyDSL bar candidates that no FlyDSL prebuild has covered."""
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+    from . import workload
+    from .flydsl_prebuild import enumerate_flydsl
+
+    done = read_manifest()
+    tmp = os.environ.get("TMPDIR") or "/tmp"
+    gfx, cu = get_gfx(), get_cu_num()
+    out = []
+    for c in cases:
+        if c.kind != "fused" or c.token <= 0 or c.id in done:
+            continue
+        try:
+            _ctx, cands = enumerate_flydsl(workload.resolve(c), c, tmp, gfx, cu)
+        except Exception:  # noqa: BLE001, S112  (the bar reports enumeration errors)
+            continue
+        if cands:
+            out.append(c.id)
+    return out
+
+
+def arm_flydsl_run_only():
+    """In a leased run: the same cache dir as the host build, and a miss is an error."""
+    os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = flydsl_cache_dir()
+    os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
+
+
+def run_flydsl_prebuild(
+    cases,
+    procs=None,
+    per_proc=40,
+    log=print,
+    tree=None,
+    tmpdir=None,
+    cases_csv=None,
+    timeout=6 * 3600,
+    arch=None,
+):
+    """Host-compile the FlyDSL candidates of ``cases`` with no GPU, ``procs`` at a time.
+
+    Each case's FlyDSL candidates are split in slices of about ``per_proc`` candidates, one
+    child process per slice (compiles are mostly single-threaded). Results go into the
+    cache's ``prebuilt.json`` manifest; returns {case_id: {...}}.
+    """
+    import tempfile
+
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+    from . import runner, schema, workload
+    from .flydsl_prebuild import enumerate_flydsl
+
+    tmpdir = tmpdir or os.environ.get("TMPDIR") or "/tmp"
+    os.makedirs(flydsl_cache_dir(), exist_ok=True)
+    gfx, cu = get_gfx(), get_cu_num()
+    shim = pkg = None
+    if tree:
+        tree = use_tree(tree)
+        if runner.needs_shim(tree):
+            shim = runner.make_shim(tmpdir)
+            pkg = "moe_bench_shim"
+    pkg = pkg or "op_tests.moe_bench"
+    cores = os.cpu_count() or 8
+    procs = max(1, procs or cores // 4)
+    plan_ = []
+    for c in cases:
+        if c.kind != "fused" or c.token <= 0:
+            continue
+        try:
+            _ctx, cands = enumerate_flydsl(workload.resolve(c), c, tmpdir, gfx, cu)
+        except Exception as e:  # noqa: BLE001
+            log(f"flydsl prebuild: {c.id}: cannot enumerate ({type(e).__name__})")
+            continue
+        if cands:
+            parts = max(1, -(-len(cands) // per_proc))
+            plan_.append((c, len(cands), parts))
+    log(
+        f"flydsl prebuild: {len(plan_)} cases with FlyDSL candidates, "
+        f"{sum(n for _, n, _ in plan_)} candidates, {sum(p for _, _, p in plan_)} slices, "
+        f"{procs} at a time, cache {flydsl_cache_dir()}"
+    )
+    if cases_csv is None:
+        fd, cases_csv = tempfile.mkstemp(suffix=".csv", dir=tmpdir)
+        os.close(fd)
+        with open(cases_csv, "w", newline="") as f:
+            import csv as _csv
+
+            w = _csv.DictWriter(f, fieldnames=schema.COLS)
+            w.writeheader()
+            for c, _, _ in plan_:
+                w.writerow({k: c.row.get(k, "") for k in schema.COLS})
+    tasks = [(c, i, parts) for c, _, parts in plan_ for i in range(parts)]
+    started, ended, rows = {}, {}, {}
+
+    def child(c, part, extra):
+        p = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                f"{pkg}.flydsl_prebuild",
+                "--cases",
+                cases_csv,
+                "--id",
+                c.id,
+                "--part",
+                part,
+                "--tmpdir",
+                tmpdir,
+                *extra,
+            ],
+            env=_child_env(1, tree, shim, flydsl=True),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            cwd=tree or None,
+        )
+        for line in p.stdout.splitlines():
+            if line.startswith("FLYDSL "):
+                return json.loads(line[len("FLYDSL ") :]), ""
+        return None, (p.stderr or p.stdout)[-300:]
+
+    counts = {c.id: n for c, n, _ in plan_}
+
+    def one(task):
+        c, i, parts = task
+        started.setdefault(c.id, time.time())
+        res, _err = child(c, f"{i}/{parts}", [])
+        if res is None:
+            # a compiler crash (the tracing can segfault) loses the whole slice: redo its
+            # candidates one by one so one bad kernel costs one candidate
+            res = {"built": 0, "failed": [], "seconds": 0.0}
+            for k in range(i, counts[c.id], parts):
+                r1, e1 = child(c, f"{i}/{parts}", ["--indices", str(k)])
+                if r1 is None:
+                    res["failed"].append([f"candidate #{k}", f"child crashed: {e1}"])
+                else:
+                    res["built"] += r1["built"]
+                    res["failed"] += r1["failed"]
+                    res["seconds"] += r1["seconds"]
+        ended[c.id] = time.time()
+        return c.id, res, ""
+
+    with ThreadPoolExecutor(max_workers=procs) as pool:
+        for fut in as_completed([pool.submit(one, t) for t in tasks]):
+            cid, res, err = fut.result()
+            r = rows.setdefault(cid, {"built": 0, "failed": [], "child_seconds": 0.0})
+            if res is None:
+                r["failed"].append(["slice", err])
+            else:
+                r["built"] += res["built"]
+                r["failed"] += res["failed"]
+                r["child_seconds"] += res["seconds"]
+    manifest = read_manifest()
+    for c, n, _ in plan_:
+        r = rows.get(c.id, {"built": 0, "failed": [], "child_seconds": 0.0})
+        r.update(
+            candidates=n,
+            wall_seconds=round(ended.get(c.id, 0) - started.get(c.id, 0), 1),
+            arch=gfx,
+        )
+        manifest[c.id] = r
+        log(
+            f"flydsl prebuild: {c.id}: {n} candidates, {r['built']} compiled, "
+            f"{len(r['failed'])} could not, {r['child_seconds']:.0f} CPU-s, "
+            f"{r['wall_seconds']:.0f}s wall"
+        )
+    with open(manifest_path(), "w") as f:
+        json.dump(manifest, f, indent=1)
+    return {c.id: manifest[c.id] for c, _, _ in plan_}
+
+
+def prebuild_probe(log=print, tree=None, tmpdir=None):
+    """Host-compile the preflight's FlyDSL vecadd probe so the lease finds it cached."""
+    from . import runner
+
+    shim = pkg = None
+    if tree:
+        tree = use_tree(tree)
+        if runner.needs_shim(tree):
+            shim = runner.make_shim(tmpdir or os.environ.get("TMPDIR") or "/tmp")
+            pkg = "moe_bench_shim"
+    pkg = pkg or "op_tests.moe_bench"
+    os.makedirs(flydsl_cache_dir(), exist_ok=True)
+    p = subprocess.run(
+        [sys.executable, "-m", f"{pkg}.preflight"],
+        env=_child_env(1, tree, shim, flydsl=True),
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=tree or None,
+    )
+    ok = False
+    for line in p.stdout.splitlines():
+        if line.startswith("PREFLIGHT "):
+            res = json.loads(line[len("PREFLIGHT ") :])
+            ok = any(
+                c["name"] == "flydsl compile probe" and c["ok"] for c in res["checks"]
+            )
+    log(f"flydsl prebuild: vecadd probe {'host-compiled' if ok else 'FAILED'}")
+    return ok
 
 
 def main(argv=None):

@@ -109,10 +109,15 @@ def _flydsl_probe():
         )
 
     n = 4096
-    a = torch.randn(n, dtype=torch.float32, device="cuda")
-    b = torch.randn(n, dtype=torch.float32, device="cuda")
-    c = torch.zeros(n, dtype=torch.float32, device="cuda")
+    # COMPILE_ONLY=1 (the CPU prebuild): compile and cache the kernel, launch nothing
+    host = os.environ.get("COMPILE_ONLY") == "1"
+    dev = "cpu" if host else "cuda"
+    a = torch.randn(n, dtype=torch.float32, device=dev)
+    b = torch.randn(n, dtype=torch.float32, device=dev)
+    c = torch.zeros(n, dtype=torch.float32, device=dev)
     vadd(a, b, c, n)
+    if host:
+        return "FlyDSL vecadd host-compiled (COMPILE_ONLY, not launched)"
     torch.cuda.synchronize()
     if not torch.allclose(c, a + b):
         raise RuntimeError("FlyDSL vecadd compiled but returned a wrong result")
