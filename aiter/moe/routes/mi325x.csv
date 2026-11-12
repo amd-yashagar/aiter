@@ -1,1 +1,6 @@
 family,model_dim,inter_dim,experts,topk,act,doweight_stage1,m_min,m_max,kernel,config,verified,note
+fp8-token,*,*,2048,*,*,*,0,2147483648,aiter,,harness 828341869 tier1 acb14acf1,prefill slower than dispatch at E2048
+fp8-token,*,*,*,*,*,*,0,16,gfx942_fp8_token.decode,,harness 828341869 tier1 acb14acf1,decode: 17/17 rows pass; faster than dispatch and the M=8 bars
+fp8-token,*,*,*,*,*,*,4096,2147483648,gfx942_fp8_token.prefill,,harness 828341869 tier1 acb14acf1,prefill: faster than dispatch and the M=4096 bars
+fp8-tensor,*,*,*,*,*,*,0,16,gfx942_fp8_token.decode,,harness 828341869 tier1 acb14acf1,decode serves per-tensor too
+fp8-tensor,*,*,*,*,*,*,4096,2147483648,gfx942_fp8_tensor.prefill,,harness 828341869 tier1 acb14acf1,per-tensor prefill
