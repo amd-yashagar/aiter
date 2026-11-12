@@ -3,7 +3,8 @@
   "configs": {
     "d16": {
       "tile_m": 16,
-      "tile_n2": 128
+      "tile_n2": 128,
+      "splits": "auto"
     },
     "d32": {
       "tile_m": 32,
@@ -21,6 +22,21 @@
       "tile_m": 128,
       "tile_n2": 128,
       "stage1": "8wave"
+    },
+    "d16_s2": {
+      "tile_m": 16,
+      "tile_n2": 128,
+      "splits": 2
+    },
+    "d16_s4": {
+      "tile_m": 16,
+      "tile_n2": 128,
+      "splits": 4
+    },
+    "d16_s8": {
+      "tile_m": 16,
+      "tile_n2": 128,
+      "splits": 8
     },
     "d16_af32": {
       "tile_m": 16,

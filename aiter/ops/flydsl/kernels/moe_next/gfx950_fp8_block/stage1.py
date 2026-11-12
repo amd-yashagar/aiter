@@ -32,16 +32,22 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
+
 from . import helpers as fxh
 
 # keep fp32 folds as VOP2: v_pk_fma_f32 does not issue under an MFMA (lag-scale-fold-behind-mfma)
 _NO_PACKED_F32 = {"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]}
 
 CHANNELS = 128  # intermediate channels per workgroup = one quant group
+# sc0 | sc1: split-K partials cross XCDs, which do not share L2; these accesses write
+# through and read past it.
+CPOL_COHERENT = 0x1 | 0x10
 
 
 def _build_stage1(
-    *, model_dim, inter_dim, experts, tile_m, act, doweight_stage1, wide_k
+    *, model_dim, inter_dim, experts, tile_m, act, doweight_stage1, wide_k, splits
 ):
     elem_t = fx.Float8E4M3FN
     K = int(model_dim)
@@ -51,10 +57,14 @@ def _build_stage1(
     IB = I // CHANNELS
     BM = int(tile_m)
     TILE_K = 128
+    SPLITS = int(splits)
+    KS = KB // SPLITS  # K tiles per split
     assert K % TILE_K == 0 and KB % 2 == 0, f"model_dim={K} must be a multiple of 256"
     assert I % CHANNELS == 0, f"inter_dim={I} must be a multiple of 128"
     assert BM in (16, 32, 64, 128), f"tile_m={BM}"
     assert act in ("silu", "gelu")
+    assert KB % SPLITS == 0 and KS % 2 == 0, f"{KB} K tiles do not split {SPLITS} ways"
+    assert SPLITS == 1 or wide_k, "split-K is built on the wide-K path"
 
     # The A gather copies 256 // (TILE_K / 16) = 32 rows per pass: a tile_m 16 buffer
     # must still hold 32 rows, or the copy runs into the other ping-pong buffer.
@@ -79,7 +89,7 @@ def _build_stage1(
     _m_per_wave = _thrs_m // 4
 
     def _gemm(
-        blk_n, arg_p_input, arg_p_weight, lds, M, a_scale_t, w_scale_t, expert_id
+        blk_n, arg_p_input, arg_p_weight, lds, M, a_scale_t, w_scale_t, expert_id, k0
     ):
         tid = gpu.thread_idx.x
         mma_atom, tiled_mma = fxh.make_1x4_tiled_mma(elem_t, wide_k)
@@ -285,7 +295,8 @@ def _build_stage1(
                         pending = (acc, m, n, Vec(p), sa[n] * sw)
             _fold(*pending)
 
-        _load_gmem(0, 0)
+        # This workgroup's K tiles: [k0, k0 + KS) (all of K without split-K).
+        _load_gmem(k0, 0)
         rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile))
         _write_a_lds(0)
         gpu.barrier()
@@ -294,13 +305,14 @@ def _build_stage1(
         # Rolled K loop, two tiles per trip so the ping-pong buffers stay static. The
         # prefetch past the last tile is clamped to it (loaded and ignored), so every
         # trip issues the same loads and waits on the same vmcnt.
-        last = fx.Int32(num_tiles - 1)
-        for kt2 in range(0, num_tiles, 2):
+        k_end = k0 + fx.Int32(KS)
+        last = k_end - fx.Int32(1)
+        for kt2 in range(0, KS, 2):
             for u in range_constexpr(2):
-                kt = fx.Int32(kt2) + fx.Int32(u)
+                kt = k0 + fx.Int32(kt2) + fx.Int32(u)
                 sa, sg, su = _scales(kt)
                 kn = kt + fx.Int32(1)
-                kn = (kn < fx.Int32(num_tiles)).select(kn, last)
+                kn = (kn < k_end).select(kn, last)
                 _load_gmem(kn, 1 - u)
                 rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile))
                 _write_a_lds(1 - u)
@@ -423,6 +435,8 @@ def _build_stage1(
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
         arg_num_valid_ids: fx.Tensor,
+        arg_ws: fx.Tensor,
+        arg_cnt: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_rows: fx.Int32,
     ):
@@ -478,6 +492,7 @@ def _build_stage1(
             tw_frag = None
             if const_expr(doweight_stage1):
                 tw_frag = fxh.load_sorted_weight_frag(arg_sorted_weights, row0, BM, tid)
+            split = gpu.block_idx.z
             c_gate, c_up = _gemm(
                 blk_n,
                 arg_p_input,
@@ -487,29 +502,95 @@ def _build_stage1(
                 a_scale_t,
                 w_scale_t,
                 expert_id,
+                split * fx.Int32(KS),
             )
-            _activate(c_gate, c_up, tw_frag)
-            out_rsrc = fx.rocdl.get_buffer_rsrc(
-                fx.get_iter(
-                    fx.rocdl.make_buffer_tensor(
-                        arg_inter,
-                        max_size=False,
-                        num_records_bytes=fx.Int64(i32_rows) * fx.Int64(I),
+            if const_expr(SPLITS == 1):
+                _epilogue(c_gate, c_up, tw_frag, lds, tid, blk_n, row0, arg_inter,
+                          arg_inter_scale, i32_rows)
+            else:
+                # Each split stores its fp32 partials; the last to arrive at the
+                # (tile, block) counter sums all of them in split order (the same
+                # sum whichever split is last) and runs the epilogue.
+                ws_rsrc = fx.rocdl.get_buffer_rsrc(
+                    fx.get_iter(fx.rocdl.make_buffer_tensor(arg_ws, max_size=False))
+                )
+                pair = e_idx * fx.Int32(IB) + blk_n
+                # The coherent stores, waited on, are the release: an agent-scope
+                # fence would write back the whole L2 (splitk_epilogue.py's protocol).
+                _store_partials(c_gate, c_up, ws_rsrc, pair * fx.Int32(SPLITS) + split, tid)
+                rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=0))
+                gpu.barrier()
+                flag = fx.make_view(lds.amax.peek().ptr, fx.make_layout(4 * 128, 1))
+                cnt_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_cnt))) + fx.Int64(pair) * fx.Int64(4)
+                if tid == fx.Int32(0):
+                    old = fx.Int32(comm_ops.atomic_add_agent(cnt_addr, fx.Int32(1)))
+                    flag[0] = old.to(fx.Float32)
+                gpu.barrier()
+                is_last = flag[0] == fx.Float32(SPLITS - 1)
+                gpu.barrier()
+                if is_last:
+                    _sum_partials(c_gate, c_up, ws_rsrc, pair * fx.Int32(SPLITS), tid)
+                    if tid == fx.Int32(0):
+                        comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-SPLITS))
+                    _epilogue(c_gate, c_up, tw_frag, lds, tid, blk_n, row0, arg_inter,
+                              arg_inter_scale, i32_rows)
+
+    def _partial_slots(c_gate, c_up):
+        return [(acc, m, n) for acc in (c_gate, c_up)
+                for n in range_constexpr(fxh.reps(c_gate, 2))
+                for m in range_constexpr(fxh.reps(c_gate, 1))]
+
+    def _store_partials(c_gate, c_up, ws_rsrc, slot, tid):
+        """This thread's accumulators, vec4 j at ((slot * J + j) * 256 + tid) * 4."""
+        slots = _partial_slots(c_gate, c_up)
+        for j, (acc, m, n) in enumerate(slots):
+            off = ((slot * fx.Int32(len(slots)) + fx.Int32(j)) * fx.Int32(256) + tid) * fx.Int32(4)
+            buffer_ops.buffer_store(
+                acc[None, m, n].load(), ws_rsrc, off, cache_modifier=CPOL_COHERENT
+            )
+
+    def _sum_partials(c_gate, c_up, ws_rsrc, slot0, tid):
+        slots = _partial_slots(c_gate, c_up)
+        for j, (acc, m, n) in enumerate(slots):
+            total = None
+            for s in range_constexpr(SPLITS):
+                off = (((slot0 + fx.Int32(s)) * fx.Int32(len(slots)) + fx.Int32(j)) * fx.Int32(256)
+                       + tid) * fx.Int32(4)
+                p = Vec(
+                    buffer_ops.buffer_load(
+                        ws_rsrc, off, vec_width=4, cache_modifier=CPOL_COHERENT
                     )
                 )
-            )
-            scale_rsrc = fx.rocdl.get_buffer_rsrc(
-                fx.get_iter(
-                    fx.rocdl.make_buffer_tensor(
-                        arg_inter_scale,
-                        max_size=False,
-                        num_records_bytes=fx.Int64(i32_rows) * fx.Int64(IB * 4),
-                    )
+                total = p if total is None else total + p
+            acc[None, m, n].store(total)
+
+    def _epilogue(c_gate, c_up, tw_frag, lds, tid, blk_n, row0, arg_inter, arg_inter_scale, i32_rows):
+        _activate(c_gate, c_up, tw_frag)
+        out_rsrc = fx.rocdl.get_buffer_rsrc(
+            fx.get_iter(
+                fx.rocdl.make_buffer_tensor(
+                    arg_inter,
+                    max_size=False,
+                    num_records_bytes=fx.Int64(i32_rows) * fx.Int64(I),
                 )
             )
-            lds.amax = lds.amax.peek()
-            gpu.barrier()
-            _quant_store(c_gate, lds, tid, blk_n, row0, out_rsrc, scale_rsrc)
+        )
+        scale_rsrc = fx.rocdl.get_buffer_rsrc(
+            fx.get_iter(
+                fx.rocdl.make_buffer_tensor(
+                    arg_inter_scale,
+                    max_size=False,
+                    num_records_bytes=fx.Int64(i32_rows) * fx.Int64(IB * 4),
+                )
+            )
+        )
+        lds.amax = lds.amax.peek()
+        gpu.barrier()
+        _quant_store(c_gate, lds, tid, blk_n, row0, out_rsrc, scale_rsrc)
+
+    _store_partials = ASTRewriter.transform(_store_partials)
+    _sum_partials = ASTRewriter.transform(_sum_partials)
+    _epilogue = ASTRewriter.transform(_epilogue)
 
     def fxh_view_i32(t):
         return fx.make_view(
@@ -544,12 +625,59 @@ def _build_stage1(
             arg_expert_ids,
             arg_sorted_weights,
             arg_num_valid_ids,
+            arg_x,  # no split-K: workspace and counters unused
+            arg_x,
             i32_tokens,
             i32_rows,
             value_attrs=_NO_PACKED_F32,
         ).launch(grid=(IB, fx.Int64(i32_tiles), 1), block=(256, 1, 1), stream=stream)
 
-    return launch_fp8b_stage1
+    @flyc.jit
+    def launch_fp8b_stage1_splitk(
+        arg_inter: fx.Tensor,
+        arg_inter_scale: fx.Tensor,
+        arg_x: fx.Tensor,
+        arg_x_scale: fx.Tensor,
+        arg_w: fx.Tensor,
+        arg_w_scale: fx.Tensor,
+        arg_sorted_token_ids: fx.Tensor,
+        arg_expert_ids: fx.Tensor,
+        arg_sorted_weights: fx.Tensor,
+        arg_num_valid_ids: fx.Tensor,
+        arg_ws: fx.Tensor,
+        arg_cnt: fx.Tensor,
+        i32_tokens: fx.Int32,
+        i32_rows: fx.Int32,
+        i32_tiles: fx.Int32,
+        stream: fx.Stream,
+    ):
+        fp8b_stage1(
+            arg_inter,
+            arg_inter_scale,
+            arg_x,
+            arg_x_scale,
+            arg_w,
+            arg_w_scale,
+            arg_sorted_token_ids,
+            arg_expert_ids,
+            arg_sorted_weights,
+            arg_num_valid_ids,
+            arg_ws,
+            arg_cnt,
+            i32_tokens,
+            i32_rows,
+            value_attrs=_NO_PACKED_F32,
+        ).launch(
+            grid=(IB, fx.Int64(i32_tiles), SPLITS), block=(256, 1, 1), stream=stream
+        )
+
+    return launch_fp8b_stage1 if SPLITS == 1 else launch_fp8b_stage1_splitk
+
+
+def splitk_workspace_floats(tile_m, tiles, inter_dim, splits):
+    """fp32 elements of the split-K workspace: per (tile, block) pair and split, the
+    gate and up accumulators of one tile (2 x tile_m x 128 values)."""
+    return tiles * (inter_dim // CHANNELS) * splits * 2 * tile_m * CHANNELS
 
 
 @functools.lru_cache(maxsize=256)
@@ -562,7 +690,11 @@ def compile_stage1(
     act="silu",
     doweight_stage1=False,
     wide_k=True,
+    splits=1,
 ):
+    """splits > 1: split-K over hidden into that many workgroups per (tile, block); the
+    launcher then also takes the fp32 workspace (splitk_workspace_floats) and one
+    int32 counter per (tile, block) pair, zero before the call and zero after it."""
     return _build_stage1(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -571,4 +703,5 @@ def compile_stage1(
         act=act,
         doweight_stage1=doweight_stage1,
         wide_k=wide_k,
+        splits=splits,
     )
