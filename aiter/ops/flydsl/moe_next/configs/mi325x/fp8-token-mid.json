@@ -57,5 +57,97 @@
   "m64nbd2": {
     "tile_m": 64,
     "down_nbd": 2
+  },
+  "m16": {
+    "tile_m": 16,
+    "down_nbd": 2
+  },
+  "m16gw2": {
+    "tile_m": 16,
+    "down_nbd": 2,
+    "gateup_waves": 2
+  },
+  "m32gw2": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_waves": 2
+  },
+  "m32gw1": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_waves": 1
+  },
+  "m32ch4": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_ch": 4
+  },
+  "m32ch1": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_ch": 1
+  },
+  "m32dw2": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "down_waves": 2
+  },
+  "m32nbd1": {
+    "tile_m": 32,
+    "down_nbd": 1
+  },
+  "m32pw1": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_pw": 1,
+    "gateup_pa": 1
+  },
+  "m32pw3": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_pw": 3
+  },
+  "m64gw2": {
+    "tile_m": 64,
+    "down_nbd": 2,
+    "gateup_waves": 2
+  },
+  "m128nbd2": {
+    "tile_m": 128,
+    "down_nbd": 2
+  },
+  "m128gw8": {
+    "tile_m": 128,
+    "down_nbd": 2,
+    "gateup_waves": 8
+  },
+  "m32gw2ks2": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_waves": 2,
+    "gateup_ks": 2
+  },
+  "m32ks2": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_ks": 2
+  },
+  "m32gw1ks4": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_waves": 1,
+    "gateup_ks": 4
+  },
+  "m32gw2ks4": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_waves": 2,
+    "gateup_ks": 4
+  },
+  "m32gw8ks2": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_waves": 8,
+    "gateup_ks": 2
   }
 }
