@@ -4201,6 +4201,8 @@ def _ck_blockscale_swiglu_oai_supported():
             return "Activation::swiglu_oai_and_mul" in f.read()
     except OSError:
         return False
+
+
 def _fmoe_asm_dtype_tag(dtype):
     return "b16" if dtype == dtypes.bf16 else "f16"
 
