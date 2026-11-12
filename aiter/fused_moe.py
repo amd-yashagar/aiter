@@ -4201,6 +4201,17 @@ def _ck_blockscale_swiglu_oai_supported():
             return "Activation::swiglu_oai_and_mul" in f.read()
     except OSError:
         return False
+def _fmoe_asm_dtype_tag(dtype):
+    return "b16" if dtype == dtypes.bf16 else "f16"
+
+
+def _fmoe_asm_bf16_kernel_exists(dtype):
+    """Whether the pure a16w16 1-stage ASM kernel (aiter.fmoe) is shipped for this arch."""
+    return os.path.exists(
+        os.path.join(
+            AITER_ROOT_DIR, "hsa", get_gfx(), f"fmoe_{_fmoe_asm_dtype_tag(dtype)}.co"
+        )
+    )
 
 
 def _swiglu_limit_is_active(swiglu_limit) -> bool:
@@ -4733,6 +4744,28 @@ def get_2stage_cfgs(
                 "1-stage SiTUv2 ASM has fixed beta=4 and linear_beta=25; "
                 "use separated preshuffled weights for runtime betas"
             )
+
+    if (
+        cfg is not None
+        and cfg.get("run_1stage", False)
+        and q_type == QuantType.No
+        and activation == ActivationType.Silu
+        and not use_g1u1
+        and not _fmoe_asm_bf16_kernel_exists(dtype)
+    ):
+        # fused_moe_1stage runs aiter.fmoe for this combination, which loads
+        # hsa/<gfx>/fmoe_{b16,f16}.co. Archs without the file would fail at launch.
+        if config_file is not None:
+            raise NotImplementedError(
+                f"The 1-stage a16w16 ASM kernel fmoe_{_fmoe_asm_dtype_tag(dtype)}.co "
+                f"is not shipped for {get_gfx()}"
+            )
+        cfg = None
+        logger.warning(
+            f"[fused_moe] discarding 1-stage a16w16 ASM config for {keys}: "
+            f"fmoe_{_fmoe_asm_dtype_tag(dtype)}.co is not shipped for {get_gfx()}; "
+            "using default heuristics"
+        )
 
     if (
         cfg is not None
