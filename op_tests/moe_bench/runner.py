@@ -393,6 +393,14 @@ class GroupJob:
             st, det = status, detail
             if (
                 status == "crash"
+                and c.kind == "sorting"
+                and c["q_type"] == "per_1x32"
+                and self.meta.get("gfx") != "gfx950"
+            ):
+                st = "unsupported"
+                det = "MXFP4 sort+quant aborted the process on this arch: " + detail
+            if (
+                status == "crash"
                 and "LLVM ERROR" in detail
                 and self.meta.get("gfx") != "gfx950"
             ):
