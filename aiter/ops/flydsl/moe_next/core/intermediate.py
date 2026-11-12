@@ -29,9 +29,12 @@ class Layout:
     values per byte). ``group`` is the scale group along the columns: an int
     (128 blockscale, 32 MX), ``"row"`` (one scale per row) or ``"none"``.
     ``scale_order`` ``row_major`` stores scales ``[rows, groups]``;
-    ``mfma_native`` (MX e8m0 in scaled-MFMA operand order) is specified in
-    docs/aiter-moe-api.md and not implemented yet. ``row_pad`` rounds the row
-    count up; ``col_pad`` rounds each value row (in elements) up.
+    ``mfma_native`` (MX: group 32, e8m0) stores them in scaled-MFMA operand
+    order, aiter's e8m0_shuffle over sorted rows: ``[rows padded to 32,
+    groups padded to 8]`` bytes, byte (r, g) at ``scale_offset(r, g)``, the
+    padding bytes 0x7F (written by stage 1; ``alloc`` is ``torch.empty``).
+    ``row_pad`` rounds the row count up; ``col_pad`` rounds each value row
+    (in elements) up.
     """
 
     rows: int
@@ -46,8 +49,10 @@ class Layout:
     def __post_init__(self):
         if self.scale_order not in SCALE_ORDERS:
             raise ValueError(f"scale_order must be one of {SCALE_ORDERS}")
-        if self.scale_order == "mfma_native":
-            raise NotImplementedError("mfma_native scale order is not implemented yet")
+        if self.scale_order == "mfma_native" and (
+            self.group != 32 or self.scale_dtype != dtypes.fp8_e8m0
+        ):
+            raise ValueError("mfma_native needs group 32 and fp8_e8m0 scales")
         if isinstance(self.group, int) and self.cols % self.group:
             raise ValueError(
                 f"cols {self.cols} is not a multiple of group {self.group}"
@@ -79,13 +84,30 @@ class Layout:
     def scales_shape(self) -> tuple[int, int] | None:
         if self.group == "none":
             return None
+        if self.scale_order == "mfma_native":
+            return (-(-self.padded_rows // 32) * 32, -(-self.groups // 8) * 8)
         return (self.padded_rows, self.groups)
+
+    @property
+    def nbytes(self) -> int:
+        n = self.values_shape[0] * self.values_shape[1] * self.dtype.itemsize
+        if self.scales_shape is not None:
+            rows, cols = self.scales_shape
+            n += rows * cols * self.scale_dtype.itemsize
+        return n
 
     def value_offset(self, row: int, col: int) -> int:
         """Element offset of (row, col) in the values tensor's storage."""
         return row * self.values_shape[1] + col
 
-    def scale_offset(self, row: int, group: int) -> int:
+    def scale_offset(self, row, group):
+        """Element offset of the scale of (row, group); ints or tensors."""
+        if self.scale_order == "mfma_native":
+            from aiter.ops.flydsl.kernels.moe_next.core.intermediate import (
+                mfma_native_offset,
+            )
+
+            return mfma_native_offset(row, group, self.scales_shape[1])
         return row * self.groups + group
 
     def alloc(self, device) -> "Intermediate":
@@ -103,6 +125,10 @@ class Layout:
         rows = max_sorted_rows(m, topk, spec.global_experts, tile_m)
         if spec.quant == QuantType.per_1x128:
             return cls(rows, spec.inter_dim, dtypes.fp8, 128, dtypes.fp32)
+        if spec.quant == QuantType.per_1x32:
+            # a4w4 keeps fp4 between the stages; MXFP8 weights keep fp8
+            dtype = dtypes.fp4x2 if spec.w_dtype == dtypes.fp4x2 else dtypes.fp8
+            return cls(rows, spec.inter_dim, dtype, 32, dtypes.fp8_e8m0, "mfma_native")
         raise NotImplementedError(f"no intermediate layout for {spec.quant} yet")
 
 
@@ -123,8 +149,10 @@ def reference_pack(a2: torch.Tensor, tile_map: TileMap, layout: Layout) -> Inter
     """
     from aiter import get_hip_quant
 
+    if layout.scale_order == "mfma_native":
+        return _reference_pack_mx(a2, tile_map, layout)
     if layout.group != 128 or layout.dtype != dtypes.fp8:
-        raise NotImplementedError("reference_pack covers per_1x128 only")
+        raise NotImplementedError("reference_pack covers per_1x128 and MX only")
     m, topk, cols = a2.shape
     q, s = get_hip_quant(QuantType.per_1x128)(a2, quant_dtype=dtypes.fp8)
     q = q.view(m * topk, cols)
@@ -141,3 +169,43 @@ def reference_pack(a2: torch.Tensor, tile_map: TileMap, layout: Layout) -> Inter
     out.values[rows] = q[src]
     out.scales[rows] = s[src]
     return out
+
+
+def _sorted_rows(tile_map: TileMap, topk: int):
+    nv = int(tile_map.num_valid_ids[0])
+    sid = tile_map.sorted_token_ids[:nv]
+    tok, slot = sid & 0xFFFFFF, sid >> 24
+    real = slot < topk
+    return torch.nonzero(real).flatten(), (tok[real] * topk + slot[real]).long()
+
+
+def _reference_pack_mx(a2, tile_map, layout):
+    """MX: aiter's per_1x32_mx_quant_hip (RoundUp) per token-slot row, values
+    gathered by sorted row (padding rows zero), scales in the mfma_native
+    order with 0x7F padding."""
+    from aiter.ops.quant import per_1x32_mx_quant_hip
+
+    m, topk, cols = a2.shape
+    q, s = per_1x32_mx_quant_hip(
+        a2.reshape(m * topk, cols),
+        quant_dtype=layout.dtype,
+        scale_type=dtypes.fp8_e8m0,
+    )
+    out = layout.alloc(a2.device)
+    out.values.view(torch.uint8).zero_()
+    rows, src = _sorted_rows(tile_map, topk)
+    out.values.view(torch.uint8)[rows] = q.view(torch.uint8).view(m * topk, -1)[src]
+    rm = torch.full(layout.scales_shape, 0x7F, dtype=torch.uint8, device=a2.device)
+    rm[rows, : layout.groups] = s.view(torch.uint8)[src, : layout.groups]
+    out.scales.view(torch.uint8).copy_(to_mfma_native(rm, layout))
+    return out
+
+
+def to_mfma_native(row_major: torch.Tensor, layout: Layout) -> torch.Tensor:
+    """Row-major e8m0 bytes ``[*layout.scales_shape]`` in the mfma_native
+    order (same shape)."""
+    r = torch.arange(row_major.shape[0], device=row_major.device)[:, None]
+    g = torch.arange(row_major.shape[1], device=row_major.device)[None, :]
+    out = torch.empty_like(row_major).view(-1)
+    out[layout.scale_offset(r, g).flatten()] = row_major.flatten()
+    return out.view(row_major.shape)

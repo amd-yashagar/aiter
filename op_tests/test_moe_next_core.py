@@ -15,7 +15,11 @@ from aiter import QuantType, dtypes
 from aiter.fused_moe import _flydsl_moe_sorting, _moe_sorting_impl, fused_topk
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.moe import MoeSpec
-from aiter.ops.flydsl.moe_next.core.intermediate import Layout, reference_pack
+from aiter.ops.flydsl.moe_next.core.intermediate import (
+    Layout,
+    reference_pack,
+    to_mfma_native,
+)
 from aiter.ops.flydsl.moe_next.core.tile_map import reference_tile_map, route_to_tiles
 
 torch.set_default_device("cuda")
@@ -593,6 +597,103 @@ def time_sorts(token, E, topk, mask, model_dim, tile_m=32):
     return ret
 
 
+def _offsets_on_device(rows, groups, gp8):
+    """scale_offset_mfma evaluated by a kernel for every (row, group)."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    from aiter.ops.flydsl.kernels.moe_next.core.intermediate import (
+        scale_offset_mfma,
+    )
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def offsets_kernel(out: fx.Tensor, n: fx.Int32):
+        u = fx.gpu.block_idx.x * fx.Int32(256) + fx.gpu.thread_idx.x
+        r = u // fx.Int32(groups)
+        g = u - r * fx.Int32(groups)
+        it = fx.get_iter(fx.rocdl.make_buffer_tensor(out, max_size=True))
+        if u < n:
+            fx.ptr_store(scale_offset_mfma(r, g, gp8), it + fx.Int64(u))
+
+    @flyc.jit
+    def launch(out: fx.Tensor, n: fx.Int32, grid: fx.Int32, stream: fx.Stream = None):
+        offsets_kernel(out, n).launch(
+            grid=(grid, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    out = torch.empty(rows * groups, dtype=torch.int32)
+    launch(out, rows * groups, -(-rows * groups // 256))
+    return out.view(rows, groups)
+
+
+def test_mfma_native():
+    """The MX mfma_native scale order: byte for byte against aiter's
+    shuffle_scale (e8m0_shuffle), padding 0x7F included; the kernel helper
+    against the host formula; and reference_pack against aiter's sorted MX
+    quant (fused_dynamic_mx_quant_moe_sort) on the valid bytes."""
+    from aiter.ops.shuffle import shuffle_scale
+
+    rows_out = []
+    for R, G in [(256, 12), (512, 14), (256, 64), (512, 224), (100, 90), (33, 7)]:
+        lay = Layout(R, G * 32, dtypes.fp4x2, 32, dtypes.fp8_e8m0, "mfma_native")
+        assert lay.scales_shape == (-(-R // 32) * 32, -(-G // 8) * 8)
+        src = torch.randint(0, 255, (R, G), dtype=torch.uint8)
+        ref = shuffle_scale(src.view(dtypes.fp8_e8m0)).view(torch.uint8).flatten()
+        rm = torch.full(lay.scales_shape, 0x7F, dtype=torch.uint8)
+        rm[:R, :G] = src
+        mine = to_mfma_native(rm, lay).flatten()
+        assert torch.equal(mine, ref[: mine.numel()]), f"mfma_native R={R} G={G}"
+        r = torch.arange(lay.scales_shape[0])[:, None]
+        g = torch.arange(lay.scales_shape[1])[None, :]
+        host = lay.scale_offset(r, g).int()
+        dev = _offsets_on_device(*lay.scales_shape, lay.scales_shape[1])
+        assert torch.equal(host, dev), f"device offsets R={R} G={G}"
+        rows_out.append({"check": f"mfma_native R={R} G={G}", "exact": True})
+    mx = [dtypes.fp8] + ([dtypes.fp4x2] if get_gfx_runtime() == "gfx950" else [])
+    for dt in mx:
+        for token, E, topk, inter in [(16, 32, 4, 512), (300, 64, 8, 2880)]:
+            from aiter.ops.quant import fused_dynamic_mx_quant_moe_sort
+
+            ti, tw, _ = routing(token, E, topk)
+            tm = route_to_tiles(ti, tw, num_experts=E, tile_m=32)
+            lay = Layout(tm.rows, inter, dt, 32, dtypes.fp8_e8m0, "mfma_native")
+            a2 = torch.randn((token, topk, inter), dtype=dtypes.bf16) * 2
+            a2[0, 0].zero_()
+            packed = reference_pack(a2, tm, lay)
+            aq, asc = fused_dynamic_mx_quant_moe_sort(
+                a2.view(token * topk, inter),
+                tm.sorted_token_ids,
+                tm.num_valid_ids,
+                token,
+                topk,
+                32,
+                quant_dtype=dt,
+            )
+            nv = int(tm.num_valid_ids[0])
+            sid = tm.sorted_token_ids[:nv]
+            tok, slot = sid & 0xFFFFFF, sid >> 24
+            real = slot < topk
+            rows = torch.nonzero(real).flatten()
+            src = (tok[real] * topk + slot[real]).long()
+            bad = []
+            if not torch.equal(
+                packed.values.view(torch.uint8)[rows],
+                aq.view(torch.uint8).view(token * topk, -1)[src],
+            ):
+                bad.append("values")
+            gg = torch.arange(lay.groups)[None, :]
+            off = lay.scale_offset(rows[:, None], gg).flatten()
+            mine = packed.scales.view(torch.uint8).flatten()[off]
+            theirs = asc.view(torch.uint8).flatten()[off]
+            if not torch.equal(mine, theirs):
+                bad.append(f"scales ({int((mine != theirs).sum())} bytes)")
+            assert not bad, f"reference_pack {dt} M={token} I={inter}: {bad}"
+            rows_out.append(
+                {"check": f"reference_pack {dt} M={token} I={inter}", "exact": True}
+            )
+    return rows_out
+
+
 def test_intermediate(token=64, E=32, topk=4, inter_dim=512, tile_m=32):
     """per_1x128 layout shapes, and reference_pack against aiter's own quant."""
     spec = MoeSpec(
@@ -684,7 +785,7 @@ def main():
     aiter.logger.info(
         "eager host time:\n%s", pd.DataFrame(test_host_time()).to_markdown(index=False)
     )
-    checks = test_graph_capture() + test_intermediate()
+    checks = test_graph_capture() + test_intermediate() + test_mfma_native()
     aiter.logger.info("checks:\n%s", pd.DataFrame(checks).to_markdown(index=False))
     if args.tier:
         rows = []
