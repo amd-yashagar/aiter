@@ -107,11 +107,11 @@ def compile_decode_gateup(
     KB = K // 16
     assert WAVES in (4, 8) and KB % (4 * WAVES) == 0
     assert not HAS_MASK or GLOBAL_E, "EP needs the global expert count"
-    assert (K // 2) % (4 * 64 * WAVES) == 0, "the x row is staged 16 bytes per lane"
     NTHR = 64 * WAVES
     STEPS = KB // (4 * WAVES)
-    CH = min(CHUNK, STEPS)
-    assert STEPS % CH == 0
+    CH = max(c for c in range(1, min(CHUNK, STEPS) + 1) if STEPS % c == 0)
+    X_DW = K // 2
+    X_ROUNDS = -(-X_DW // (4 * NTHR))
     limit = float(swiglu_limit) if swiglu_limit else 7.0
 
     def _act(g, u):
@@ -186,10 +186,14 @@ def compile_decode_gateup(
             g_row = gi * (16 * K) + c * 16
             u_row = (I // 16 + gi) * (16 * K) + c * 16
             x_lds = fx.make_view(lds.x.ptr, fx.make_layout(K // 2, 1))
-            for i in range_constexpr(K // 2 // (4 * NTHR)):
-                xw = _load_dwords(x_rsrc, (fx.Int32(i * 4 * NTHR) + tid * 4) * 4)
-                for d in range_constexpr(4):
-                    x_lds[fx.Int32(i * 4 * NTHR + d) + tid * 4] = fx.Int32(xw[d])
+            # K % 256 == 0, so a lane's 16-byte chunk is either wholly in the row
+            # or wholly past it.
+            for i in range_constexpr(X_ROUNDS):
+                at = fx.Int32(i * 4 * NTHR) + tid * 4
+                if at < X_DW:
+                    xw = _load_dwords(x_rsrc, at * 4)
+                    for d in range_constexpr(4):
+                        x_lds[at + d] = fx.Int32(xw[d])
             gpu.barrier()
             acc_g = Vec.filled(16, 0.0, fx.Float32)
             acc_u = Vec.filled(16, 0.0, fx.Float32)
