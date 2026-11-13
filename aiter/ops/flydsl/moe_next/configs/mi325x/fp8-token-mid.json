@@ -232,5 +232,55 @@
     "down_nbd": 1,
     "gateup_waves": 8,
     "down_kc": true
+  },
+  "m64gw2kc": {
+    "tile_m": 64,
+    "down_nbd": 2,
+    "gateup_waves": 2,
+    "down_kc": true
+  },
+  "m64gw4kc": {
+    "tile_m": 64,
+    "down_nbd": 2,
+    "gateup_waves": 4,
+    "down_kc": true
+  },
+  "m128gw2kc": {
+    "tile_m": 128,
+    "down_nbd": 2,
+    "gateup_waves": 2,
+    "down_kc": true
+  },
+  "m128gw4kc": {
+    "tile_m": 128,
+    "down_nbd": 2,
+    "gateup_waves": 4,
+    "down_kc": true
+  },
+  "m64gw4ks2kc": {
+    "tile_m": 64,
+    "down_nbd": 2,
+    "gateup_waves": 4,
+    "gateup_ks": 2,
+    "down_kc": true
+  },
+  "m64gw2ks2kc": {
+    "tile_m": 64,
+    "down_nbd": 2,
+    "gateup_waves": 2,
+    "gateup_ks": 2,
+    "down_kc": true
+  },
+  "m64gw2nbd4kc": {
+    "tile_m": 64,
+    "down_nbd": 4,
+    "gateup_waves": 2,
+    "down_kc": true
+  },
+  "m64gw4nbd4kc": {
+    "tile_m": 64,
+    "down_nbd": 4,
+    "gateup_waves": 4,
+    "down_kc": true
   }
 }
