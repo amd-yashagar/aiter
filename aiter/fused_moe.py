@@ -878,6 +878,19 @@ def moe_sorting(
     output_aux=False,
     output=None,
 ):
+    """Sort the (token, slot) routes of ``topk_ids`` by expert, padded to ``block_size``.
+
+    Contract: the experts of one token's ``topk_ids`` row must be distinct. If a row
+    repeats an expert, the opus, CK and FlyDSL sorts keep exactly one of its slots and
+    drop the others, together with their weights. Which slot survives is unspecified:
+    it depends on the slot positions, and when the token's slots span two 64-lane
+    waves (topk that does not divide 64) it can change from call to call. Every
+    route of a token without repeats is kept. Slots of a masked or non-local expert
+    are dropped as before, so repeats of those are harmless, and so are repeated
+    padding slots whose weight is 0. aiter's own routers (fused_topk, grouped_topk,
+    biased_grouped_topk) pick distinct experts; a router that does not must merge
+    the weights of a repeated expert itself.
+    """
     asm_mode = AsmMoeMode(flat)
     if (
         not _USE_CK_MOE_SORTING
