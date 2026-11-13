@@ -7,8 +7,7 @@ Stage 2 writes one bf16 row per route, token-major ([tokens, topk, N]: row = tok
 already applied, with plain stores. This kernel sums a token's topk rows in fp32 in slot order (deterministic)
 and rounds once to bf16. A route the sort drops (id -1, an expert outside expert_mask, a token at or past
 num_local_tokens) has no row: its load is moved past the buffer's end, which reads zeros, so its row needs no
-zero-fill. Tokens at or past num_local_tokens come out as zeros, as the sort's zero-fill leaves them under the
-atomic combine.
+zero-fill. Rows at or past num_local_tokens are not written, as aiter's dispatch path leaves them.
 """
 
 import functools
@@ -79,7 +78,8 @@ def compile_rows_reduce(*, model_dim, topk, has_mask, has_local, chunks=1, threa
                 acc[c] = [acc[c][i] + v[i].to(fx.Float32) for i in range(VEC)]
         for c in range_constexpr(CH):
             packed = Vec.from_elements(acc[c], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
-            if cols[c] < fx.Int32(N):
+            # rows at or past num_local_tokens stay untouched, as aiter's dispatch leaves them
+            if live & (cols[c] < fx.Int32(N)):
                 buffer_ops.buffer_store(packed, out_rsrc, (t * fx.Int32(N) + cols[c]) // fx.Int32(2))
 
     @flyc.jit

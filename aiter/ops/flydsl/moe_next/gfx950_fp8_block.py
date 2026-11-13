@@ -383,7 +383,12 @@ class _Fp8BlockGfx950(MoeKernel):
             return out
         if combine == "rows_f32":
             buf = buf.view(M, call.topk, D).sum(dim=1)
-        out.copy_(buf)
+        if call.num_local_tokens is None:
+            out.copy_(buf)
+        else:
+            # rows at or past num_local_tokens stay untouched, as aiter's dispatch leaves them
+            local = torch.arange(M, device=x.device) < call.num_local_tokens.to(x.device)
+            out.copy_(torch.where(local[:, None], buf.to(out.dtype), out))
         return out
 
 

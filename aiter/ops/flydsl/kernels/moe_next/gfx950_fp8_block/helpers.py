@@ -175,6 +175,7 @@ class TensorWithIndex:
         row_stride=None,
         row_limit=None,
         cache=0,
+        slot_limit=None,
     ):
         layout = fx.get_layout(self.fake_tensor_thr)
         rep_m = reps(self.fake_tensor_thr, 1)
@@ -186,7 +187,12 @@ class TensorWithIndex:
         for m in range_constexpr(rep_m):
             if const_expr(atomic_rsrc is not None):
                 tok = self.index_frag[0, m] & 0xFFFFFF
-                if tok < fx.Int32(row_limit):
+                keep = tok < fx.Int32(row_limit)
+                if const_expr(slot_limit is not None):
+                    # under num_local_tokens a pad row carries token num_local_tokens (< row_limit) and
+                    # slot topk: the slot drops it either way
+                    keep = keep & ((self.index_frag[0, m] >> 24) < fx.Int32(slot_limit))
+                if keep:
                     row_base = tok * fx.Int32(row_stride) + fx.Int32(k_idx) * fx.Int32(
                         self.tile_k
                     )
@@ -219,8 +225,12 @@ class TensorWithIndex:
                 # (token >= row_limit) are skipped: token * topk * N can pass int32 for a large
                 # pad token and wrap back inside the buffer, past the descriptor's bounds check.
                 tok3 = self.index_frag[0, m] & 0xFFFFFF
-                tensor_sub_block = tensor_block[None, tok3, self.index_frag[0, m] >> 24]
-                if tok3 < fx.Int32(row_limit):
+                slot3 = self.index_frag[0, m] >> 24
+                tensor_sub_block = tensor_block[None, tok3, slot3]
+                keep3 = tok3 < fx.Int32(row_limit)
+                if const_expr(slot_limit is not None):
+                    keep3 = keep3 & (slot3 < fx.Int32(slot_limit))
+                if keep3:
                     for k in range_constexpr(rep_k):
                         offset_block = fx.crd2idx((0, m, k), layout).to_py_value()
                         offset_k_in_tile = offset_block // self.tile_m + self.offset_thread_k
