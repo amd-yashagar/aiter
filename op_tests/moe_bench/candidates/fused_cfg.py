@@ -150,7 +150,38 @@ def _a16w16(name):
     )
 
 
+HUGE_BOUND = 1 << 62
+
+
+def raise_bounds():
+    """Put aiter's activation-dtype switches out of reach (``GPTOSS_SWIGLU_MXFP4_BF16_BOUND``
+    for SEPARATED Swiglu, ``AITER_BF16_FP8_MOE_BOUND`` for INTERLEAVE), so a case that
+    passes bf16 activations keeps them. Returns what ``restore_bounds`` needs."""
+    import aiter.fused_moe as fm
+
+    saved = (fm._SWIGLU_MXFP4_BF16_BOUND, os.environ.get("AITER_BF16_FP8_MOE_BOUND"))
+    fm._SWIGLU_MXFP4_BF16_BOUND = HUGE_BOUND
+    os.environ["AITER_BF16_FP8_MOE_BOUND"] = str(HUGE_BOUND)
+    return saved
+
+
+def restore_bounds(saved):
+    import aiter.fused_moe as fm
+
+    fm._SWIGLU_MXFP4_BF16_BOUND, env = saved
+    if env is None:
+        os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
+    else:
+        os.environ["AITER_BF16_FP8_MOE_BOUND"] = env
+
+
 class ForcedConfig(Candidate):
+    """One forced one-row config. Where dispatch rounds the activations more than the case
+    asks for (a16w4 from M 256 gets fp4x2: ``ctx.dispatch_rounds_more``), the candidates are
+    those of the requested dtype and run with the switch out of reach, so their rows key on
+    the dtype the case passes and a16w4 kernels, not the a4w4 ones, are what is timed.
+    """
+
     source = "fused_moe"
     entry = "aiter.fused_moe.fused_moe(AITER_CONFIG_FMOE one-row)"
 
@@ -159,9 +190,17 @@ class ForcedConfig(Candidate):
         self.row = row
         self.group = group
 
+    raised = False
+    confirmed = ""
+    _saved = None
+
     def prepare(self, ctx):
         row = dict(self.row)
         a = ctx.dispatch_args
+        self.raised = bool(getattr(ctx, "dispatch_rounds_more", ""))
+        qa = ctx.S.aq if self.raised else a["q_dtype_a"]
+        if self.raised and self._saved is None:
+            self._saved = raise_bounds()
         row.update(
             gfx=ctx.dispatch_meta["gfx"],
             cu_num=ctx.dispatch_meta["cu_num"],
@@ -172,7 +211,7 @@ class ForcedConfig(Candidate):
             topk=a["topk"],
             act_type=str(a["activation"]),
             dtype=str(a["dtype"]),
-            q_dtype_a=str(a["q_dtype_a"]),
+            q_dtype_a=str(qa),
             q_dtype_w=str(a["q_dtype_w"]),
             q_type=str(a["q_type"]),
             use_g1u1=int(a["use_g1u1"]),
@@ -198,6 +237,22 @@ class ForcedConfig(Candidate):
 
     def release(self, ctx):
         unforce()
+        if self._saved is not None:
+            restore_bounds(self._saved)
+            self._saved = None
+
+    def confirm(self, args, route, S):
+        """With the switch raised: the call must have kept the case's activation dtype."""
+        if not self.raised:
+            return None
+        if not args or args.get("q_dtype_a") != S.aq:
+            got = (args or {}).get("q_dtype_a")
+            return (
+                f"activation dtype is {got}, not the case's {S.aq}: the raised bound "
+                "did not take effect"
+            )
+        self.confirmed = f"q_dtype_a={str(S.aq).split('.')[-1]} (bound raised)"
+        return None
 
     def verify(self, route):
         """None when the router used this candidate, else why not."""
@@ -301,7 +356,9 @@ class FusedCfgSource(Source):
             a["topk"],
             a["activation"],
             a["dtype"],
-            a["q_dtype_a"],
+            # dispatch rounds the activations more than requested: the candidates are the
+            # requested dtype's (the a4w4 registry is not a16w4's)
+            ctx.S.aq if getattr(ctx, "dispatch_rounds_more", "") else a["q_dtype_a"],
             a["q_dtype_w"],
             a["q_type"],
             bool(a["use_g1u1"]),

@@ -225,6 +225,7 @@ def routed_modules(S, case, cands, ctx):
             c.prepare(ctx)
             got = []
             routes.dry_route(case, S, capture=got)
+            c.release(ctx)
             found = modules_from_metadata(S, got[-1]) if got else {}
             by_key[key] = sorted(found)
             mods.update(found)

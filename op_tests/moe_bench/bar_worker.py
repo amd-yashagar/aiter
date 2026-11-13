@@ -457,7 +457,7 @@ class Measurer:
                 reason = cand.confirm(
                     rec.last()[0] if rec.records else None, route, ctx.S
                 )
-                if reason is None:
+                if reason is None and getattr(cand, "confirmed", ""):
                     emit(
                         self.fh,
                         {

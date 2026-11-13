@@ -73,10 +73,19 @@ def dispatch_args_of(S, case=None):
 def make_ctx(S, case, tmpdir, gfx, cu):
     import types
 
+    from . import accuracy
+
+    args = dispatch_args_of(S, case)
+    # where dispatch rounds the activations more than the case asks for, the bar enumerates
+    # (and the host build compiles) the requested dtype's candidates under the raised bound
+    more = accuracy.measured_rounds_more(
+        S, args.get("q_dtype_a"), S.M
+    ) or accuracy.dispatch_rounds_more(S, S.M, gfx)
     return types.SimpleNamespace(
         S=S,
         case=case,
-        dispatch_args=dispatch_args_of(S, case),
+        dispatch_args=args,
+        dispatch_rounds_more=more,
         dispatch_meta={"gfx": gfx, "cu_num": cu},
         tmpdir=tmpdir,
         enum_errors=[],
@@ -299,6 +308,7 @@ def build_slice(case, part, parts, tmpdir, indices=None, cover=True):
             one("dispatch", lambda: None)
         for c in mine:
             one(c.id, lambda c=c: c.prepare(ctx), c)
+            c.release(ctx)
         from .candidates.fused_cfg import unforce
 
         unforce()
