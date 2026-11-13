@@ -262,6 +262,13 @@ def compile_decode_down(*, N, K, TOPK, RB=2, PF=2):
     BN = WAVES * 16 * RB
     assert N % BN == 0
     STEPS = TOPK * KB
+    QW = TOPK * K // 4
+    NBLK = TOPK * KB
+
+    @fx.struct
+    class DownShared:
+        q: fx.Array[fx.Int32, QW, 16]
+        s: fx.Array[fx.Float32, NBLK, 16]
 
     @flyc.kernel
     def decode_down(
@@ -304,21 +311,44 @@ def compile_decode_down(*, N, K, TOPK, RB=2, PF=2):
             for e in experts
         ]
 
+        # The workgroup quantizes the token's TOPK intermediate rows once (aiter's
+        # per_1x128 math on the FP32 values) into LDS; 16 threads per 128 block.
+        lds = fx.SharedAllocator().allocate(DownShared)
+        q_ptr = lds.q.peek().ptr
+        qv = fx.make_view(q_ptr, fx.make_layout(QW, 1))
+        sv = fx.make_view(lds.s.peek().ptr, fx.make_layout(NBLK, 1))
+        sub = tid % 16
+        for it in range_constexpr((NBLK + 15) // 16):
+            b = it * 16 + tid // 16
+            bc = fx.arith.select(b < NBLK, b, NBLK - 1)
+            col = (bc % KB) * SCALE_BLOCK + sub * 8
+            src = (tok * TOPK + bc // KB) * K + col
+            xs = []
+            for q in range_constexpr(2):
+                v = buffer_ops.buffer_load(
+                    a_rsrc, src + q * 4, vec_width=4, dtype=fx.Int32
+                )
+                f = Vec(v).bitcast(fx.Float32)
+                xs += [f[i] for i in range_constexpr(4)]
+            amax = fx.Float32(1e-10)
+            for x in xs:
+                amax = amax.maximumf(fx.absf(x))
+            for sh in range_constexpr(4):
+                amax = amax.maximumf(amax.shuffle_xor(fx.Int32(1 << sh), fx.Int32(64)))
+            sa_b = amax * fx.Float32(1.0 / FP8_MAX)
+            words = _quant_words(xs, fx.Float32(1.0) / sa_b)
+            if b < NBLK:
+                dst = ((bc // KB) * K + col) // 4
+                qv[dst] = words[0]
+                qv[dst + 1] = words[1]
+                if sub == 0:
+                    sv[bc] = sa_b
+        gpu.barrier()
+
         def load_step(st):
             j, kb = st // KB, st % KB
-            r = tok * TOPK + j
             e = experts[j]
             k1_0 = kb * (SCALE_BLOCK // 16)
-            av = [
-                buffer_ops.buffer_load(
-                    a_rsrc,
-                    r * K + (k1_0 + c * 4 + g) * 16 + q * 4,
-                    vec_width=4,
-                    dtype=fx.Int32,
-                )
-                for c in range_constexpr(2)
-                for q in range_constexpr(4)
-            ]
             wv = [
                 [
                     buffer_ops.buffer_load(
@@ -333,7 +363,7 @@ def compile_decode_down(*, N, K, TOPK, RB=2, PF=2):
                 for rb in range_constexpr(RB)
             ]
             sb = fx.Int32(_sload(ws_rsrc, (e * NB + nb) * KB + kb)).bitcast(fx.Float32)
-            return av, wv, sb
+            return wv, sb
 
         out = [Vec.filled(4, 0.0, fx.Float32) for _ in range(RB)]
         route = [Vec.filled(4, 0.0, fx.Float32) for _ in range(RB)]
@@ -341,22 +371,15 @@ def compile_decode_down(*, N, K, TOPK, RB=2, PF=2):
         for st in range_constexpr(STEPS):
             if const_expr(st + PF < STEPS):
                 pending.append(load_step(st + PF))
-            av, wv, sb = pending.pop(0)
-            xs = []
-            for v in av:
-                f = Vec(v).bitcast(fx.Float32)
-                xs += [f[i] for i in range_constexpr(4)]
-            amax = fx.Float32(1e-10)
-            for x in xs:
-                amax = amax.maximumf(fx.absf(x))
-            for sh in range_constexpr(2):
-                amax = amax.maximumf(amax.shuffle_xor(fx.Int32(16 << sh), fx.Int32(64)))
-            sa = amax * fx.Float32(1.0 / FP8_MAX)
-            inv = fx.Float32(1.0) / sa
-            a_ops = [
-                _i64_pair(_quant_words(xs[c * 16 : c * 16 + 16], inv))
-                for c in range_constexpr(2)
-            ]
+            wv, sb = pending.pop(0)
+            j, kb = st // KB, st % KB
+            k1_0 = kb * (SCALE_BLOCK // 16)
+            a_ops = []
+            for c in range_constexpr(2):
+                w4 = fxh.atom_tensor(q_ptr, (j * K + (k1_0 + c * 4 + g) * 16) // 4, 128)
+                a = Vec(w4.load())
+                a_ops.append(_i64_pair([a[i] for i in range_constexpr(4)]))
+            sa = fx.Float32(sv[j * KB + kb])
             s = Vec.filled(4, sa * sb, fx.Float32)
             for rb in range_constexpr(RB):
                 part = Vec.filled(4, 0.0, fx.Float32)
@@ -366,7 +389,6 @@ def compile_decode_down(*, N, K, TOPK, RB=2, PF=2):
                     part = _mfma(w1, a_ops[c][1], part)
                 route[rb] = fx.fma(Vec(part), s, route[rb])
             if const_expr(st % KB == KB - 1):
-                j = st // KB
                 wt = fx.Int32(_sload(tw_rsrc, tok * TOPK + j)).bitcast(fx.Float32)
                 wvec = Vec.filled(4, wt, fx.Float32)
                 for rb in range_constexpr(RB):
