@@ -1,5 +1,4 @@
 family,model_dim,inter_dim,experts,topk,act,doweight_stage1,m_min,m_max,kernel,config,verified,note
-fp8-token,*,*,2048,*,*,*,0,2147483648,aiter,,harness 828341869 tier1 acb14acf1,prefill slower than dispatch at E2048
 fp8-token,4096,128,513,11,silu,0,17,20,gfx942_fp8_token.mid,m16,gate:dell300x-gate6-2660e606a-50ef6bc76,Qwen3.5-397B: M 17 warm -5.2% / cold -37.5%; M 20 -5.3% / -38.7%
 fp8-token,4096,128,513,11,silu,0,21,24,gfx942_fp8_token.mid,m32gw2,gate:dell300x-gate6-2660e606a-50ef6bc76,Qwen3.5-397B: M 21 -4.6% / -38.0%; M 24 -5.6% / -36.6%
 fp8-token,4096,128,513,11,silu,0,25,64,gfx942_fp8_token.mid,m32nbd2,gate:dell300x-gate6-2660e606a-50ef6bc76,Qwen3.5-397B: M 25 -4.5% / -35.3%; M 64 -9.6% / -28.9%
@@ -12,17 +11,28 @@ fp8-token,4096,192,128,8,silu,0,16,320,gfx942_fp8_token.mid_atomic,m32gw2,gate:d
 fp8-token,4096,192,128,8,silu,0,897,960,gfx942_fp8_token.mid,m64nbd2,gate:dell300x-gate6-2660e606a-50ef6bc76,Qwen3-235B: M 897 -1.8% / -14.0%; M 960 -0.4% / -10.1% (M 1024 +1.3% warm: aiter)
 fp8-tensor,4096,192,192,8,silu,0,33,639,gfx942_fp8_tensor.mid_atomic,m32gw2,gate:dell300x-gatehy-2660e606a-50ef6bc76,Hunyuan3 per-tensor: M 33/256/384/639 0.56-0.81x warm and cold vs the safe fixed-CK bar; target internal/aiter-moe/results/dell300x-hunyuan3-tensor-fixedck-bars-safe-gfx942.csv (GM-123-BENCH-325)
 fp8-tensor,4096,192,192,8,silu,0,640,2048,gfx942_fp8_tensor.mid,m64nbd2,gate:dell300x-gatehy-2660e606a-50ef6bc76,Hunyuan3 per-tensor: M 640/1024/2048 0.59-0.76x warm and cold vs the safe fixed-CK bar; target internal/aiter-moe/results/dell300x-hunyuan3-tensor-fixedck-bars-safe-gfx942.csv (GM-123-BENCH-325)
-fp8-token,4096,128,513,11,silu,0,0,16,gfx942_fp8_token.decode,,harness 946a02adc xover vs mid c30b8f19d,Qwen3.5-397B: decode beats mid warm and cold at M 8/12/16 (M=16 cold 72.0 vs 77.9 us); mid from 17
-fp8-token,6144,384,129,5,swiglu,0,0,9,gfx942_fp8_token.decode,,harness 946a02adc xover vs mid c30b8f19d + routing variants,"MiniMax-M3 E129: decode beats mid at M=8 (cold 68.8 vs 77.6 us) and dispatch on uniform, hot1 and zipf routing at M 4-9"
-fp8-token,6144,384,129,5,swiglu,0,10,15,aiter,,harness 946a02adc routing variants,"MiniMax-M3 E129: zipf routing is faster on dispatch warm from M=10 (44.4 vs 43.9 us at M=10, 1.47x at M=15)"
-fp8-token,6144,384,128,4,swiglu,0,0,12,gfx942_fp8_token.decode,,harness 946a02adc routing variants,"MiniMax-M3 E128: decode beats dispatch on uniform, hot1 and zipf routing at M 1-12, warm and cold"
-fp8-token,6144,384,128,4,swiglu,0,13,16,aiter,,harness 946a02adc routing variants,MiniMax-M3 E128: zipf routing is faster on dispatch warm from M=13 (47.6 vs 44.1 us); uniform and hot1 at M=16
-fp8-token,4096,192,128,8,silu,0,0,15,gfx942_fp8_token.decode,,harness 946a02adc xover vs mid c30b8f19d,"Qwen3-235B: decode beats mid at M=8 (cold 41.7 vs 50.0 us), ties at 12; mid from 16"
-fp8-token,*,*,*,*,*,*,0,16,gfx942_fp8_token.decode,,harness 946a02adc gate d30ed2ad5,decode: at or below the 946a02adc bar warm and cold where dispatch passes accuracy; beats a dispatch that fails accuracy (MOEBUG-022) on Qwen3.5
-fp8-token,6144,384,129,5,swiglu,0,3328,2147483648,gfx942_fp8_token.prefill,,harness 2660e606a bar + routing variants,"MiniMax-M3 E129: prefill at or below the bar (0.91-0.98x) and faster than dispatch on hot1 and zipf (0.78-0.89x) at M 3328, 3584, 4095, 4096, 6144; loses the bar at 3072"
-fp8-token,4096,128,513,11,silu,0,4096,6143,aiter,,harness 972db4e11 routing variants,Qwen3.5-397B: prefill loses to dispatch warm under zipf routing at M=4096 (486 vs 432 us); every variant wins at M=6144
-fp8-token,4096,192,128,8,silu,0,4096,2147483648,aiter,,harness 972db4e11 bar + routing variants,Qwen3-235B: prefill loses to the bar at M=4096 (527 vs 507 us warm) and to dispatch under zipf at M 4096 and 6144
-fp8-token,*,*,*,*,*,*,4096,2147483648,gfx942_fp8_token.prefill,,harness 828341869 tier1 acb14acf1,prefill: faster than dispatch and the M=4096 bars
-fp8-tensor,4096,192,192,8,silu,0,17,32,gfx942_fp8_token.decode,,harness 946a02adc dvn,"REVIEW: Hunyuan3 per-tensor; aiter fails accuracy (MOEBUG-021, logits_diff 0.93); decode passes and beats it warm and cold (M=32 warm tie)"
-fp8-tensor,*,*,*,*,*,*,0,16,gfx942_fp8_token.decode,,harness 946a02adc gate d30ed2ad5,decode serves per-tensor too
-fp8-tensor,*,*,*,*,*,*,4096,2147483648,gfx942_fp8_tensor.prefill,,harness 828341869 tier1 acb14acf1,per-tensor prefill
+fp8-tensor,4096,192,192,8,silu,0,0,12,gfx942_fp8_token.decode,,"harness 42d7b4279 vs dispatch; fixed-CK safe bar (dell bench, 42f45cad4)","REVIEW Hunyuan3 per-tensor: unfixed dispatch fails accuracy (MOEBUG-021), decode beats it on every variant; vs the fixed-CK safe bar (dell bench, 42f45cad4): loses at M=1 (1.04-1.23x, all variants) and zipf at M=16; faster than mid_atomic through M=12"
+fp8-tensor,4096,192,192,8,silu,0,13,32,gfx942_fp8_tensor.mid_atomic,m32gw2,"harness 42d7b4279 vs dispatch; fixed-CK safe bar (dell bench, 42f45cad4)","REVIEW Hunyuan3 per-tensor: beats failing dispatch (0.47-0.71x); faster than decode at M=16 (crossover M 13-15); vs the fixed-CK safe bar (dell bench, 42f45cad4): wins uniform/hot1, loses zipf warm at M16 1.13x, M17 1.075x, M24 1.014x"
+fp8-tensor,4096,192,192,8,silu,0,2049,6144,gfx942_fp8_tensor.mid,m64nbd2,"harness 186be311c/42d7b4279; fixed-CK safe bar (dell bench, 42f45cad4)","Hunyuan3 per-tensor: no worse than the fixed-CK safe bar (dell bench, 42f45cad4) on every variant, warm and cold, 0.69-0.97x (cross-run); target M2049 458.6/485.9, M4095 787.7/792.0, M6144 1012.5/1038.2 us uniform warm/cold"
+fp8-tensor,4096,192,192,8,silu,0,6145,2147483648,gfx942_fp8_tensor.mid,m64nbd2,"harness 42d7b4279; fixed-CK safe bar (dell bench, 42f45cad4)","REVIEW Hunyuan3 per-tensor: fastest correct path (0.75-0.77x of gfx942_fp8_tensor.prefill, beats failing dispatch); loses the fixed-CK safe bar (dell bench, 42f45cad4) from M=8192 (uniform 1.02x, zipf 1.11x) to M=16384 (1.16-1.44x)"
+fp8-token,4096,128,513,11,silu,0,0,16,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,"Qwen3.5-397B: REVIEW, beats a dispatch that fails accuracy (MOEBUG-022) on every variant"
+fp8-token,2048,128,257,9,silu,0,0,16,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,"Qwen3.5-35B: REVIEW, beats a dispatch that fails accuracy (MOEBUG-022) on every variant"
+fp8-token,2560,192,513,11,silu,0,0,16,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,Qwen3.8: wins every variant at M 1 and 16
+fp8-token,4096,192,192,8,silu,0,0,16,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,Hunyuan3 (per-tensor-as-per-token layout measured): wins every variant at M 1 and 16
+fp8-token,6144,384,128,4,swiglu,0,0,12,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,MiniMax-M3 E128: zipf loses warm from M=13
+fp8-token,6144,384,129,5,swiglu,0,0,9,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,MiniMax-M3 E129: zipf loses warm from M=10; mid from 16
+fp8-token,4096,192,128,8,silu,0,0,15,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,Qwen3-235B: wins every variant to M=15; mid from 16
+fp8-token,6144,256,257,9,silu,0,0,8,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,GLM-5: zipf loses warm at M=12 (1.36x)
+fp8-token,7168,256,257,9,silu,0,0,8,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,DeepSeek-V3: zipf loses warm at M=12 (1.37x)
+fp8-tensor,7168,256,257,9,silu,0,0,8,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,DeepSeek-V3 per-tensor: zipf loses warm at M=12 (1.25x)
+fp8-tensor,7168,256,256,8,silu,0,0,8,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,DeepSeek-V3 per-tensor E256 (vllm E-scale layout measured): zipf loses warm at M=12 (1.16x)
+fp8-token,6144,384,129,5,swiglu,0,3328,2147483648,gfx942_fp8_token.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,MiniMax-M3 E129: bar and every variant from M=3328
+fp8-token,4096,128,513,11,silu,0,6144,2147483648,gfx942_fp8_token.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,Qwen3.5-397B: zipf loses to dispatch below M=6144
+fp8-token,6144,384,128,4,swiglu,0,4096,2147483648,gfx942_fp8_token.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,MiniMax-M3 E128: every variant at M 4096-16384
+fp8-token,5120,384,161,9,silu,0,16384,2147483648,gfx942_fp8_token.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,zipf loses to dispatch below M=16384
+fp8-token,6144,256,257,9,silu,0,16384,2147483648,gfx942_fp8_token.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,GLM-5: zipf loses to dispatch below M=16384
+fp8-token,7168,256,257,9,silu,0,16384,2147483648,gfx942_fp8_token.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,DeepSeek-V3: zipf loses to dispatch below M=16384
+fp8-tensor,2560,320,513,11,silu,0,4096,2147483648,gfx942_fp8_tensor.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,every variant at M 4096-16384
+fp8-tensor,7168,256,256,8,silu,0,4096,2147483648,gfx942_fp8_tensor.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,DeepSeek-V3 per-tensor E256: every variant at M 4096-16384
+fp8-tensor,7168,256,257,9,silu,0,4096,2147483648,gfx942_fp8_tensor.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,DeepSeek-V3 per-tensor: every variant at M 4096-16384
+fp8-tensor,1024,384,1,1,silu,0,16384,2147483648,gfx942_fp8_tensor.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,hot1/zipf lose to dispatch below M=16384
