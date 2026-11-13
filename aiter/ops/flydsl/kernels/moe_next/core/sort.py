@@ -416,21 +416,21 @@ def _write_tile_table(hist, start, local, tile_e, seid_it, live_it, total, tid, 
 POISON_ID = 0x7FFFFFFF  # slot 127, token 0xFFFFFF: past any real route
 
 
-def _pad_arg(pad, sids_it, sw_it, topk, tokens, on):
+def _pad_arg(pad, sids_it, sw_it, topk, capacity, on):
     """The _expert_scan ``pad`` argument for a pad mode (None: no stores)."""
     if pad == "none":
         return None
-    sentinel, weight = _pad_values(pad, topk, tokens)
+    sentinel, weight = _pad_values(pad, topk, capacity)
     return (sids_it, sw_it, sentinel, weight, on)
 
 
-def _pad_values(pad, topk, tokens):
+def _pad_values(pad, topk, capacity):
     """(id, weight) the padding rows get: aiter's sentinel and 0, or under
     ``pad == "poison"`` (pad_rows=False with AITER_MOE_DEBUG) an id past every
     token and slot and a NaN weight, so a consumer reading them is caught."""
     if pad == "poison":
         return fx.Int32(POISON_ID), fx.Float32(float("nan"))
-    return (fx.Int32(topk) << fx.Int32(24)) | tokens, fx.Float32(0.0)
+    return (fx.Int32(topk) << fx.Int32(24)) | capacity, fx.Float32(0.0)
 
 
 @flyc.jit
@@ -664,6 +664,7 @@ def _oneshot_body(
     live_it,
     nlive_it,
     tokens,
+    m_cap,
     num_experts,
     topk,
     tile_m,
@@ -722,7 +723,7 @@ def _oneshot_body(
         tile_m,
         ept,
         has_mask,
-        _pad_arg(pad, sids_it, sw_it, topk, tokens, fx.Boolean(True)),
+        _pad_arg(pad, sids_it, sw_it, topk, m_cap, fx.Boolean(True)),
         tile_e,
     )
     _write_meta(nv_it, nlive_it, tid, tokens, total, tile_m)
@@ -955,6 +956,7 @@ def build(
                 _it(live_tiles),
                 _it(num_live),
                 tokens,
+                m_cap,
                 E,
                 topk,
                 tile_m,
@@ -1132,7 +1134,7 @@ def build(
                 ept,
                 has_mask,
                 # each thread's experts are padded by workgroup tid % n_chunks
-                _pad_arg(pad, _it(sorted_ids), _it(sorted_w), topk, tokens, pad_mine),
+                _pad_arg(pad, _it(sorted_ids), _it(sorted_w), topk, m_cap, pad_mine),
             )
             if bid == c0:
                 _write_meta(_it(num_valid), _it(num_live), tid, tokens, total, tile_m)

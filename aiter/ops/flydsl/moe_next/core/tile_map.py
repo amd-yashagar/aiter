@@ -28,12 +28,17 @@ def _arch() -> str:
 def oneshot_max_routes(num_experts: int) -> int:
     """Routes up to which the one-workgroup sort beats the two-launch one, per
     arch and E (both zero-filling). gfx942 (MI300X, core e8e07a4c6): break-even
-    near 2200 routes at E = 128, 1550 at E = 256, 1100 at E >= 385. Other
-    archs keep 3072 / 2560 until measured (crossover_sweep in the vault)."""
-    if _arch() == "gfx942":
+    near 2200 routes at E = 128, 1550 at E = 256, 1100 at E >= 385. gfx950
+    (MI355X, smci355 sweep on 7a1eba59c): one-shot wins to 2560 routes at
+    E <= 256 (ties at 3072 at E <= 128), crossovers near 1000-1100 at E >= 385.
+    Other archs keep 3072 / 2560 until measured (crossover_sweep in the vault)."""
+    arch = _arch()
+    if arch == "gfx942":
         if num_experts <= 128:
             return 2048
         return 1536 if num_experts <= 256 else 1024
+    if arch == "gfx950":
+        return 2560 if num_experts <= 256 else 1024
     return ONESHOT_MAX_ROUTES if num_experts <= 256 else 2560
 
 
@@ -187,6 +192,10 @@ def route_to_tiles(
 ) -> TileMap:
     """Sort routes into tiles of ``tile_m`` rows and zero ``zero_output``'s rows
     below the token count (``num_local_tokens`` when given), as aiter's sort does.
+    Padding rows carry the sentinel ``(topk << 24) | M`` with M the capacity
+    (rows of ``topk_ids``), also under ``num_local_tokens``, so a consumer that
+    bounds tokens by M or by the local count skips them (aiter's Opus sort
+    writes the local count there instead, MOEBUG-062).
 
     ``num_experts`` is the global expert count (the size of ``expert_mask``
     under EP). ``zero_output`` is the output an atomic epilogue accumulates
@@ -417,7 +426,10 @@ def reference_tile_map(
     num_local_tokens=None,
     zero_output=None,
 ) -> TileMap:
-    """aiter's Opus sort, with the live-tile list derived on the device."""
+    """aiter's Opus sort, with the live-tile list derived on the device. Its
+    padding rows' token field is set to the capacity M, as core writes it:
+    under num_local_tokens Opus writes the local count there (MOEBUG-062),
+    an id below M that consumers bounding tokens by M take for a real one."""
     from aiter import dtypes
     from aiter.fused_moe import _moe_sorting_impl
 
@@ -437,6 +449,9 @@ def reference_tile_map(
         accumulate=zero_output is not None,
         output=zero_output,
     )
+    if num_local_tokens is not None:
+        pad = (sids >> 24) >= topk
+        sids = torch.where(pad, (sids & ~0xFFFFFF) | topk_ids.shape[0], sids)
     tiles = seids.numel()
     t = torch.arange(tiles, device=topk_ids.device, dtype=torch.int32)
     real = (sids.view(tiles, tile_m) >> 24) < topk
