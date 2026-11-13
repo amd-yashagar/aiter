@@ -6147,6 +6147,17 @@ def get_2stage_cfgs(
             quant_type=q_type,
             use_non_temporal_load=use_non_temporal_load,
         )
+    # The per-token asm stage-1 kernels consume model_dim in blocks of 128; any other size
+    # returns wrong results (logits diff 0.01 to 0.03) with no error.
+    if (
+        q_type in (QuantType.per_Token, QuantType.per_Tensor)
+        and q_dtype_w in (dtypes.i8, dtypes.fp8)
+        and model_dim % 128 != 0
+    ):
+        raise NotImplementedError(
+            f"asm 2-stage stage 1 for {q_dtype_w} {q_type.name} MoE needs "
+            f"model_dim % 128 == 0 (got model_dim={model_dim})"
+        )
     return MOEMetadata(
         functools.partial(
             asm_stage1,
