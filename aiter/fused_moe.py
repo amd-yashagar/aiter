@@ -5071,8 +5071,11 @@ def get_2stage_cfgs(
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
     is_cktile1 = isinstance(kernelName1, str) and kernelName1.startswith("cktile_")
     is_asm1 = isinstance(kernelName1, str) and kernelName1.startswith("_ZN5aiter")
-    if is_opus1 or is_flydsl1 or is_flydsl2:
-        if not (is_opus1 or is_flydsl1) and (is_flydsl2_layout or is_opus2):
+    # The "layout" opus stage 2 reads the quantized intermediate and scales that its
+    # paired opus or FlyDSL stage 1 writes; the plain one takes any bf16 stage 1.
+    is_opus2_layout = is_opus2 and "layout" in kernelName2
+    if is_opus1 or is_flydsl1 or is_flydsl2 or (is_cktile1 and is_opus2):
+        if not (is_opus1 or is_flydsl1) and (is_flydsl2_layout or is_opus2_layout):
             raise NotImplementedError(
                 f"Stage 1 {kernelName1!r} cannot feed the layout stage 2 "
                 f"{kernelName2!r}: layout stage 2 kernels read the quantized "
