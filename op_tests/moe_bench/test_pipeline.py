@@ -101,8 +101,14 @@ def test_covering_pairs_compile_every_stage_kernel_once_not_the_product():
             id=f"{g}|{a}|{b}", group=g, kernels="flydsl_x", meta={"s1": a, "s2": b}
         )
 
-    cands = [pair("pair-bm32", f"a{i}", f"b{j}") for i in range(6) for j in range(11)]
-    cands += [pair("pair-bm64", f"a{i}", f"b{j}") for i in range(3) for j in range(4)]
+    def s1(i):
+        return f"flydsl_moe1_afp8_wfp4_bf16_t32x{32 * (i + 1)}x256_w2"
+
+    def s2(j):
+        return f"flydsl_moe2_afp8_wfp4_bf16_t16x128x{128 * (j + 1)}_atomic"
+
+    cands = [pair("pair-bm32", s1(i), s2(j)) for i in range(6) for j in range(11)]
+    cands += [pair("pair-bm64", s1(i), s2(j)) for i in range(3) for j in range(4)]
     single = types.SimpleNamespace(
         id="g", group="whole-graph", kernels="impl__flydsl", meta={}
     )
@@ -110,7 +116,10 @@ def test_covering_pairs_compile_every_stage_kernel_once_not_the_product():
     bm32 = [c for c in keep if c.group == "pair-bm32"]
     bm64 = [c for c in keep if c.group == "pair-bm64"]
     assert single in keep
-    assert len(bm32) == 11 and len(bm64) == 4  # max(n1, n2), not 66 and 12
+    # every stage kernel once (one partner class here): n1 + n2 - 1 pairs, not 66 and 12
+    assert len(bm32) == 6 + 11 - 1 and len(bm64) == 3 + 4 - 1
     for lst, n1, n2 in ((bm32, 6, 11), (bm64, 3, 4)):
         assert len({c.meta["s1"] for c in lst}) == n1
         assert len({c.meta["s2"] for c in lst}) == n2
+    covered = {e for c in keep for e in fp.elements(c)}
+    assert fp.uncovered(cands, covered) == []

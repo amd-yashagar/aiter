@@ -222,6 +222,46 @@ def drop_build_failed(fh, case_id, source, mode, cands):
     return keep
 
 
+def drop_aot_uncovered(fh, case_id, source, mode, cands):
+    """In a run-only lease: candidates whose FlyDSL artifacts the host build's cover does
+    not contain are reported ``aot-missing`` (a harness error that makes the bar
+    incomplete) instead of failing one by one inside the lease. Returns (kept, n)."""
+    if source != "fused_moe" or not (
+        os.environ.get("FLYDSL_RUNTIME_RUN_ONLY") == "1"
+        or os.environ.get("MOE_BENCH_NO_BUILD") == "1"
+    ):
+        return cands, 0
+    from . import prebuild
+    from .flydsl_prebuild import elements, is_flydsl
+
+    entry = prebuild.read_manifest().get(case_id)
+    if not entry or "covered" not in entry:
+        return cands, 0
+    covered = set(entry["covered"])
+    keep, n = [], 0
+    for x in cands:
+        if is_flydsl(x) and any(e not in covered for e in elements(x)):
+            n += 1
+            emit(
+                fh,
+                {
+                    "event": "cand",
+                    "case_id": case_id,
+                    "cand_id": x.id,
+                    "source": source,
+                    "kernels": x.kernels or "",
+                    "phase": "enumerate",
+                    "mode": mode,
+                    "status": "aot-missing",
+                    "detail": "no usable AOT cache: the host build's cover lacks "
+                    "this candidate's FlyDSL artifact",
+                },
+            )
+        else:
+            keep.append(x)
+    return keep, n
+
+
 def not_prebuilt_row(md_name):
     """(status, detail, outcome) of a candidate that reached a module not built beforehand.
 
@@ -549,6 +589,12 @@ class Measurer:
             if md:
                 status, detail, res["outcome"] = not_prebuilt_row(md)
                 self._emit(base, modes, status=status, detail=detail)
+                return res
+            if "no usable AOT cache" in str(e):
+                # a FlyDSL kernel the host build did not cover: a harness error, never a
+                # quiet drop (the bar is incomplete and says so)
+                res["outcome"] = "aotmiss"
+                self._emit(base, modes, status="aot-missing", detail=_err(e))
                 return res
             status = "unsupported" if isinstance(e, NotImplementedError) else "error"
             msg = _err(e)
@@ -906,6 +952,11 @@ def run_bar_group(cases, spec, fh):
                 )
                 continue
             cands = drop_build_failed(fh, c.id, src.name, modes[0], cands)
+            cands, n_aot = drop_aot_uncovered(fh, c.id, src.name, modes[0], cands)
+            if n_aot:
+                enum_errors.append(
+                    f"{n_aot} {src.name} candidates not in the host build's FlyDSL cover"
+                )
             for name1, bm, npairs, why in (
                 getattr(ctx, "unsupported", None) or ()
                 if src.name == "fused_moe"
@@ -1101,6 +1152,11 @@ def _accounting(enum_counts, stats, enum_errors, kind):
             reasons.append(
                 f"{k}: {t['unnamed']} candidates resolved to an unnamed impl "
                 "('<lambda>'), the router check cannot tell what ran"
+            )
+        if t.get("aotmiss", 0) > 0:
+            reasons.append(
+                f"{k}: {t['aotmiss']} candidates hit no usable AOT cache (FlyDSL not "
+                "prebuilt): a harness error, the bar misses them"
             )
         if (
             t.get("enumerated", 0) > 0

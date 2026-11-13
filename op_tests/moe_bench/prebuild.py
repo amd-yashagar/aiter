@@ -990,7 +990,7 @@ def read_manifest():
 
 # manifest entries written before a candidate's forced row was checked against the route
 # aiter took (padded-M lookup, see flydsl_prebuild.dispatch_args_of) may cover nothing
-FORCED_VERIFIED = 2
+FORCED_VERIFIED = 3
 
 
 def flydsl_covered(entry):
@@ -1000,6 +1000,9 @@ def flydsl_covered(entry):
         entry
         and entry.get("forced_verified") == FORCED_VERIFIED
         and (entry.get("built", 0) > 0 or entry.get("candidates", 0) == 0)
+        # the run-only check of candidates the cover did not build found them all
+        and entry.get("n_misses", 1) == 0
+        and (entry.get("verify_tried", 0) > 0 or entry.get("verify_pool", 1) == 0)
     )
 
 
@@ -1042,6 +1045,7 @@ def run_flydsl_prebuild(
     cases_csv=None,
     timeout=6 * 3600,
     arch=None,
+    verify=80,
 ):
     """Host-compile the FlyDSL candidates of ``cases`` with no GPU, ``procs`` at a time.
 
@@ -1054,8 +1058,9 @@ def run_flydsl_prebuild(
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
     from . import runner, schema, workload
-    from .flydsl_prebuild import enumerate_flydsl
+    from .flydsl_prebuild import elements, enumerate_flydsl
 
+    covered_by_case = {}
     tmpdir = tmpdir or os.environ.get("TMPDIR") or "/tmp"
     os.makedirs(flydsl_cache_dir(), exist_ok=True)
     gfx, cu = get_gfx(), get_cu_num()
@@ -1080,6 +1085,7 @@ def run_flydsl_prebuild(
         if cands:
             parts = max(1, -(-len(cands) // per_proc))
             plan_.append((c, len(cands), parts))
+            covered_by_case[c.id] = sorted({e for x in cands for e in elements(x)})
     log(
         f"flydsl prebuild: {len(plan_)} cases with FlyDSL candidates, "
         f"{sum(n for _, n, _ in plan_)} candidates, {sum(p for _, _, p in plan_)} slices, "
@@ -1098,7 +1104,10 @@ def run_flydsl_prebuild(
     tasks = [(c, i, parts) for c, _, parts in plan_ for i in range(parts)]
     started, ended, rows = {}, {}, {}
 
-    def child(c, part, extra):
+    def child(c, part, extra, run_only=False):
+        env = _child_env(1, tree, shim, flydsl=True)
+        if run_only:
+            env["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
         p = subprocess.run(
             [
                 sys.executable,
@@ -1114,7 +1123,7 @@ def run_flydsl_prebuild(
                 tmpdir,
                 *extra,
             ],
-            env=_child_env(1, tree, shim, flydsl=True),
+            env=env,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -1157,9 +1166,32 @@ def run_flydsl_prebuild(
                 r["built"] += res["built"]
                 r["failed"] += res["failed"]
                 r["child_seconds"] += res["seconds"]
+    verified = {}
+    if verify:
+
+        def check(c):
+            res, err = child(c, "0/1", ["--verify", str(verify)], run_only=True)
+            return c.id, res, err
+
+        with ThreadPoolExecutor(max_workers=procs) as pool:
+            for cid, res, err in pool.map(check, [c for c, _, _ in plan_]):
+                verified[cid] = res or {
+                    "verify_tried": 0,
+                    "verify_pool": 1,
+                    "n_misses": 1,
+                    "misses": [["verify", f"child failed: {err}"]],
+                }
     manifest = read_manifest()
     for c, n, _ in plan_:
         r = rows.get(c.id, {"built": 0, "failed": [], "child_seconds": 0.0})
+        v = verified.get(c.id, {})
+        r.update(
+            covered=covered_by_case.get(c.id, []),
+            verify_tried=v.get("verify_tried", 0),
+            verify_pool=v.get("verify_pool", 0),
+            n_misses=v.get("n_misses", 0),
+            misses=v.get("misses", []),
+        )
         r.update(
             candidates=n,
             wall_seconds=round(ended.get(c.id, 0) - started.get(c.id, 0), 1),
@@ -1170,8 +1202,11 @@ def run_flydsl_prebuild(
         log(
             f"flydsl prebuild: {c.id}: {n} candidates, {r['built']} compiled, "
             f"{len(r['failed'])} could not, {r['child_seconds']:.0f} CPU-s, "
-            f"{r['wall_seconds']:.0f}s wall"
+            f"{r['wall_seconds']:.0f}s wall; run-only check {r['verify_tried']}/"
+            f"{r['verify_pool']} uncovered candidates, {r['n_misses']} missed"
         )
+        for cid, err in r["misses"][:5]:
+            log(f"flydsl prebuild:   MISS {cid}: {err[:160]}")
     with open(manifest_path(), "w") as f:
         json.dump(manifest, f, indent=1)
     return {c.id: manifest[c.id] for c, _, _ in plan_}

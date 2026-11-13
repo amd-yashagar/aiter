@@ -20,6 +20,7 @@ Children are started by ``prebuild.run_flydsl_prebuild``:
 import argparse
 import json
 import os
+import re
 import sys
 import time
 
@@ -82,48 +83,118 @@ def make_ctx(S, case, tmpdir, gfx, cu):
     )
 
 
-def enumerate_flydsl(S, case, tmpdir, gfx, cu):
+def enumerate_flydsl(S, case, tmpdir, gfx, cu, cover=True):
     """The FlyDSL candidates to compile for ``case`` (no GPU needed): the bar's FlyDSL
-    singles plus a covering set of its stage pairs (``covering_pairs``)."""
+    singles plus a covering set of its stage pairs (``covering_pairs``), or every FlyDSL
+    candidate with ``cover=False`` (what a lease may try)."""
     from .candidates.fused_cfg import FusedCfgSource
 
     ctx = make_ctx(S, case, tmpdir, gfx, cu)
-    cands = FusedCfgSource().enumerate(ctx)
-    return ctx, covering_pairs([c for c in cands if is_flydsl(c)])
+    cands = [c for c in FusedCfgSource().enumerate(ctx) if is_flydsl(c)]
+    return ctx, covering_pairs(cands) if cover else cands
+
+
+def _family(name):
+    return re.split(r"_t\d+x\d+x\d+", name or "")[0]
+
+
+def stage2_class(name):
+    """What of a stage-2 kernel changes the stage-1 launch beside stage 1's own name: the
+    v2 layout epilogue (scatter writes the aux sort output; its input dtype sets stage 1's
+    output dtype) and the sort block of the sbm variants."""
+    from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+
+    v2 = parse_flydsl_v2_gemm2_kernel(name)
+    if v2:
+        return f"v2:{v2['a_dtype']}:{v2['epilog']}:{v2['sort_block_m']}:{v2['spart']}"
+    sbm = re.search(r"_sbm(\d+)", name or "")
+    return f"{_family(name)}:{sbm.group(1) if sbm else ''}"
+
+
+def stage1_class(name):
+    """What of a stage-1 kernel changes the stage-2 launch beside stage 2's own name: the
+    quantization fused into stage 1 decides whether stage 2 reads scales and which dtype.
+    """
+    tail = (name or "").split("_t")[-1]
+    fuse = "fp4" if "_fp4" in tail else "fp8" if "_fp8" in tail else ""
+    return f"{_family(name)}:{fuse}"
+
+
+def elements(c):
+    """The artifacts a candidate launches, as keys: each stage kernel with the class of
+    its partner (a stage's artifact key follows its partner's class, not its tile), or
+    the candidate itself for a single."""
+    m = getattr(c, "meta", None) or {}
+    if c.group.startswith("pair-") and "s1" in m:
+        return (
+            f"1|{c.group}|{m['s1']}|{stage2_class(m['s2'])}",
+            f"2|{c.group}|{m['s2']}|{stage1_class(m['s1'])}",
+        )
+    return (f"single|{c.id}",)
 
 
 def covering_pairs(cands):
-    """Candidates to compile so every stage kernel is compiled at least once.
+    """Candidates to compile so every artifact any candidate launches exists.
 
     Pair candidates are the product of stage-1 and stage-2 kernels per block_m group (55k
-    for one a4w4 case), but a stage's artifact does not depend on its partner: its key is
-    that stage's own lowered code and config. So a smallest cover of the stage-1 and stage-2
-    kernels (about max(n1, n2) pairs per group) fills the cache for every pair and every
-    pair the bar's marginal screening will time. Singles (1-stage, whole-graph) are all kept.
+    for one a4w4 case); a stage's artifact does not depend on its partner's tile but does on
+    its class (``stage2_class``, ``stage1_class``): the same stage-1 kernel is a different
+    artifact next to a layout stage 2 than next to an atomic one. So the cover has one pair
+    for every (stage 1, partner class) and every (stage 2, partner class). Singles
+    (1-stage, whole-graph) are all kept.
     """
-    pairs = [c for c in cands if c.group.startswith("pair-")]
     keep = [c for c in cands if not c.group.startswith("pair-")]
-    by_group = {}
-    for c in pairs:
-        by_group.setdefault(c.group, []).append(c)
-    for lst in by_group.values():
-        by_s1 = {}
-        for c in lst:
-            by_s1.setdefault(c.meta["s1"], []).append(c)
-        need1 = set(by_s1)
-        need2 = {c.meta["s2"] for c in lst}
-        while need1 or need2:
-            best, gain = None, -1
-            for c in lst:
-                g = (c.meta["s1"] in need1) + (c.meta["s2"] in need2)
-                if g > gain:
-                    best, gain = c, g
-                    if g == 2:
-                        break
-            keep.append(best)
-            need1.discard(best.meta["s1"])
-            need2.discard(best.meta["s2"])
-    return keep
+    seen, chosen = set(), {}
+    for c in cands:
+        if not c.group.startswith("pair-"):
+            continue
+        els = elements(c)
+        if any(e not in seen for e in els):
+            chosen[c.id] = c
+            seen.update(els)
+    return keep + list(chosen.values())
+
+
+def uncovered(cands, covered):
+    """Candidates of ``cands`` whose artifacts the manifest's ``covered`` set lacks."""
+    return [c for c in cands if any(e not in covered for e in elements(c))]
+
+
+def verify_sample(case, tmpdir, k, only=None):
+    """Run ``k`` FlyDSL candidates the cover did not compile in FlyDSL's run-only mode
+    (the environment sets FLYDSL_RUNTIME_RUN_ONLY=1): each finds its artifact or raises
+    "no usable AOT cache". Returns {"verify": k_tried, "misses": [...]}."""
+    import random
+
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+
+    from . import workload
+
+    S = workload.resolve(case)
+    _ctx, everything = enumerate_flydsl(
+        S, case, tmpdir, get_gfx(), get_cu_num(), cover=False
+    )
+    built = {c.id for c in covering_pairs(everything)}
+    rest = [
+        i
+        for i, c in enumerate(everything)
+        if c.id not in built and (only is None or only(c))
+    ]
+    random.Random(case.id).shuffle(rest)
+    pick = rest[:k]
+    res = build_slice(case, 0, 1, tmpdir, indices=pick, cover=False) if pick else []
+    # only a missing artifact is a miss: a candidate aiter declines (its forced row is not
+    # honored) or whose kernel raises is not an incomplete cover
+    misses = [(c, e) for c, ok, e in res if not ok and "no usable AOT cache" in e]
+    other = [(c, e) for c, ok, e in res if not ok and "no usable AOT cache" not in e]
+    return {
+        "case": case.id,
+        "verify_tried": len(res),
+        "verify_pool": len(rest),
+        "misses": [[c, e] for c, e in misses[:20]],
+        "n_misses": len(misses),
+        "n_other_errors": len(other),
+    }
 
 
 def _patch_generators():
@@ -141,7 +212,7 @@ def _patch_generators():
         setattr(torch, name, wrap)
 
 
-def build_slice(case, part, parts, tmpdir, indices=None):
+def build_slice(case, part, parts, tmpdir, indices=None, cover=True):
     """Compile slice ``part`` of ``parts`` of the case's FlyDSL candidates (plus the
     dispatch route in slice 0), or exactly the candidates at ``indices``. Returns
     [(candidate id, ok, error)]."""
@@ -160,7 +231,7 @@ def build_slice(case, part, parts, tmpdir, indices=None):
     with dry_run(gfx, cu), _without_device_queries():
         import aiter.fused_moe as fm
 
-        ctx, cands = enumerate_flydsl(S, case, tmpdir, gfx, cu)
+        ctx, cands = enumerate_flydsl(S, case, tmpdir, gfx, cu, cover=cover)
         if indices is not None:
             mine = [cands[i] for i in indices if i < len(cands)]
         else:
@@ -228,12 +299,23 @@ def main(argv=None):
     ap.add_argument("--part", default="0/1")
     ap.add_argument("--indices", help="comma-separated candidate indexes (a retry)")
     ap.add_argument("--tmpdir", default=os.environ.get("TMPDIR", "/tmp"))
+    ap.add_argument(
+        "--verify",
+        type=int,
+        default=0,
+        help="run-only check of this many candidates the cover did not build "
+        "(FLYDSL_RUNTIME_RUN_ONLY=1): a miss means the cover is incomplete",
+    )
     a = ap.parse_args(argv)
     from . import runner
 
     case = next(c for c in runner.select_cases([a.cases]) if c.id == a.id)
     part, parts = (int(x) for x in a.part.split("/"))
     t0 = time.time()
+    if a.verify:
+        out = verify_sample(case, a.tmpdir, a.verify)
+        print("FLYDSL " + json.dumps(out), flush=True)
+        return 0
     idx = [int(x) for x in a.indices.split(",")] if a.indices else None
     res = build_slice(case, part, parts, a.tmpdir, idx)
     bad = [r for r in res if not r[1]]

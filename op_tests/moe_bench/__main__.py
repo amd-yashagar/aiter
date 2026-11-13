@@ -242,6 +242,13 @@ def main(argv=None):
         help="FlyDSL host-build processes at once (default cores/4)",
     )
     p.add_argument(
+        "--flydsl-verify",
+        type=int,
+        default=80,
+        help="per case, run-only check of this many FlyDSL candidates the cover did "
+        "not build (a miss means the cover is incomplete; 0 skips)",
+    )
+    p.add_argument(
         "--flydsl-per-proc",
         type=int,
         default=40,
@@ -418,6 +425,7 @@ def main(argv=None):
                     cs,
                     procs=a.flydsl_procs,
                     per_proc=a.flydsl_per_proc,
+                    verify=a.flydsl_verify,
                     tree=a.aiter,
                     tmpdir=a.tmpdir,
                 )
