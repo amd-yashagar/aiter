@@ -3,6 +3,8 @@
 """Configs that cannot run on the arch are never tried (MOEBUG-061); a launch failure that
 poisons the context is recorded with its error before the worker restarts."""
 
+import pytest
+
 from op_tests.moe_bench import bar_runner, schema
 from op_tests.moe_bench.candidates.fused_cfg import (
     flydsl_stage1_unsupported as unsupported,
@@ -45,7 +47,8 @@ def test_every_enumerated_a16w16_config_over_64_kib_is_dropped_on_gfx942():
     for n in names:
         p = mk.get_flydsl_kernel_params(n)
         need = mk._gemm1_lds_bytes(p["tile_m"], p["tile_n"], p["tile_k"], p["k_wave"])
-        assert (n in dropped) == (need > 64 * 1024), n
+        over = need > 64 * 1024 or (need == 64 * 1024 and p["tile_m"] >= 128)
+        assert (n in dropped) == over, n
         assert unsupported(n, 3072, "gfx950") is None
 
 
@@ -87,3 +90,49 @@ def test_a_poisoning_fault_is_recorded_with_its_error_before_the_restart():
     job.phase = "cand:k2"
     job._fail("crash", "worker exit -11")
     assert job.cand_table.rows[1]["detail"] == "worker exit -11"
+
+
+def test_exactly_at_the_budget_runs_below_tile_m_128_and_is_dropped_at_128_on_gfx942():
+    """The code objects give 64 KiB for all of these; the launches split by tile_m."""
+    ok = [
+        "flydsl_moe1_abf16_wbf16_bf16_t64x128x256_bnt0",  # 64 KiB, tile_m 64: runs
+        "flydsl_moe1_abf16_wbf16_bf16_t32x16x128_bnt0_kw4",  # 64 KiB, tile_m 32: runs
+        "flydsl_moe1_abf16_wbf16_bf16_t16x16x256_bnt0_kw4",  # 64 KiB, tile_m 16: runs
+    ]
+    for name in ok:
+        assert unsupported(name, 3072, "gfx942") is None, name
+    for name in (
+        "flydsl_moe1_abf16_wbf16_bf16_t128x128x128",
+        "flydsl_moe1_abf16_wbf16_bf16_t128x128x128_bnt0",
+        "flydsl_moe1_abf16_wbf16_bf16_t128x64x128",
+        "flydsl_moe1_abf16_wbf16_bf16_t128x64x128_bnt0",
+    ):
+        why = unsupported(name, 3072, "gfx942")
+        assert why and "LDS 64 KiB = budget 64 KiB" in why and "MOEBUG-061" in why, name
+        assert unsupported(name, 3072, "gfx950") is None
+    # over the budget stays over
+    assert unsupported(BIG[0], 3072, "gfx942").startswith("LDS 128 KiB > budget 64 KiB")
+
+
+def test_the_lds_model_is_the_code_objects_size_where_artifacts_exist():
+    import glob
+    import os
+
+    from op_tests.moe_bench import lds_real
+
+    roots = [
+        d
+        for d in (
+            os.path.expanduser("~/.flydsl/cache"),
+            os.path.join(os.environ.get("AITER_JIT_DIR", ""), "flycache"),
+        )
+        if glob.glob(os.path.join(d, "launch_gemm1*", "*.pkl"))
+    ]
+    if not roots:
+        pytest.skip("no FlyDSL gemm1 artifacts on this node")
+    rows = lds_real.scan(roots)
+    assert rows and lds_real.mismatches(rows) == []
+    assert (
+        lds_real.model_bytes(128, 128, 128, 1, 7168) == 65536
+    )  # t128x128x128, 2 stages
+    assert lds_real.model_bytes(128, 128, 256, 1, 7168) == 131072

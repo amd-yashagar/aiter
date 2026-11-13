@@ -213,6 +213,11 @@ class ForcedConfig(Candidate):
 
 
 LDS_BUDGET_KIB = {"gfx942": 64, "gfx950": 160}  # per workgroup, the arch's real limit
+# A config whose kernel needs exactly the budget runs on gfx942 for tile_m <= 64 (767 of 767
+# launches in the bf16 tier-1 bars) and fails to launch for tile_m 128 (10 of 10), though
+# its code object's group_segment_fixed_size is exactly 64 KiB, within the limit
+# (``lds_real`` reads them: the model is the code objects' size for all 1131 of them).
+AT_BUDGET_MIN_TILE_M = {"gfx942": 128}
 
 
 def flydsl_stage1_unsupported(name, model_dim, gfx=None):
@@ -224,7 +229,10 @@ def flydsl_stage1_unsupported(name, model_dim, gfx=None):
     * LDS (MOEBUG-061): ``moe_kernels`` filters the a16 (bf16 activation) configs at the
       gfx950 budget (160 KiB) on every arch; a config that needs more than the arch's
       real budget (64 KiB on gfx942) faults at its first launch (``hipErrorIllegalState``)
-      and poisons the context, so it is never tried."""
+      and poisons the context, so it is never tried. The code object's size is the model's
+      (``lds_real``), so a config at exactly the budget is within it; the tile_m 128 ones
+      there still fail to launch, as observed (``AT_BUDGET_MIN_TILE_M``), and are dropped
+      on that evidence, not on the size."""
     if not str(name).startswith("flydsl_moe1_"):
         return None
     from aiter.ops.flydsl.moe_kernels import _gemm1_lds_bytes, get_flydsl_kernel_params
@@ -236,11 +244,21 @@ def flydsl_stage1_unsupported(name, model_dim, gfx=None):
     batches = int(p.get("k_batch") or 1)
     waves = int(p.get("k_wave") or 1)
     if str(p.get("a_dtype")) in ("bf16", "fp16") and gfx in LDS_BUDGET_KIB:
-        need = (
-            _gemm1_lds_bytes(int(p["tile_m"]), int(p["tile_n"]), tile_k, waves) // 1024
-        )
-        if need > LDS_BUDGET_KIB[gfx]:
-            return f"LDS {need} KiB > budget {LDS_BUDGET_KIB[gfx]} KiB (MOEBUG-061)"
+        need = _gemm1_lds_bytes(int(p["tile_m"]), int(p["tile_n"]), tile_k, waves)
+        budget = LDS_BUDGET_KIB[gfx] * 1024
+        if need > budget:
+            return (
+                f"LDS {need // 1024} KiB > budget {LDS_BUDGET_KIB[gfx]} KiB "
+                "(MOEBUG-061)"
+            )
+        if need == budget and int(p["tile_m"]) >= AT_BUDGET_MIN_TILE_M.get(
+            gfx, 1 << 30
+        ):
+            return (
+                f"LDS {need // 1024} KiB = budget {LDS_BUDGET_KIB[gfx]} KiB and tile_m "
+                f"{p['tile_m']} does not launch on {gfx} (hipErrorIllegalState; "
+                "MOEBUG-061)"
+            )
     if not tile_k:
         return None
     k = int(model_dim)
