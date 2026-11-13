@@ -31,6 +31,7 @@ from .common import (
     bf16x2_word,
     bf16x4_words,
     half,
+    lds_barrier,
     lds_load_x4,
     lds_store_x2,
     lds_store_x4,
@@ -157,7 +158,7 @@ def compile_down(
                     w_sets = []
                     for p in range_constexpr(PWD):
                         w_sets += load_w(fx.Int32(p))
-                    gpu.barrier()
+                    lds_barrier()
 
                     def block(
                         b,
@@ -255,7 +256,7 @@ def compile_down(
                             block(b, w_sets[b * 2 * KSTEPS : (b + 1) * 2 * KSTEPS])
                         )
                     if const_expr(COALESCE):
-                        gpu.barrier()
+                        lds_barrier()
                         for b in range_constexpr(NBD):
                             for s in range_constexpr(SV):
                                 lds_store_x2(

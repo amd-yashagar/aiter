@@ -30,6 +30,7 @@ from .common import (
     OOB,
     bf16x4_words,
     half,
+    lds_barrier,
     lds_load_x4,
     lds_store_x4,
     load_s1,
@@ -209,7 +210,7 @@ def compile_gateup(
                     w_sets = []
                     for p in range_constexpr(PW):
                         w_sets += load_w(fx.Int32(p))
-                    gpu.barrier()
+                    lds_barrier()
                     init = [zero] * na_acc + w_sets + a_sets
                     results = init
                     for iv, state in range(0, NCH, 1, init=init):
@@ -221,9 +222,9 @@ def compile_gateup(
                         w_n = load_w(n + PW)
                         acc_n = compute(w_c[:NW], acc_c)
                         a_all = a_c + a_n
-                        gpu.barrier()
+                        lds_barrier()
                         store_a(a_all[:na])
-                        gpu.barrier()
+                        lds_barrier()
                         results = yield acc_n + w_c[NW:] + w_n + a_all[na:]
                     acc = [Vec(v) for v in results[:na_acc]]
 
@@ -258,7 +259,7 @@ def compile_gateup(
                     if const_expr(KS > 1):
                         red = fx.make_view(a_lds, fx.make_layout(LDS_DW, 1))
                         red_w = na_acc * 4 * 64
-                        gpu.barrier()
+                        lds_barrier()
                         if kg > 0:
                             base = ((kg - 1) * WAVES + cw) * red_w
                             for a in range_constexpr(na_acc):
@@ -266,7 +267,7 @@ def compile_gateup(
                                     red[base + (a * 4 + i) * 64 + lane] = acc[a][
                                         i
                                     ].bitcast(fx.Int32)
-                        gpu.barrier()
+                        lds_barrier()
                         if kg == 0:
                             fin = []
                             for a in range_constexpr(na_acc):

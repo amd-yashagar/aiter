@@ -16,6 +16,7 @@ holds rows (channels) 4q .. 4q + 3 of column (token) l % 16.
 """
 
 import flydsl.expr as fx
+from flydsl._mlir.dialects import rocdl as mlir_rocdl
 from flydsl.expr import const_expr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -51,6 +52,16 @@ def load_s1(p, idx):
     """One wave-uniform int32 through the scalar cache."""
     r = rsrc(fxh._as_ptr(p, fx.Int32))
     return fx.Int32(buffer_ops.buffer_load(r, idx, vec_width=1, is_scalar=True))
+
+
+def lds_barrier():
+    """Workgroup barrier that orders LDS only. ``gpu.barrier()`` also waits for every
+    global load in flight (vmcnt(0)), which drains the weight prefetch each K chunk;
+    loads whose registers are read later still get their own vmcnt wait."""
+    fx.memory_fence(ordering=fx.AtomicOrdering.SeqCst, syncscope="singlethread")
+    rocdl.s_waitcnt(lgkmcnt=0)
+    mlir_rocdl.s_barrier()
+    fx.memory_fence(ordering=fx.AtomicOrdering.SeqCst, syncscope="singlethread")
 
 
 def lds_ptr16(base, dword_off, align=16):
