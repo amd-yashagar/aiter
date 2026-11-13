@@ -40,6 +40,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
+from aiter.ops.flydsl.kernels.moe_next.core import direct as _direct
 
 from . import helpers as fxh
 
@@ -58,9 +59,13 @@ CPOL_COHERENT = 0x1 | 0x10
 
 
 def _build_stage1(
-    *, model_dim, inter_dim, experts, tile_m, act, doweight_stage1, wide_k, splits
+    *, model_dim, inter_dim, experts, tile_m, act, doweight_stage1, wide_k, splits,
+    direct_topk=0, zero_row_v4=0
 ):
     elem_t = fx.Float8E4M3FN
+    DROUTE = int(direct_topk)
+    ZERO_V4 = int(zero_row_v4)
+    assert DROUTE == 0 or (wide_k and tile_m == 16 and ZERO_V4 > 0), "direct routing: tile_m 16, wide K"
     K = int(model_dim)
     KB = K // 128
     N_e = 2 * int(inter_dim)
@@ -433,14 +438,14 @@ def _build_stage1(
         # in flight. A goes through an LDS ping-pong one tile ahead of its MFMAs.
         last = fx.Int32(NTL - 1)
         if const_expr(DIRECT_A):
-            # W1 needs only expert_id: tile 0's W1 issues first, then the scale and A
-            # loads that wait on the sorted id
-            kb0 = _phys(0)
-            fx.copy(b_cp_atom, bl_g2r[None, None, None, kb0], bl_ret_bufs[0])
-            fx.copy(b_cp_atom, br_g2r[None, None, None, kb0], br_ret_bufs[0])
-            rocdl.sched_barrier(0)
+            # Issue in the loop body's order (scales, then tile 0's A, then its W1): the
+            # waitcnt pass merges the preheader's pending loads into the loop header, so a
+            # W1-before-A prologue made every trip's first step wait vmcnt(15) (A plus 5 W1
+            # loads of tile kt) before its x quant instead of vmcnt(20) (A only). Scales
+            # oldest also lets their LDS store wait without draining tile 0.
             scl_vals = _issue_scale_loads()
-            _load_a_direct(kb0, 0)
+            rocdl.sched_barrier(0)
+            _load_gmem(0, 0)
             rocdl.sched_barrier(0)
             for t in range_constexpr(1, PF - 1):
                 _load_gmem(min(t, NTL - 1), t)
@@ -507,7 +512,11 @@ def _build_stage1(
                         gv = gv * tw_frag[0, n]
                         uv = uv * tw_frag[0, n]
                     if const_expr(act == "silu"):
-                        e = fx.math.exp(-gv)
+                        # exp(-g) as one bare v_exp_f32: drops LLVM's ~10-VALU range
+                        # fix-up; overflow gives inf -> rcp 0, underflow 0 -> 1
+                        e = fx.Float32(
+                            rocdl.exp2(T.f32, (gv * fx.Float32(-1.4426950408889634)).ir_value())
+                        )
                         a = gv * rocdl.rcp(T.f32, (fx.Float32(1.0) + e).ir_value())
                     else:
                         a = (
@@ -604,6 +613,8 @@ def _build_stage1(
         arg_num_valid_ids: fx.Tensor,
         arg_ws: fx.Tensor,
         arg_cnt: fx.Tensor,
+        arg_topk_ids: fx.Tensor,
+        arg_zero: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_rows: fx.Int32,
     ):
@@ -619,10 +630,6 @@ def _build_stage1(
         arg_p_input = fx.make_view(
             in_ptr, fx.make_layout((M, fx.Int32(K)), (fx.Int32(K), 1))
         )
-        # num_valid, expert id and this tile's sorted ids load in parallel (all in
-        # bounds for every launched tile), not as a chain of dependent round trips
-        num_valid = fxh_view_i32(arg_num_valid_ids)[0]
-        expert_id = fxh_view_i32(arg_expert_ids)[e_idx]
         row0 = e_idx * fx.Int32(BM)
         sorted_ids = fx.rocdl.make_buffer_tensor(
             fx.make_view(
@@ -631,10 +638,45 @@ def _build_stage1(
             ),
             max_size=False,
         )
-        sid_v = sorted_ids[tid % fx.Int32(BM)]
-        # expert_id in the condition: its load issues with num_valid's, not after the branch
-        if (e_idx * fx.Int32(BM) < num_valid) & (expert_id != fx.Int32(-0x7FFFFFF)):
-            lds = fx.SharedAllocator().allocate(SharedStorage)
+        lds = fx.SharedAllocator().allocate(SharedStorage)
+        if const_expr(DROUTE > 0):
+            # No sort launch: workgroup row e_idx is route slot e_idx. Core's route_slot gives
+            # its expert, whether it leads a tile, and the tile's route list (the sort's rules
+            # and order); the slots that lead no tile skip the GEMM.
+            rl = lds.sorted_lds.peek().ptr
+            r_exp, _r_rank, r_lead = _direct.route_slot(
+                rl, arg_topk_ids, arg_topk_ids, arg_topk_ids, M, e_idx, experts, DROUTE, BM,
+                False, False,
+            )
+            rr = fx.ptr_load(rl + fx.Int64(tid % fx.Int32(BM)))
+            r_ok = rr >= fx.Int32(0)
+            r_u = r_ok.select(rr, fx.Int32(0))
+            r_tok = r_u // fx.Int32(DROUTE)
+            sid_v = r_ok.select(
+                r_tok | ((r_u - r_tok * fx.Int32(DROUTE)) << fx.Int32(24)),
+                M | fx.Int32(DROUTE << 24),
+            )
+            # workgroup-uniform but loaded into a VGPR: readfirstlane keeps the W1 base in
+            # SGPRs, so the W1 buffer_loads need no waterfall loop over a VGPR descriptor
+            expert_id = fx.Int32(
+                rocdl.readfirstlane(T.i32, r_lead.select(r_exp, fx.Int32(-0x7FFFFFF)))
+            )
+            first_wg = (blk_n == fx.Int32(0)) & (split == fx.Int32(0))
+            # The route weight load lands under the W1 stream; its store, the rest of the
+            # stage-2 publish and the output zeroing wait for the kernel tail, so no workgroup
+            # waits on them before its first W1 load (stage 2 reads them after this launch).
+            tw_g = fx.rocdl.make_buffer_tensor(arg_x_scale, max_size=True)
+            wv = tw_g[r_u]
+            gpu.barrier()
+            route_ok = r_lead
+        else:
+            # num_valid, expert id and this tile's sorted ids load in parallel (all in
+            # bounds for every launched tile), not as a chain of dependent round trips
+            num_valid = fxh_view_i32(arg_num_valid_ids)[0]
+            expert_id = fxh_view_i32(arg_expert_ids)[e_idx]
+            sid_v = sorted_ids[tid % fx.Int32(BM)]
+            route_ok = (e_idx * fx.Int32(BM) < num_valid) & (expert_id != fx.Int32(-0x7FFFFFF))
+        if route_ok:
             lds.sorted_lds = lds.sorted_lds.peek()
             lds.gemm = lds.gemm.peek()
             w_ptr = fx.recast_iter(elem_t, fx.get_iter(arg_w))
@@ -709,6 +751,26 @@ def _build_stage1(
                         comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-SPLITS))
                     _epilogue(c_gate, c_up, tw_frag, lds, tid, blk_n, row0, arg_inter,
                               arg_inter_scale, i32_rows)
+        if const_expr(DROUTE > 0):
+            if first_wg:
+                # the tile in the sort's layout for stage 2: ids, weights, expert, row count
+                if tid < fx.Int32(BM):
+                    sid_g = fx.rocdl.make_buffer_tensor(arg_sorted_token_ids, max_size=True)
+                    sw_g = fx.rocdl.make_buffer_tensor(arg_sorted_weights, max_size=True)
+                    fx.ptr_store(sid_v, fx.get_iter(sid_g) + fx.Int64(row0 + tid))
+                    fx.ptr_store(
+                        r_ok.select(wv, fx.Float32(0.0)), fx.get_iter(sw_g) + fx.Int64(row0 + tid)
+                    )
+                if tid == fx.Int32(0):
+                    ex_g = fx.rocdl.make_buffer_tensor(arg_expert_ids, max_size=True)
+                    fx.ptr_store(expert_id, fx.get_iter(ex_g) + fx.Int64(e_idx))
+                    if e_idx == fx.Int32(0):
+                        nv_g = fx.rocdl.make_buffer_tensor(arg_num_valid_ids, max_size=True)
+                        fx.ptr_store(i32_rows, fx.get_iter(nv_g))
+            # zero stage 2's atomic output, as the sort would (stage 2 runs after this launch)
+            nwg = fx.Int32(gpu.grid_dim.x) * fx.Int32(gpu.grid_dim.y)
+            wg = e_idx * fx.Int32(gpu.grid_dim.x) + bx
+            _direct.zero_rows(arg_zero, wg * fx.Int32(256) + tid, nwg * fx.Int32(256), M, M, ZERO_V4)
 
     def _partial_slots(c_gate, c_up):
         return [(acc, m, n) for acc in (c_gate, c_up)
@@ -784,6 +846,8 @@ def _build_stage1(
         arg_expert_ids: fx.Tensor,
         arg_sorted_weights: fx.Tensor,
         arg_num_valid_ids: fx.Tensor,
+        arg_topk_ids: fx.Tensor,
+        arg_zero: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_rows: fx.Int32,
         i32_tiles: fx.Int32,
@@ -802,6 +866,8 @@ def _build_stage1(
             arg_num_valid_ids,
             arg_x,  # no split-K: workspace and counters unused
             arg_x,
+            arg_topk_ids,
+            arg_zero,
             i32_tokens,
             i32_rows,
             value_attrs=_NO_PACKED_F32,
@@ -821,6 +887,8 @@ def _build_stage1(
         arg_num_valid_ids: fx.Tensor,
         arg_ws: fx.Tensor,
         arg_cnt: fx.Tensor,
+        arg_topk_ids: fx.Tensor,
+        arg_zero: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_rows: fx.Int32,
         i32_tiles: fx.Int32,
@@ -839,6 +907,8 @@ def _build_stage1(
             arg_num_valid_ids,
             arg_ws,
             arg_cnt,
+            arg_topk_ids,
+            arg_zero,
             i32_tokens,
             i32_rows,
             value_attrs=_NO_PACKED_F32,
@@ -866,10 +936,18 @@ def compile_stage1(
     doweight_stage1=False,
     wide_k=True,
     splits=1,
+    direct_topk=0,
+    zero_row_v4=0,
 ):
     """splits > 1: split-K over hidden into that many workgroups per (tile, block); the
     launcher then also takes the fp32 workspace (splitk_workspace_floats) and one
-    int32 counter per (tile, block) pair, zero before the call and zero after it."""
+    int32 counter per (tile, block) pair, zero before the call and zero after it.
+    Every launcher also takes topk_ids (int32 [M, topk]) and the output stage 2 accumulates
+    into (as int32). direct_topk = topk: no sort; the grid is one tile row per route slot
+    (M * topk <= core direct.DIRECT_MAX_ROUTES), stage 1 writes the tiles' sorted ids, weights
+    (from the x_scale slot, which then takes topk_weight as f32), expert ids and row count in
+    the sort's layout and zeroes that output's first M rows (zero_row_v4 16-byte vectors a
+    row). direct_topk = 0: both are unused."""
     return _build_stage1(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -879,4 +957,6 @@ def compile_stage1(
         doweight_stage1=doweight_stage1,
         wide_k=wide_k,
         splits=splits,
+        direct_topk=direct_topk,
+        zero_row_v4=zero_row_v4,
     )

@@ -375,7 +375,16 @@ def _build_stage2(
             fx.recast_iter(fx.Int32, fx.get_iter(arg_num_valid_ids)),
             fx.make_layout(2, 1),
         )[0]
-        if e_idx * fx.Int32(BM) < num_valid:
+        live = e_idx * fx.Int32(BM) < num_valid
+        if const_expr(DECODE):
+            # stage 1's direct routing publishes a tile for every route slot and marks the
+            # slots that lead no tile with expert -0x7FFFFFF
+            ex_pre = fx.make_view(
+                fx.recast_iter(fx.Int32, fx.get_iter(arg_expert_ids)),
+                fx.make_layout(1 << 20, 1),
+            )[e_idx]
+            live = live & (ex_pre != fx.Int32(-0x7FFFFFF))
+        if live:
             lds = fx.SharedAllocator().allocate(SharedStorage).peek()
             row0 = e_idx * fx.Int32(BM)
             sorted_ids = fx.rocdl.make_buffer_tensor(

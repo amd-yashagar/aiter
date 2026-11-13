@@ -6,6 +6,12 @@
       "tile_n2": 128,
       "splits": "auto"
     },
+    "d16s": {
+      "tile_m": 16,
+      "tile_n2": 128,
+      "splits": "auto",
+      "route": "sort"
+    },
     "d32": {
       "tile_m": 32,
       "tile_n2": 128

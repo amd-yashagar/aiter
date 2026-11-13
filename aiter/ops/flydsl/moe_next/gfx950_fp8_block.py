@@ -9,6 +9,7 @@ Weights stay in aiter's layout (shuffle_weight(16, 16) fp8, fp32 [E, N/128, K/12
 scales). Tile configs are data: configs/mi355x/fp8-block.json.
 """
 
+import dataclasses
 import functools
 import json
 import os
@@ -98,6 +99,20 @@ def _decode_stage1(cfg, spec):
     )
 
 
+def _direct_route(cfg, spec, m, topk, combine):
+    """Whether the decode stage 1 routes its own tiles instead of a sort launch (core's
+    direct.route_slot, one workgroup per route slot, up to DIRECT_MAX_ROUTES routes). The
+    call must also carry no expert_mask / num_local_tokens and a contiguous output."""
+    from aiter.ops.flydsl.kernels.moe_next.core.direct import DIRECT_MAX_ROUTES
+
+    return (
+        _decode_stage1(cfg, spec)
+        and cfg.get("route", "direct") == "direct"
+        and combine in ("atomic_bf16", "atomic_f32")
+        and m * topk <= DIRECT_MAX_ROUTES
+    )
+
+
 def _tile_config(gpu, config, m, topk, experts):
     table = _configs(gpu)
     if config:
@@ -177,9 +192,15 @@ class _Fp8BlockGfx950(MoeKernel):
     def warmup(self, weights, m, topk, config):
         spec = weights.spec
         cfg = _tile_config(weights.gpu, config, m, topk, spec.experts)
-        self._launchers(topk, spec, cfg, _splits(cfg, spec, m, topk))
+        combine = self._combine or cfg.get("combine", "atomic_bf16")
+        splits = _splits(cfg, spec, m, topk)
+        self._launchers(topk, spec, cfg, splits)
+        if _direct_route(cfg, spec, m, topk, combine):
+            # calls with expert_mask / num_local_tokens keep the sort, so both are built
+            zero_v4 = spec.model_dim * (4 if combine == "atomic_f32" else 2) // 16
+            self._launchers(topk, spec, cfg, splits, zero_v4)
 
-    def _launchers(self, topk, spec, cfg, splits):
+    def _launchers(self, topk, spec, cfg, splits, zero_v4=0):
         from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage1 import (
             compile_stage1,
         )
@@ -199,10 +220,13 @@ class _Fp8BlockGfx950(MoeKernel):
                 act=_ACTS[spec.act],
             )
         else:
+            kw = {}
             if _decode_stage1(cfg, spec):
                 from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage1_decode import (
                     compile_stage1,
                 )
+
+                kw = {"direct_topk": topk if zero_v4 else 0, "zero_row_v4": zero_v4}
             s1 = compile_stage1(
                 model_dim=spec.model_dim,
                 inter_dim=spec.inter_dim,
@@ -211,6 +235,7 @@ class _Fp8BlockGfx950(MoeKernel):
                 act=_ACTS[spec.act],
                 doweight_stage1=spec.doweight_stage1,
                 splits=splits,
+                **kw,
             )
         s2 = compile_stage2(
             model_dim=spec.model_dim,
@@ -242,7 +267,6 @@ class _Fp8BlockGfx950(MoeKernel):
         cfg = _tile_config(weights.gpu, call.config, call.m, call.topk, spec.experts)
         tm = cfg["tile_m"]
         splits = _splits(cfg, spec, call.m, call.topk)
-        s1, s2 = self._launchers(call.topk, spec, cfg, splits)
         combine = self._combine or cfg.get("combine", "atomic_bf16")
         x = call.hidden_states
         M, D, I = call.m, spec.model_dim, spec.inter_dim
@@ -266,11 +290,31 @@ class _Fp8BlockGfx950(MoeKernel):
             # zeroed: masked, -1 and past-num_local_tokens routes write no row
             buf = torch.zeros((M * call.topk, D), dtype=torch.float32, device=x.device)
         zero = None if combine.startswith("rows") else buf
+        direct = (
+            _direct_route(cfg, spec, M, call.topk, combine)
+            and call.expert_mask is None
+            and call.num_local_tokens is None
+            and buf.is_contiguous()
+        )
+        s1, s2 = self._launchers(
+            call.topk, spec, cfg, splits, D * buf.element_size() // 16 if direct else 0
+        )
+        routes = M * call.topk
         # As fused_moe sorts: global expert count, EP mask (local expert ids out, masked
         # and -1 routes dropped, their rows zeroed), num_local_tokens.
         # core's route_to_tiles where the config asks for it (p128w8c: exact against Opus, 10-15 us
         # less sort at DSV3 E257 M >= 8192); AITER_FP8B_CORE_SORT=1 forces it everywhere
-        if _CORE_SORT or cfg.get("sort") == "core":
+        if direct:
+            # no sort launch: stage 1 routes its own tiles (one per route slot), writes them
+            # in the sort's layout for stage 2 and zeroes the output's rows
+            tiles = routes
+            rows = routes * tm
+            sorted_ids = torch.empty(rows, dtype=torch.int32, device=x.device)
+            sorted_w = torch.empty(rows, dtype=torch.float32, device=x.device)
+            sorted_e = torch.empty(tiles, dtype=torch.int32, device=x.device)
+            nvalid = torch.empty(2, dtype=torch.int32, device=x.device)
+            xs = call.topk_weight.to(torch.float32).contiguous().view(-1)
+        elif _CORE_SORT or cfg.get("sort") == "core":
             tmap = route_to_tiles(
                 call.topk_ids.to(torch.int32),
                 call.topk_weight.to(torch.float32),
@@ -295,13 +339,16 @@ class _Fp8BlockGfx950(MoeKernel):
                 output=zero,
                 accumulate=zero is not None,
             )
-        rows = sorted_ids.numel()
-        # The sort gives each expert with routes ceil(routes / tile_m) tiles, so at most
-        # routes // tile_m + (experts with routes) are live: a grid bound from shapes
-        # alone (graph-safe) that drops most of the dead tiles at decode.
-        routes = M * call.topk
-        tiles = min(sorted_e.numel(), routes // tm + min(spec.experts, routes) + 1)
-        inter = Layout.for_spec(spec, M, call.topk, tm).alloc(x.device)
+        if not direct:
+            rows = sorted_ids.numel()
+            # The sort gives each expert with routes ceil(routes / tile_m) tiles, so at most
+            # routes // tile_m + (experts with routes) are live: a grid bound from shapes
+            # alone (graph-safe) that drops most of the dead tiles at decode.
+            tiles = min(sorted_e.numel(), routes // tm + min(spec.experts, routes) + 1)
+        layout = Layout.for_spec(spec, M, call.topk, tm)
+        if layout.rows < rows:
+            layout = dataclasses.replace(layout, rows=rows)
+        inter = layout.alloc(x.device)
         inter, inter_s = inter.values, inter.scales
         stream = fx.Stream(torch.cuda.current_stream(x.device))
         splitk = ()
@@ -316,6 +363,13 @@ class _Fp8BlockGfx950(MoeKernel):
                 device=x.device,
             )
             splitk = (ws, _splitk_counters(x.device, tiles * (I // 128)))
+        route_args = ()
+        if _decode_stage1(cfg, spec):
+            route_args = (
+                (call.topk_ids.to(torch.int32).contiguous(), buf.view(torch.int32))
+                if direct
+                else (_unused_i32(x.device), _unused_i32(x.device))
+            )
         _run_compiled(
             s1,
             inter.view(torch.int8),
@@ -329,6 +383,7 @@ class _Fp8BlockGfx950(MoeKernel):
             sorted_w,
             nvalid,
             *splitk,
+            *route_args,
             M,
             rows,
             tiles,
