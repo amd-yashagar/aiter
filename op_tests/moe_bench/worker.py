@@ -431,8 +431,9 @@ def run_first_case(case, fh, variant):
 
 
 def main(argv=None):
-    from . import prebuild
+    from . import gpu_claim, prebuild
 
+    gpu_claim.watch_claim()
     prebuild.forbid_builds()
     ap = argparse.ArgumentParser()
     ap.add_argument(

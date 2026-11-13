@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: PLW1509  (preexec_fn only calls prctl; every spawn is single-threaded)
 """Claim idle GPUs on a shared node, run commands on them, release the claims.
 
 Claim files live in /tmp/gm123-gpu-claims/gpu<N> (override with MOE_BENCH_CLAIM_DIR),
@@ -165,16 +166,138 @@ def attlas_flow_running():
 FLOW_GPUS = (0, 3)  # the gfx942 prefill flow's GPUs: never started on while it runs
 
 
+def die_with_parent():
+    """``preexec_fn`` for every process this harness starts on a GPU: the kernel kills it
+    when its parent dies (PR_SET_PDEATHSIG), so a worker never outlives the process whose
+    claim file holds its GPU."""
+    parent = os.getpid()
+
+    def preexec():
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+        if os.getppid() != parent:  # the parent died before the call
+            os._exit(1)
+
+    return preexec
+
+
+def claim_is_live(gpu, parent_pid, worker=None):
+    """Whether the claim file of ``gpu`` names ``parent_pid`` (alive) as its owner."""
+    try:
+        with open(claim_path(gpu)) as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if int(c.get("pid") or 0) != parent_pid or not os.path.exists(
+        f"/proc/{parent_pid}"
+    ):
+        return False
+    return worker is None or c.get("worker") == worker
+
+
+def watch_claim(period=15.0, exit_code=71):
+    """In a worker: when ``MOE_BENCH_GPU`` names a GPU (the claim launcher set it), exit if
+    the claim file of that GPU stops naming this worker's parent: a worker never runs on a
+    GPU without a live claim. Returns the thread (None when there is no claim to watch).
+    """
+    import threading
+
+    gpu = os.environ.get("MOE_BENCH_GPU")
+    if not gpu or not gpu.isdigit():
+        return None
+    parent = os.getppid()
+    gpu = int(gpu)
+
+    def loop():
+        while True:
+            time.sleep(period)
+            if os.getppid() != parent or not claim_is_live(gpu, parent):
+                print(
+                    f"moe_bench worker: no live claim on gpu{gpu} (parent {parent}); exiting",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                os._exit(exit_code)
+
+    t = threading.Thread(target=loop, daemon=True, name="claim-watch")
+    t.start()
+    return t
+
+
+def excluded_gpus():
+    """HIP indexes never claimed (``MOE_BENCH_EXCLUDE_GPUS=0,3`` or ``--exclude-gpus``),
+    read at call time so a CLI flag set after import applies."""
+    out = set()
+    for tok in os.environ.get("MOE_BENCH_EXCLUDE_GPUS", "").replace(" ", "").split(","):
+        if tok.isdigit():
+            out.add(int(tok))
+    return out
+
+
+KFD = "/sys/class/kfd/kfd"
+MIN_FOREIGN_VRAM = 64 * 2**20  # bytes of a GPU's memory held by a process: in use
+
+
+def kfd_gpu_users(kfd=KFD):
+    """{HIP index: [(pid, vram bytes, queues)]} of the processes using each GPU, from the
+    kernel's per-process, per-GPU accounting (``/sys/class/kfd/kfd/proc``): a process counts
+    on a GPU when it holds memory there (over 64 MiB) or has a compute queue on it. This is
+    what the node's processes really do, whatever their pid namespace and whatever claim
+    files exist (amd-smi lists a process on every GPU with its total memory). The HIP index
+    is the position among the GPU nodes of the KFD topology."""
+    try:
+        nodes = sorted(
+            int(n) for n in os.listdir(f"{kfd}/topology/nodes") if n.isdigit()
+        )
+        gpu_ids = []
+        for n in nodes:
+            with open(f"{kfd}/topology/nodes/{n}/gpu_id") as f:
+                gid = int(f.read().strip() or 0)
+            if gid:
+                gpu_ids.append(gid)
+        procs = os.listdir(f"{kfd}/proc")
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for pid in procs:
+        if not pid.isdigit():
+            continue
+        for idx, gid in enumerate(gpu_ids):
+            try:
+                with open(f"{kfd}/proc/{pid}/vram_{gid}") as f:
+                    vram = int(f.read().strip() or 0)
+            except (OSError, ValueError):
+                vram = 0
+            queues = 0
+            try:
+                qdir = f"{kfd}/proc/{pid}/queues"
+                for q in os.listdir(qdir):
+                    with open(f"{qdir}/{q}/gpuid") as f:
+                        queues += f.read().strip() == str(gid)
+            except OSError:
+                pass
+            if vram > MIN_FOREIGN_VRAM or queues:
+                out.setdefault(idx, []).append((int(pid), vram, queues))
+    return out
+
+
 def idle_gpus():
     state = gpu_state()
     claims = read_claims()
     flow = attlas_flow_running()
     out = []
+    skip = excluded_gpus()
+    users = kfd_gpu_users()
     for i, s in sorted(state.items()):
         busy = (
-            s["util"] > MAX_UTIL_PCT
+            i in skip
+            or s["util"] > MAX_UTIL_PCT
             or s["vram_gb"] > MAX_VRAM_GB
-            or (s["procs"] and s["vram_gb"] > 0.6)
+            # a process holds memory or a queue on it, claim file or not (this harness
+            # only runs on the GPUs it claimed, so on an unclaimed GPU any is foreign)
+            or bool(users.get(i))
             # another worker's claim holds the GPU even when its pid looks dead: the
             # recorded pid can be a launcher while the job lives on
             or (
@@ -302,7 +425,11 @@ def run_shards(cmds, launcher="claim", jobs=None, wait=0, env_extra=None):
             env = dict(os.environ, **(env_extra or {}))
             if launcher == "gpuq":
                 env.setdefault("GPUQ_USER", "yashagar")
-                proc = subprocess.Popen(_gpuq_cmd(cmd), env=env)
+                proc = subprocess.Popen(
+                    _gpuq_cmd(cmd),
+                    env=env,
+                    preexec_fn=die_with_parent(),
+                )
                 gpu = None
             else:
                 got = acquire(1, cmd, wait=0)
@@ -310,7 +437,7 @@ def run_shards(cmds, launcher="claim", jobs=None, wait=0, env_extra=None):
                     break
                 gpu = got[0]
                 env.update(HIP_VISIBLE_DEVICES=str(gpu), MOE_BENCH_GPU=str(gpu))
-                proc = subprocess.Popen(cmd, env=env)
+                proc = subprocess.Popen(cmd, env=env, preexec_fn=die_with_parent())
             pending.pop(0)
             running[idx] = (proc, gpu)
         if pending and not running and time.time() - started > wait:
@@ -325,11 +452,16 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--gpu", type=int, default=None, help="claim this GPU if idle")
     ap.add_argument("--worker", default=WORKER)
+    ap.add_argument(
+        "--exclude-gpus", help="comma separated HIP indexes never claimed (e.g. 0,3)"
+    )
     ap.add_argument("--list", action="store_true", help="print state and exit")
     ap.add_argument("--wait", type=int, default=0, help="seconds to wait for a GPU")
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     a = ap.parse_args(argv)
     cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
+    if a.exclude_gpus:
+        os.environ["MOE_BENCH_EXCLUDE_GPUS"] = a.exclude_gpus
 
     if a.list:
         idle, state, claims = idle_gpus()
@@ -359,7 +491,7 @@ def main(argv=None):
     signal.signal(signal.SIGINT, _stop)
     try:
         print(f"claimed gpu{gpu}: {shlex.join(cmd)}", file=sys.stderr)
-        proc = subprocess.Popen(cmd, env=env)
+        proc = subprocess.Popen(cmd, env=env, preexec_fn=die_with_parent())
         return proc.wait()
     finally:
         release_claim(gpu)

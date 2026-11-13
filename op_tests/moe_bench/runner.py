@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: PLW1509  (preexec_fn only calls prctl; every spawn is single-threaded)
 """``run``: shard, group, launch workers, collect rows, resume, drift check.
 
 This process never touches a GPU. Workers (``worker.py``) run in subprocesses
@@ -216,7 +217,14 @@ def _launch(cmd, launcher, env, capture=False, wait=0):
             raise RuntimeError("no idle unclaimed GPU")
         env = dict(env, HIP_VISIBLE_DEVICES=str(gpus[0]), MOE_BENCH_GPU=str(gpus[0]))
     try:
-        r = subprocess.run(cmd, env=env, capture_output=capture, text=True, check=False)
+        r = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=capture,
+            text=True,
+            check=False,
+            preexec_fn=gpu_claim.die_with_parent(),
+        )
         return r.stdout if capture else r.returncode
     finally:
         for g in gpus:
@@ -361,14 +369,22 @@ class GroupJob:
             env["GPUQ_USER"] = env.get("GPUQ_USER", "yashagar")
             cmd = ["gpuq", "--num-gpus=1", *cmd]
         elif self.launcher == "claim":
-            got = gpu_claim.acquire(1, cmd)
-            if not got:
-                return False
-            self.gpu = got[0]
+            # a respawn stays on the GPU the job started on (its claim is kept between
+            # workers); only the first spawn picks one
+            if self.gpu is None:
+                got = gpu_claim.acquire(1, cmd)
+                if not got:
+                    return False
+                self.gpu = got[0]
             env.update(HIP_VISIBLE_DEVICES=str(self.gpu), MOE_BENCH_GPU=str(self.gpu))
         self.log = open(self.outfile + ".log", "w")  # noqa: SIM115
         self.proc = subprocess.Popen(
-            cmd, env=env, cwd=self.tree, stdout=self.log, stderr=subprocess.STDOUT
+            cmd,
+            env=env,
+            cwd=self.tree,
+            stdout=self.log,
+            stderr=subprocess.STDOUT,
+            preexec_fn=gpu_claim.die_with_parent(),
         )
         self.last_event = time.time()
         self.spawns = getattr(self, "spawns", 0) + 1
@@ -517,10 +533,10 @@ class GroupJob:
     def _finish_proc(self):
         if getattr(self, "log", None) is not None:
             self.log.close()
-        self._release()
         self.proc = None
         if not self.pending:
             self.done = True
+            self._release()
 
 
 def run_jobs(jobs, concurrency):

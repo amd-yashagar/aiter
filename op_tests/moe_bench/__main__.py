@@ -23,6 +23,12 @@ def add_launcher(p):
         "gpuq: GPUQ_USER=yashagar gpuq --num-gpus=1 per worker (smci355); "
         "none: inherit the environment",
     )
+    p.add_argument(
+        "--exclude-gpus",
+        default=os.environ.get("MOE_BENCH_EXCLUDE_GPUS", ""),
+        help="comma separated HIP indexes the claim launcher never takes (e.g. 0,3); "
+        "also MOE_BENCH_EXCLUDE_GPUS",
+    )
     p.add_argument("--tmpdir", default=None, help="private TMPDIR for workers")
     p.add_argument(
         "--min-free-gb",
@@ -381,6 +387,8 @@ def main(argv=None):
     p.set_defaults(fn="gpus")
 
     a = ap.parse_args(argv)
+    if getattr(a, "exclude_gpus", ""):
+        os.environ["MOE_BENCH_EXCLUDE_GPUS"] = a.exclude_gpus
     if a.cmd == "cases":
         return a.fn(a)
     if a.fn == "routes":
