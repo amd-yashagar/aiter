@@ -354,13 +354,16 @@ def _build_stage2(
             arg_p_weight = fxh.make_weight_view(w_ptr, expert_id, N, K)
             pos_view = fx.make_view(lds.index.pos.ptr, fx.make_layout(256, 1))
             ids_view = fx.make_view(lds.index.ids.ptr, fx.make_layout(256, 1))
+            # The token ids feed only the epilogue's atomics: issue their load now (tid >= BM
+            # reads past the BM-entry descriptor and gets 0) and store them to LDS after the
+            # GEMM, so the GEMM's loads no longer wait one memory round trip behind them.
+            sid_t = sorted_ids[tid]
             # Slots past BM read by the copy layouts point at row `rows` / token `tokens` (OOB).
             pos_view[tid] = rows
             ids_view[tid] = tokens
             gpu.barrier()
             if tid < fx.Int32(BM):
                 pos_view[tid] = row0 + tid
-                ids_view[tid] = sorted_ids[tid]
             gpu.barrier()
             a_scale_t = fx.rocdl.make_buffer_tensor(
                 fx.make_view(
@@ -427,19 +430,6 @@ def _build_stage2(
                 fx.make_layout(((_cshuffle_nlane, _n_row_thr), 1), ((0, 1), 0)),
                 fx.make_tile(_n_row_thr),
             )
-            c_out_index_frag = fxh.read_sorted_index(
-                c_index_copy, tid, lds.index.ids, BM
-            )
-            c_out = fxh.TensorWithIndex(
-                out_tensor,
-                BM,
-                BN,
-                c_out_index_frag,
-                c_rw_copy,
-                tid,
-                is_read_from_mem=False,
-            )
-
             c_frag = _gemm(
                 blk_n,
                 arg_p_input,
@@ -451,6 +441,8 @@ def _build_stage2(
                 expert_id,
                 row0,
             )
+            if tid < fx.Int32(BM):
+                ids_view[tid] = sid_t  # read after the C-shuffle barrier below
             c_out_frag = _weight_and_cast(c_frag, tw_frag)
 
             _, _tiled_mma = fxh.make_1x4_tiled_mma(elem_t, wide_k)
@@ -471,6 +463,18 @@ def _build_stage2(
                 ),
             )
             gpu.barrier()
+            c_out_index_frag = fxh.read_sorted_index(
+                c_index_copy, tid, lds.index.ids, BM
+            )
+            c_out = fxh.TensorWithIndex(
+                out_tensor,
+                BM,
+                BN,
+                c_out_index_frag,
+                c_rw_copy,
+                tid,
+                is_read_from_mem=False,
+            )
             store_c = fx.make_tiled_copy_C(cshuf_atom_w, _tiled_mma).get_slice(tid)
             fx.copy(
                 cshuf_atom_w,

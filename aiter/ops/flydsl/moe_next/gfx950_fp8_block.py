@@ -85,6 +85,19 @@ def _atom_cache(cfg):
     return sum(bits[b] for b in cfg.get("atom_cache", ()))
 
 
+def _decode_stage1(cfg, spec):
+    """Whether stage1_decode.py runs: it quantizes bf16 x itself (aiter's 1x128 HIP rule) in
+    its K loop, so the call launches no separate activation quant."""
+    # The decode stage 1 wins at inter_dim <= 256 (DSV3 / Qwen3.5 M=8: 84.4 vs 93.5 us
+    # warm, 88.9 vs 113.9 cold) and loses to stage1.py at 1024-2048 (synthetic M=128
+    # 103.8 vs 85.9, GLM-5.1 M=64 344 vs 293).
+    return (
+        cfg["tile_m"] == 16
+        and cfg.get("stage1") not in ("general", "8wave")
+        and spec.inter_dim <= 256
+    )
+
+
 def _tile_config(gpu, config, m, topk, experts):
     table = _configs(gpu)
     if config:
@@ -186,11 +199,7 @@ class _Fp8BlockGfx950(MoeKernel):
                 act=_ACTS[spec.act],
             )
         else:
-            # The decode stage 1 wins at inter_dim <= 256 (DSV3 / Qwen3.5 M=8: 84.4 vs 93.5 us
-            # warm, 88.9 vs 113.9 cold) and loses to stage1.py at 1024-2048 (synthetic M=128
-            # 103.8 vs 85.9, GLM-5.1 M=64 344 vs 293).
-            if (cfg["tile_m"] == 16 and cfg.get("stage1") != "general"
-                    and spec.inter_dim <= 256):
+            if _decode_stage1(cfg, spec):
                 from aiter.ops.flydsl.kernels.moe_next.gfx950_fp8_block.stage1_decode import (
                     compile_stage1,
                 )
@@ -237,7 +246,11 @@ class _Fp8BlockGfx950(MoeKernel):
         combine = self._combine or cfg.get("combine", "atomic_bf16")
         x = call.hidden_states
         M, D, I = call.m, spec.model_dim, spec.inter_dim
-        xq, xs = per_group_quant_hip(x, quant_dtype=dtypes.fp8, group_size=128)
+        if _decode_stage1(cfg, spec):
+            # bf16 x as bytes; stage 1 reads no activation scales (the slot takes any f32 tensor)
+            xq, xs = x.contiguous().view(torch.int8), w1s
+        else:
+            xq, xs = per_group_quant_hip(x, quant_dtype=dtypes.fp8, group_size=128)
         # atomic_bf16: the sort zeroes the output (or output=); atomic_f32: it zeroes
         # an f32 buffer; rows_* write every route row, so nothing is zeroed.
         if combine == "atomic_bf16":

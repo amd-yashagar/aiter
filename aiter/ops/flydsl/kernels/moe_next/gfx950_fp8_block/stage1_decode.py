@@ -47,6 +47,11 @@ from . import helpers as fxh
 _NO_PACKED_F32 = {"llvm.passthrough": [["target-features", "-packed-fp32-ops"]]}
 
 CHANNELS = 128  # intermediate channels per workgroup = one quant group
+# Stage 1 register prefetch ring depth (W1 + A tiles per lane, 40 VGPRs each). One 4-wave
+# workgroup per CU streams W1, so the ring is the only cover for HBM latency: PF-1 tiles
+# (32 KiB of W1 per CU each) stay in flight at every wait. Every split's K tile count
+# (dsv3 56/28, qwen35 32) must be a multiple of it.
+STAGE1_PF = 2
 # sc0 | sc1: split-K partials cross XCDs, which do not share L2; these accesses write
 # through and read past it.
 CPOL_COHERENT = 0x1 | 0x10
@@ -99,7 +104,10 @@ def _build_stage1(
     _swz_params = (3, 4, 3)
     NT_B = 3  # W1 load cache policy (0 cached, 2 nt)
     DIRECT_A = bool(wide_k)  # A tile straight to MFMA operand VGPRs, no LDS/barrier in loop
-    PF = 2  # register prefetch ring depth (tiles); KB must be a multiple of lcm(PF, 2)
+    # Direct A reads x as bf16 and quantizes it in the K loop (no separate quant launch);
+    # the gather path reads the pre-quantized fp8 x.
+    A_BYTES = 2 if DIRECT_A else 1
+    PF = int(STAGE1_PF)  # register prefetch ring depth (tiles); KB must be a multiple of lcm(PF, 2)
     assert NTL % PF == 0 and PF % 2 == 0
     _thrs_k = TILE_K // _val_per_thr
     _thrs_m = 256 // _thrs_k
@@ -113,7 +121,7 @@ def _build_stage1(
         mma_atom, tiled_mma = fxh.make_1x4_tiled_mma(elem_t, wide_k)
 
         a_tensor = fx.rocdl.make_buffer_tensor(
-            arg_p_input, max_size=False, num_records_bytes=fx.Int64(M) * fx.Int64(K)
+            arg_p_input, max_size=False, num_records_bytes=fx.Int64(M) * fx.Int64(K * A_BYTES)
         )
         b_tensor = fx.rocdl.make_buffer_tensor(arg_p_weight, max_size=False)
         a_size_buf = fx.rocdl.make_buffer_tensor(
@@ -168,10 +176,10 @@ def _build_stage1(
                     kbl = (kbl < fx.Int32(NTL)).select(kbl, fx.Int32(NTL - 1))
                 kbi = sp * fx.Int32(NTL) + kbl
                 if const_expr(DIRECT_A):
-                    tok = sid_v & fx.Int32(0xFFFFFF)  # row == tid % BM (BM divides 256)
+                    sa = None  # x is quantized in the K loop: stage only the W1 scale
                 else:
                     tok = sid_view[row] & fx.Int32(0xFFFFFF)
-                sa = a_scale_t[tok * fx.Int32(KB) + kbi]
+                    sa = a_scale_t[tok * fx.Int32(KB) + kbi]
                 sw = w_scale_t[(gsel == fx.Int32(0)).select(sw_gate_base, sw_up_base) + kbi]
                 scl_vals.append((idx, sa, sw))
             return scl_vals
@@ -243,7 +251,7 @@ def _build_stage1(
             fx.size(fx.get_shape(a_cp_frag_bufs[0])).to_py_value() // _val_per_thr
         )
         if const_expr(DIRECT_A):
-            _a_loads_per_tile = 2 * (BM // 16)
+            _a_loads_per_tile = 4 * (BM // 16)  # 64 B of bf16 x per lane and token rep
         _loads_per_tile = _a_loads_per_tile + _b_loads_per_tile
 
         c_fake_buf = fx.rocdl.make_buffer_tensor(
@@ -287,22 +295,52 @@ def _build_stage1(
                 tokn = sid_v & fx.Int32(0xFFFFFF)  # tid % 16 == lane % 16
             else:
                 tokn = sorted_ids[fx.Int32(n * 16) + lane64 % fx.Int32(16)] & fx.Int32(0xFFFFFF)
-            a_lane_off.append(tokn * fx.Int32(K) + (lane64 // fx.Int32(16)) * fx.Int32(32))
-        a_ring = [[fx.make_rmem_tensor(8, fx.Int32) for _ in range(_NA)] for _ in range(PF)]
+            a_lane_off.append(tokn * fx.Int32(2 * K) + (lane64 // fx.Int32(16)) * fx.Int32(64))
+        a_ring = [[fx.make_rmem_tensor(16, fx.Int32) for _ in range(_NA)] for _ in range(PF)]
 
         def _load_a_direct(kb, s):
+            # this lane's 32 bf16 of x (token lane%16, K (lane//16)*32..+32): 4 x 16 B
             for n in range_constexpr(_NA):
-                off = a_lane_off[n] + kb * fx.Int32(TILE_K)
-                lo = Vec(rocdl.raw_ptr_buffer_load(
-                    T.vec(4, T.i32), a_rsrc, off.ir_value(), fx.Int32(0).ir_value(), aux=0
-                ))
-                hi = Vec(rocdl.raw_ptr_buffer_load(
-                    T.vec(4, T.i32), a_rsrc, (off + fx.Int32(16)).ir_value(),
-                    fx.Int32(0).ir_value(), aux=0
-                ))
-                a_ring[s][n].store(
-                    Vec.from_elements([lo[i] for i in range(4)] + [hi[i] for i in range(4)], fx.Int32)
+                off = a_lane_off[n] + kb * fx.Int32(2 * TILE_K)
+                parts = []
+                for q in range_constexpr(4):
+                    v = Vec(rocdl.raw_ptr_buffer_load(
+                        T.vec(4, T.i32), a_rsrc, (off + fx.Int32(16 * q)).ir_value(),
+                        fx.Int32(0).ir_value(), aux=0
+                    ))
+                    parts += [v[i] for i in range(4)]
+                a_ring[s][n].store(Vec.from_elements(parts, fx.Int32))
+
+        def _quant_a(s, n):
+            # aiter's per-group HIP quant of x, fused: amax over the 128-wide K group
+            # (this lane's 32 values, then lanes l^16, l^32, l^48), floored at kAmaxFloor;
+            # scale = amax * (1/448), q = fp8(x * (1 / scale)). Returns the MFMA B operand
+            # (8 dwords of fp8) and this lane's token scale.
+            raw = Vec(a_ring[s][n].load())
+            xf = []
+            for i in range_constexpr(16):
+                w = raw[i]
+                xf.append((w << fx.Int32(16)).bitcast(fx.Float32))
+                xf.append((w & fx.Int32(-65536)).bitcast(fx.Float32))
+            mx = fx.Float32(fxh.AMAX_FLOOR)
+            for v in xf:
+                mx = fx.max(mx, fx.math.absf(v))
+            mx = fx.max(mx, mx.shuffle_xor(16, 64))
+            mx = fx.max(mx, mx.shuffle_xor(32, 64))
+            scale = mx * fx.Float32(fxh.FP8_MAX_RCP)
+            inv_scale = fx.Float32(1.0) / scale
+            qd = []
+            for j in range_constexpr(8):
+                lo = rocdl.cvt_pk_fp8_f32(
+                    res=T.i32, src_a=xf[4 * j] * inv_scale, src_b=xf[4 * j + 1] * inv_scale,
+                    old=fx.Int32(0), word_sel=False
                 )
+                pk = rocdl.cvt_pk_fp8_f32(
+                    res=T.i32, src_a=xf[4 * j + 2] * inv_scale, src_b=xf[4 * j + 3] * inv_scale,
+                    old=lo, word_sel=True
+                )
+                qd.append(pk)
+            return Vec.from_elements(qd, fx.Int32), scale
 
         def _load_gmem(kt, s):
             kb = _phys(kt)
@@ -354,8 +392,10 @@ def _build_stage1(
             # so the fold's VALU issues under the next MFMA (lag-scale-fold-behind-mfma).
             pending = None
             for n in range_constexpr(n_reps):
+                sg, su = fg[n], fu[n]
                 if const_expr(DIRECT_A):
-                    tok = Vec(a_ring[s][n].load())
+                    tok, sa = _quant_a(s, n)
+                    sg, su = sg * sa, su * sa
                 else:
                     # this token rep's A straight from the current LDS buffer: only one rep live
                     fx.copy(
@@ -366,8 +406,8 @@ def _build_stage1(
                     tok = Vec(a_frag_bufs[lb][None, n, 0].load()).bitcast(fx.Int32)
                 for m in range_constexpr(m_reps):
                     for acc, wf, sw in (
-                        (c_gate, bl_frag_bufs[s], fg[n]),
-                        (c_up, br_frag_bufs[s], fu[n]),
+                        (c_gate, bl_frag_bufs[s], sg),
+                        (c_up, br_frag_bufs[s], su),
                     ):
                         p = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                             T.vec(4, T.f32),
@@ -410,7 +450,7 @@ def _build_stage1(
                 _load_gmem(min(t, NTL - 1), t)
                 rocdl.sched_barrier(0)  # keep tiles in issue order: the vmcnt counts them
         for idx, sa, sw in scl_vals:
-            scl_view[idx] = sa * sw
+            scl_view[idx] = sw if DIRECT_A else sa * sw
         if const_expr(DIRECT_A):
             gpu.barrier()  # the loop reads scales other threads stored above
             for ktp in range(0, NTL, PF):
@@ -418,7 +458,12 @@ def _build_stage1(
                     kt = fx.Int32(ktp) + fx.Int32(u)
                     kn = kt + fx.Int32(PF - 1)
                     kn = (kn < fx.Int32(NTL)).select(kn, last)
+                    # pin the step order: unfenced, LLVM hoists a later step's x quant and
+                    # MFMAs (slot loaded at the end of the previous trip) above this step's
+                    # loads, and the in-order vmcnt then drains the whole ring (vmcnt(0))
+                    rocdl.sched_barrier(0)
                     _load_gmem(kn, (u + PF - 1) % PF)
+                    rocdl.sched_barrier(0)  # this step's quant waits behind its loads
                     rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=(PF - 1) * _loads_per_tile))
                     fg, fu = _scales(kt)
                     _mfma_fold(0, u, fg, fu)
@@ -563,9 +608,12 @@ def _build_stage1(
         i32_rows: fx.Int32,
     ):
         tid = gpu.thread_idx.x
-        blk_n = gpu.block_idx.x
+        # split-K folded into x (split-major over the blocks): one tile's active
+        # workgroups are consecutive in dispatch order, ahead of the empty tiles
+        bx = gpu.block_idx.x
+        blk_n = bx % fx.Int32(IB) if const_expr(SPLITS > 1) else bx
+        split = bx // fx.Int32(IB) if const_expr(SPLITS > 1) else gpu.block_idx.z
         e_idx = gpu.block_idx.y
-        split = gpu.block_idx.z
         M = i32_tokens
         in_ptr = fx.recast_iter(elem_t, fx.get_iter(arg_x))
         arg_p_input = fx.make_view(
@@ -795,7 +843,7 @@ def _build_stage1(
             i32_rows,
             value_attrs=_NO_PACKED_F32,
         ).launch(
-            grid=(IB, fx.Int64(i32_tiles), SPLITS), block=(256, 1, 1), stream=stream
+            grid=(IB * SPLITS, fx.Int64(i32_tiles), 1), block=(256, 1, 1), stream=stream
         )
 
     return launch_fp8b_stage1 if SPLITS == 1 else launch_fp8b_stage1_splitk
