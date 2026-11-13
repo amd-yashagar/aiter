@@ -37,6 +37,8 @@ ASM_STAGE1 = "_ZN5aiter56fmoe_stage1_bf16_pertokenFp8_doweight_g1u1_32x64_4tg_pf
 FLY_S1 = "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w4_gui_fp8"
 FLY_S2 = "flydsl_moe2_afp8_wfp4_bf16_t32x128x128_atomic_bnt2"
 FLY_S2_LAYOUT = "flydsl_moe2_layout_afp8_wfp4_bf16_t32x128x128_atomic_nt_sbm32"
+OPUS_PLAIN = "opus_moe2_afp8_wfp4_fp8_t32x256x256_sbm32_occ4_rbn2240"
+OPUS_LAYOUT = "opus_moe2_layout_afp8_wfp4_fp8_t32x256x256_sbm32_occ4_rbn2240"
 CK_S1 = (
     "moe_ck2stages_gemm1_256x32x128x128_1x4_MulABScaleExpertWeightShuffled_v1_"
     "Nswizzle0_Quant3_MulRoutedWeight0_silu_FP4X2_FP4X2_B16"
@@ -121,10 +123,21 @@ def test_cktile_stage1_with_flydsl_stage2_runs_cktile_stage1(monkeypatch, tmp_pa
     assert _func(meta.stage2) is fused_moe_module._flydsl_stage2_wrapper
 
 
+def test_cktile_stage1_with_plain_opus_stage2_runs_the_opus_stage2(
+    monkeypatch, tmp_path
+):
+    meta = _dispatch(monkeypatch, tmp_path, CKTILE, OPUS_PLAIN)
+    assert _func(meta.stage1) is cktile_moe_stage1
+    assert _func(meta.stage2).__name__ == "opus_a8w4_stage2_wrapper"
+    assert meta.stage2.keywords["kernelName"] == OPUS_PLAIN
+    assert meta.fuse_quant == ""
+
+
 @pytest.mark.parametrize(
     "kernel1,kernel2",
     [
         (CKTILE, FLY_S2_LAYOUT),
+        (CKTILE, OPUS_LAYOUT),
         (ASM_STAGE1, FLY_S2),
         (ASM_STAGE1, FLY_S2_LAYOUT),
         (CK_S1, FLY_S2_LAYOUT),
@@ -142,6 +155,8 @@ def test_pairs_without_a_correct_combination_are_refused(
     [
         (FLY_S1, FLY_S2, "_flydsl_stage1_wrapper", "_flydsl_stage2_wrapper"),
         (FLY_S1, CKTILE, "_flydsl_stage1_wrapper", "cktile_moe_stage2"),
+        (FLY_S1, OPUS_PLAIN, "_flydsl_stage1_wrapper", "opus_a8w4_stage2_wrapper"),
+        (FLY_S1, OPUS_LAYOUT, "_flydsl_stage1_wrapper", "opus_a8w4_stage2_wrapper"),
         (CKTILE, CKTILE, "cktile_moe_stage1", "cktile_moe_stage2"),
     ],
 )
