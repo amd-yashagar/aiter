@@ -1,1 +1,11 @@
 family,model_dim,inter_dim,experts,topk,act,doweight_stage1,m_min,m_max,kernel,config,verified,note
+fp8-token,*,*,2048,*,*,*,0,2147483648,aiter,,harness 828341869 tier1 acb14acf1,prefill slower than dispatch at E2048
+fp8-token,6144,384,129,5,swiglu,0,16,512,gfx942_fp8_token.mid,m32nbd2,harness 54ddd926a gate acd471eb8,mid band; M=16 beats decode cold (109 vs 166 us) and warm
+fp8-token,6144,384,129,5,swiglu,0,513,1024,gfx942_fp8_token.mid,m64nbd2,harness 54ddd926a gate acd471eb8,mid band
+fp8-token,4096,128,513,11,silu,0,25,64,gfx942_fp8_token.mid,m32nbd2,harness 54ddd926a gate acd471eb8,mid band
+fp8-token,4096,128,513,11,silu,0,65,160,gfx942_fp8_token.mid,m32gw8,harness 54ddd926a gate acd471eb8,mid band
+fp8-token,4096,128,513,11,silu,0,161,1024,gfx942_fp8_token.mid_atomic,m32gw8,harness 54ddd926a gate acd471eb8,mid band
+fp8-token,*,*,*,*,*,*,0,16,gfx942_fp8_token.decode,,harness 54ddd926a paired bar d0395e8ec,decode: median at or below the bar warm and cold on MiniMax-M3 E128/E129 M=8/12/16; Qwen3.5 shapes beat a dispatch that fails accuracy (MOEBUG-022)
+fp8-token,*,*,*,*,*,*,4096,2147483648,gfx942_fp8_token.prefill,,harness 828341869 tier1 acb14acf1,prefill: faster than dispatch and the M=4096 bars
+fp8-tensor,*,*,*,*,*,*,0,16,gfx942_fp8_token.decode,,harness 828341869 tier1 acb14acf1,decode serves per-tensor too
+fp8-tensor,*,*,*,*,*,*,4096,2147483648,gfx942_fp8_tensor.prefill,,harness 828341869 tier1 acb14acf1,per-tensor prefill
