@@ -27,5 +27,8 @@
     "gateup_ch": 1,
     "down_nbd": 4,
     "down_rows": 32
+  },
+  "g2": {
+    "gateup_waves": 2
   }
 }
