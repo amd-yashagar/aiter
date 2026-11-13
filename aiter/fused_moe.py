@@ -37,7 +37,7 @@ from aiter.fused_moe_registry import (
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import (
     get_cu_num,
-    get_gfx,
+    get_gfx,  # noqa: F401 -- kept for callers that patch or import it from here
     get_gfx_runtime,
     gfx_from_cu_num,
 )
@@ -1619,7 +1619,7 @@ def _fused_moe_impl(
     if herd_topk:
         # Only the gfx1250 integration passes K+1 candidates to MoE.
         # Other architectures finish HERD in the router and pass K routes.
-        if get_gfx() != "gfx1250":
+        if get_gfx_runtime() != "gfx1250":
             raise ValueError("herd_topk is supported only on gfx1250")
         if topk != herd_topk + 1 or topk_weight.shape != topk_ids.shape:
             raise ValueError(
@@ -1649,7 +1649,7 @@ def _fused_moe_impl(
     isShuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
     # gfx1250: GUGU row-interleave, not 16-row block shuffle.
     if (
-        get_gfx() in ("gfx1250", "gfx1250-strict")
+        get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
         and isG1U1
         and gate_mode != GateMode.INTERLEAVE
     ):
@@ -1747,7 +1747,7 @@ def _fused_moe_impl(
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
-    if herd_topk and get_gfx() == "gfx1250":
+    if herd_topk and get_gfx_runtime() == "gfx1250":
         raise ValueError(
             "gfx1250 HERD needs the grouped MoE path (per_1x32 MXFP4 weights, "
             "gate_mode=INTERLEAVE)"
@@ -1787,10 +1787,10 @@ def _fused_moe_impl(
         )
         for _bad, _why in (
             (
-                get_gfx() not in ("gfx942", "gfx950"),
+                get_gfx_runtime() not in ("gfx942", "gfx950"),
                 (
                     f"requires the FlyDSL kernel on CDNA gfx942/gfx950 "
-                    f"(gfx={get_gfx()!r})"
+                    f"(gfx={get_gfx_runtime()!r})"
                 ),
             ),
             (bias1 is not None or bias2 is not None, "per-expert bias"),
@@ -2016,10 +2016,10 @@ def _fused_moe_impl(
         and stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1)
         and expert_mask is not None
     )
-    assert asm_mode.requires_host_sort or get_gfx() in (
+    assert asm_mode.requires_host_sort or get_gfx_runtime() in (
         "gfx942",
         "gfx950",
-    ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
+    ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx_runtime()}. "
 
     sort_m_indices = None
     sort_reverse_sorted = None
@@ -4822,10 +4822,10 @@ def get_2stage_cfgs(
             q_dtype_w,
             use_g1u1,
             doweight_stage1,
-        ) in fused_moe_1stage_dict.get(get_gfx(), {}):
+        ) in fused_moe_1stage_dict.get(get_gfx_runtime(), {}):
             if q_type == QuantType.per_1x128:
                 xbf16 = (
-                    get_gfx() == "gfx950"
+                    get_gfx_runtime() == "gfx950"
                     and int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
                 )
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
@@ -6969,7 +6969,7 @@ def fused_topk(
     # The asm kernel takes no pad-row count.
     if (
         num_valid_rows is None
-        and get_gfx() in ["gfx942", "gfx950"]
+        and get_gfx_runtime() in ["gfx942", "gfx950"]
         and (expert, topk)
         in [
             (128, 4),

@@ -378,6 +378,7 @@ def test_herd_topk_is_only_for_gfx1250(monkeypatch, gfx, tokens, experts, topk):
     moe = importlib.import_module("aiter.fused_moe")
     grouped = importlib.import_module("aiter.ops.flydsl.grouped_moe_gfx1250")
     monkeypatch.setattr(moe, "get_gfx", lambda: gfx)
+    monkeypatch.setattr(moe, "get_gfx_runtime", lambda: gfx)
     dim = 256
     ids, values = _candidates(tokens, experts, topk)
     hidden = torch.zeros(tokens, dim, device="cuda", dtype=torch.bfloat16)
