@@ -92,5 +92,41 @@ def test_ck_fp8_stage2_small_inter_dim(quant_type, inter_dim, token, block_size_
     assert diff < 1e-2, f"{diff=}, mean|out|={out.abs().mean():.6f}"
 
 
+@pytest.mark.skipif(get_gfx() != "gfx942", reason="gfx942 CK fp8 tile constraints")
+@pytest.mark.parametrize(
+    "quant_type, model_dim, inter_dim, token",
+    [
+        (aiter.QuantType.per_Tensor, 1024, 224, 8),
+        (aiter.QuantType.per_Tensor, 1024, 480, 512),
+        (aiter.QuantType.per_Tensor, 1088, 320, 8),
+        (aiter.QuantType.per_Tensor, 1088, 320, 512),
+    ],
+)
+def test_ck_fp8_unsupported_shape_is_refused_cleanly(
+    quant_type, model_dim, inter_dim, token
+):
+    """CK cannot tile these sizes; dispatch must say so instead of letting CK raise
+    "device_gemm ... does not support this GEMM problem" from deep inside the call."""
+    hidden = torch.randn((token, model_dim), dtype=dtypes.bf16, device="cuda")
+    w1 = torch.randn((E, inter_dim * 2, model_dim), device="cuda") / 10
+    w2 = torch.randn((E, model_dim, inter_dim), device="cuda") / 10
+    topk_weights, topk_ids = torch.softmax(
+        torch.randn((token, E), device="cuda"), dim=-1
+    ).topk(TOPK, dim=-1)
+    w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=dtypes.fp8)
+    w2_qt, w2_scale = aiter.pertoken_quant(w2.view(E, -1), quant_dtype=dtypes.fp8)
+    with pytest.raises(NotImplementedError, match="gfx942"):
+        fused_moe(
+            hidden,
+            shuffle_weight(w1_qt.view(w1.shape), layout=(16, 16)),
+            shuffle_weight(w2_qt.view(w2.shape), layout=(16, 16)),
+            topk_weights,
+            topk_ids.to(dtypes.i32),
+            quant_type=quant_type,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
