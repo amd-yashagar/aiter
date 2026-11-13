@@ -110,17 +110,12 @@ def append_verdicts(rows, path=None):
     have = set()
     if os.path.exists(path):
         with open(path, newline="") as f:
-            have = {
-                (r["gfx"], r["stage1_tile"], r.get("status") or "exclude")
-                for r in csv.DictReader(f)
-            }
+            have = {(r["gfx"], r["stage1_tile"]) for r in csv.DictReader(f)}
     new = []
     for r in rows:
         r = {**r, "stage1_tile": r["stage1_tile"].rstrip("E")}
-        key = (
-            r["gfx"],
-            r["stage1_tile"],
-        )  # a watch entry is not re-added as an exclusion: edit its status
+        # a watch entry is not re-added as an exclusion: edit its status to promote it
+        key = (r["gfx"], r["stage1_tile"])
         if key not in have:
             have.add(key)
             new.append({c: r.get(c, "") for c in UNSAFE_COLS})
