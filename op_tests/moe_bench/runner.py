@@ -10,7 +10,6 @@ environment). A crash or hang marks the case ``crash`` or ``timeout`` and the ru
 continues; results are flushed after every row.
 """
 
-import csv
 import datetime
 import json
 import os
@@ -255,23 +254,17 @@ class Results:
     def __init__(self, path, resume):
         self.path = path
         self.done = set()
-        new = not os.path.exists(path) or not resume
+        self.out = schema.Appender(path, RESULT_COLS, resume)
         if resume and os.path.exists(path):
             for r in schema.read_csv(path):
                 self.done.add((r["case_id"], r["mode"]))
-        self.fh = open(path, "w" if new else "a", newline="")  # noqa: SIM115
-        self.w = csv.DictWriter(self.fh, fieldnames=RESULT_COLS, extrasaction="ignore")
-        if new:
-            self.w.writeheader()
-            self.fh.flush()
 
     def add(self, row):
-        self.w.writerow(row)
-        self.fh.flush()
+        self.out.add_row(row)
         self.done.add((row["case_id"], row["mode"]))
 
     def close(self):
-        self.fh.close()
+        self.out.close()
 
 
 def select_cases(paths, case_filter=None):

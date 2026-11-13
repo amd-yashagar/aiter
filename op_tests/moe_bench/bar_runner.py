@@ -149,25 +149,20 @@ class Table:
     """Append-only CSV with a flush per row."""
 
     def __init__(self, path, cols, resume, key=("case_id", "mode")):
-        self.cols, self.key = cols, key
+        self.key = key
         self.done = set()
-        new = not os.path.exists(path) or not resume
-        if not new:
+        self.out = schema.Appender(path, cols, resume)
+        self.cols = self.out.cols
+        if os.path.exists(path) and resume:
             for r in schema.read_csv(path):
                 self.done.add(tuple(r[k] for k in key))
-        self.fh = open(path, "w" if new else "a", newline="")  # noqa: SIM115
-        self.w = csv.DictWriter(self.fh, fieldnames=cols, extrasaction="ignore")
-        if new:
-            self.w.writeheader()
-            self.fh.flush()
 
     def add(self, row):
-        self.w.writerow(row)
-        self.fh.flush()
+        self.out.add_row(row)
         self.done.add(tuple(row.get(k, "") for k in self.key))
 
     def close(self):
-        self.fh.close()
+        self.out.close()
 
 
 def _row(case, ev, meta, cols):

@@ -8,7 +8,9 @@ carries a ``reason`` and an ``added_by``. See the GM-123 plan for the tiers.
 
 import csv
 import hashlib
+import io
 import os
+import sys
 from dataclasses import dataclass, field
 
 COLS = [
@@ -109,9 +111,130 @@ def _flag_on(v):
     return v not in (None, "", "0", "0.0", "False", "None", "none")
 
 
-def read_csv(path):
+class CsvShapeError(ValueError):
+    """A CSV has rows whose field count differs from its header's."""
+
+
+def shape_problems(path):
+    """[(record number, first line, fields)] of every row whose field count is not the
+    header's (a row glued to a half-written one, a column added between a run and its
+    resume, a field that was not quoted). Empty for a well-formed file."""
+    csv.field_size_limit(1 << 28)
+    out = []
+    with open(path, newline="") as f:
+        rd = csv.reader(f)
+        header, line = None, 1
+        for n, row in enumerate(rd):
+            if header is None:
+                header = len(row)
+            elif len(row) != header:
+                out.append((n, line, len(row)))
+            line = rd.line_num + 1
+    return out
+
+
+def read_csv(path, strict=False):
+    """The rows of a CSV as dicts. A row of the wrong field count is flagged: with
+    ``strict`` it raises ``CsvShapeError``, otherwise it is reported on stderr (once per
+    call) and still returned the way DictReader reads it."""
+    bad = shape_problems(path)
+    if bad:
+        msg = (
+            f"{path}: {len(bad)} rows have a field count other than the header's "
+            f"(record, line, fields): {bad[:5]}"
+        )
+        if strict:
+            raise CsvShapeError(msg)
+        print(f"WARNING {msg}", file=sys.stderr, flush=True)
     with open(path, newline="") as f:
         return list(csv.DictReader(f))
+
+
+def format_row(cols, row):
+    """One CSV record as text, through csv.DictWriter (quotes, escapes and embedded
+    newlines handled): the only way this harness builds a CSV line."""
+    buf = io.StringIO()
+    csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore").writerow(
+        {c: row.get(c, "") for c in cols}
+    )
+    return buf.getvalue()
+
+
+def migrate(path, cols):
+    """Make ``path`` safe to append ``cols`` rows to. Rows are told apart by field count:
+    a row that fits the file's header or the current columns is kept (mapped onto the
+    union header), any other (a row cut off by a kill, two writers' rows interleaved) goes
+    to ``<path>.rejected`` and out of the file. Rewritten through a temp file and renamed,
+    only when something differs. Returns (header, kept, rejected)."""
+    csv.field_size_limit(1 << 28)
+    with open(path, newline="") as f:
+        text = f.read()
+    rows = list(csv.reader(io.StringIO(text, newline="")))
+    if not rows:
+        return list(cols), 0, 0
+    old = rows[0]
+    header = list(cols) + [c for c in old if c not in cols]
+    complete = text.endswith(("\n", "\r"))
+    kept, rejected = [], []
+    for i, r in enumerate(rows[1:]):
+        last_partial = i == len(rows) - 2 and not complete
+        if last_partial:
+            rejected.append(r)
+        elif len(r) == len(old):
+            kept.append(dict(zip(old, r, strict=True)))
+        elif len(r) == len(cols):
+            kept.append(dict(zip(cols, r, strict=True)))
+        else:
+            rejected.append(r)
+    if header == old and not rejected and complete:
+        return header, len(kept), 0
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        w.writerows(kept)
+    os.replace(tmp, path)
+    if rejected:
+        with open(path + ".rejected", "a", newline="") as f:
+            csv.writer(f).writerows(rejected)
+    return header, len(kept), len(rejected)
+
+
+class Appender:
+    """Append-only CSV, one ``os.write`` per row on an O_APPEND descriptor: two processes
+    appending to one file cannot interleave inside a row, and a kill leaves at worst a
+    missing row, not a half one. Resuming first runs ``migrate`` (a changed column list
+    or a cut-off row is repaired, not appended to)."""
+
+    def __init__(self, path, cols, resume):
+        self.path = path
+        new = not os.path.exists(path) or not resume
+        self.cols = list(cols)
+        if not new:
+            self.cols, _, n = migrate(path, cols)
+            if n:
+                print(
+                    f"WARNING {path}: {n} malformed rows moved to {path}.rejected",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | (os.O_TRUNC if new else 0)
+        self.fd = os.open(path, flags, 0o644)
+        if new:
+            self._write(format_row(self.cols, {c: c for c in self.cols}))
+
+    def _write(self, line):
+        data = line.encode()
+        if os.write(self.fd, data) != len(data):
+            raise OSError(f"short write to {self.path}")
+
+    def add_row(self, row):
+        self._write(format_row(self.cols, row))
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
 
 
 def load_tier(path):
@@ -254,3 +377,22 @@ def tier_paths(tiers_dir):
         if name.startswith("tier") and name.endswith(".csv"):
             out[name[:-4]] = os.path.join(tiers_dir, name)
     return out
+
+
+def main(argv=None):
+    """``python -m op_tests.moe_bench.schema FILE...``: exit 1 when a CSV has a row whose
+    field count is not its header's, naming the rows."""
+    paths = sys.argv[1:] if argv is None else argv
+    bad = 0
+    for p in paths:
+        problems = shape_problems(p)
+        if problems:
+            bad += 1
+            print(
+                f"{p}: {len(problems)} malformed rows (record, line, fields): {problems[:10]}"
+            )
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

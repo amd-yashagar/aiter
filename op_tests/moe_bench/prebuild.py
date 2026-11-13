@@ -22,6 +22,7 @@ stays on the lease; ASM kernels are prebuilt code objects with nothing to build.
 
 import argparse
 import contextlib
+import csv
 import json
 import os
 import shutil
@@ -170,8 +171,8 @@ def fallback_modules(S, case):
 
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "empty_fmoe.csv")
-        with open(path, "w") as f:
-            f.write(",".join(fused_cfg.CSV_COLS) + "\n")
+        with open(path, "w", newline="") as f:
+            csv.writer(f).writerow(fused_cfg.CSV_COLS)
         old = os.environ.get("AITER_CONFIG_FMOE")
         os.environ["AITER_CONFIG_FMOE"] = path
         fused_cfg.reset_router()
