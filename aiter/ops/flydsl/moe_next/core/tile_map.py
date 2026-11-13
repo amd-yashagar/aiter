@@ -41,7 +41,10 @@ class TileMap:
     ``t < num_live_tiles[0]``; rows ``>= num_valid_ids[0]`` and tiles
     ``>= num_live_tiles[0]`` hold garbage. ``loc_ids[t * topk + k]`` (when
     requested) is route (t, k)'s sorted row, -1 for a dropped route (masked,
-    -1 id, or a repeated expert's earlier slot); tokens at or past the token
+    -1 id, or a repeated expert's earlier slot: an expert repeated within a
+    token keeps only its last slot, deterministically; aiter's sorts keep one
+    slot by another, unspecified rule, so which slot and weight survive can
+    differ from aiter there, MOEBUG-035); tokens at or past the token
     count are not written. ``ready_flags`` is reserved for a single persistent
     launch over both stages (not allocated today). ``a_q`` / ``a_scale`` are
     the quantized activations when ``quant_mode`` was given (QUANT_MODES).

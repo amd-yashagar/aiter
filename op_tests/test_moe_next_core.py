@@ -58,9 +58,10 @@ def compare(a, b, tile_m, out_a, out_b, slots=True):
     """Field names that differ between two tile maps (valid regions only).
 
     ``slots=False`` ignores which topk slot a row came from (and its weight):
-    for an expert repeated within one token, aiter keeps one slot, and which
-    one is a cross-wave LDS write race when the token's slots span two waves;
-    ours keeps the last slot."""
+    for an expert repeated within one token, aiter keeps one slot by its own
+    unspecified rule (opus and CK prefer the larger slot % 4, then the lower
+    slot // 4; FlyDSL another; all nondeterministic when the token spans two
+    64-lane waves: MOEBUG-035); core keeps the last slot (test_repeat_keep_last)."""
     nv = int(b.num_valid_ids[0])
     nt = nv // tile_m
     bad = []
@@ -84,6 +85,86 @@ def compare(a, b, tile_m, out_a, out_b, slots=True):
     if out_a is not None and not torch.equal(out_a, out_b):
         bad.append("zero_fill")
     return bad
+
+
+def _repeat_routing(token, E, topk, seed):
+    """topk ids with repeated experts in most tokens (pairs, runs, a token all
+    one expert), weights all distinct, so the kept slot is visible."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    ti = torch.stack(
+        [torch.randperm(E, generator=g, device="cpu")[:topk] for _ in range(token)]
+    )
+    for t in range(token):
+        kind = t % 4
+        if kind == 1:  # one pair
+            a, b = torch.randperm(topk, generator=g, device="cpu")[:2].tolist()
+            ti[t, b] = ti[t, a]
+        elif kind == 2:  # every slot the same expert
+            ti[t] = ti[t, 0]
+        elif kind == 3:  # runs of three
+            for k in range(2, topk, 3):
+                ti[t, k] = ti[t, k - 2]
+                ti[t, k - 1] = ti[t, k - 2]
+    tw = torch.arange(1, token * topk + 1, dtype=torch.float32, device="cpu")
+    tw = tw.view(token, topk)
+    return ti.int().cuda(), (tw / (token * topk)).cuda()
+
+
+def test_repeat_keep_last():
+    """Core's rule for an expert repeated within one token: exactly one row per
+    (token, expert), from the token's last slot of that expert, with that
+    slot's weight; earlier slots are dropped (loc_ids -1). On the one-shot and
+    two-launch paths, at topk 2, 8, 9 and 11 (9 and 11: tokens span two
+    64-lane waves), tile_m 16 and 32. Not compared with aiter, whose kept slot
+    follows another, unspecified rule (MOEBUG-035)."""
+    rows_out = []
+    for token, E, topk, tile_m in [
+        (8, 16, 2, 32),
+        (64, 32, 8, 16),
+        (100, 64, 9, 32),
+        (93, 257, 11, 16),
+        (300, 64, 9, 32),  # 2700 routes
+        (2000, 257, 11, 32),  # 22000 routes: two launches
+        (1000, 16, 9, 16),  # 9000 routes: two launches
+    ]:
+        ti, tw = _repeat_routing(token, E, topk, token + topk)
+        tm = route_to_tiles(ti, tw, num_experts=E, tile_m=tile_m, with_loc_ids=True)
+        nv = int(tm.num_valid_ids[0])
+        sid = tm.sorted_token_ids[:nv].cpu().long()
+        sw = tm.sorted_weights[:nv].cpu()
+        tok, slot = sid & 0xFFFFFF, sid >> 24
+        real = slot < topk
+        tok, slot, sw = tok[real], slot[real], sw[real]
+        tic, twc = ti.cpu().long(), tw.cpu()
+        expert = tic[tok, slot]
+        keys = (tok * (E + 1) + expert).tolist()
+        bad = []
+        if len(keys) != len(set(keys)):
+            bad.append("more than one row per (token, expert)")
+        want = {}
+        for t in range(token):
+            for k in range(topk):
+                want[(t, int(tic[t, k]))] = k  # the last slot of each expert wins
+        got = {(int(t), int(e)): int(k) for t, e, k in zip(tok, expert, slot)}
+        if got != want:
+            bad.append("kept slots")
+        if not torch.equal(sw, twc[tok, slot]):
+            bad.append("weights of the kept slots")
+        loc = tm.loc_ids.cpu().long()
+        for t in range(token):
+            for k in range(topk):
+                keep = want[(t, int(tic[t, k]))] == k
+                if (loc[t, k] >= 0) != keep:
+                    bad.append(f"loc_ids ({t}, {k})")
+                    break
+        assert not bad, f"keep-last M={token} E={E} topk={topk}: {bad[:3]}"
+        rows_out.append(
+            {
+                "check": f"repeat keeps the last slot M={token} E={E} topk={topk}",
+                "exact": True,
+            }
+        )
+    return rows_out
 
 
 def check_loc_ids(tm, ti, expert_mask, num_local_tokens):
@@ -1331,7 +1412,7 @@ def test_direct_grouping():
                     )
                     kw = {"num_experts": E, "tile_m": 32, "num_local_tokens": nl}
                     kw["expert_mask"] = em
-                    # Opus collapses a repeated expert racily (bugs found, 2)
+                    # aiter keeps a repeated expert's slot by its own rule (MOEBUG-035)
                     refs = [("core sort", route_to_tiles(ti, tw, **kw))]
                     if case not in ("dup", "pad"):
                         refs.append(("opus", reference_tile_map(ti, tw, **kw)))
@@ -1577,7 +1658,7 @@ def main():
         "eager host time:\n%s", pd.DataFrame(test_host_time()).to_markdown(index=False)
     )
     checks = test_graph_capture() + test_intermediate() + test_mfma_native()
-    checks += test_pad_rows() + test_pad_rows_consumer()
+    checks += test_pad_rows() + test_pad_rows_consumer() + test_repeat_keep_last()
     aiter.logger.info("checks:\n%s", pd.DataFrame(checks).to_markdown(index=False))
     if args.tier:
         rows, qrows = [], []

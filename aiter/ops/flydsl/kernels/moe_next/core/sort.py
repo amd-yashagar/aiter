@@ -117,8 +117,10 @@ def _check(e, inb, mask_lds, num_experts, has_mask, halo, i, topk, key_bits):
     """(expert or 0, valid, below, count) of a route slot.
 
     valid: in range, a real expert, local under EP, and not repeated in a later
-    slot of the same token (aiter's sorts keep only the last slot of a repeated
-    expert). below/count: valid routes of the same expert in lower lanes / in
+    slot of the same token: core keeps a repeated expert's last slot, always
+    (aiter's sorts keep one slot by their own unspecified rule, which differs
+    between them and is nondeterministic when a token's slots span two 64-lane
+    waves: MOEBUG-035). below/count: valid routes of the same expert in lower lanes / in
     the wave. A token's slots are consecutive lanes, so a repeat inside the
     wave is a same-expert lane in (lane, lane + topk - 1 - slot]; a token that
     runs past lane 63 also reads the next wave's first lanes through ``halo``.

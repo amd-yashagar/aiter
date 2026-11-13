@@ -9,7 +9,7 @@ per thread of a 256-thread workgroup) in aiter's sort order, in LDS: by expert, 
 rules (-1 and out-of-range ids dropped, experts outside ``expert_mask``
 dropped and the rest renumbered to local ids, tokens at or past
 ``num_local_tokens`` dropped, a repeated expert within a token kept at its
-last slot). It is ``route_to_tiles`` without the padding. ``zero_rows`` zeroes
+last slot, deterministically, which aiter's sorts do not promise). It is ``route_to_tiles`` without the padding. ``zero_rows`` zeroes
 the output rows below the token count, as aiter's sort does, for any element
 type (16-byte stores; rows must be a multiple of 16 bytes).
 """
