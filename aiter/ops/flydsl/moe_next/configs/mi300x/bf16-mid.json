@@ -1,0 +1,17 @@
+{
+  "default": {
+    "tile_m": 32,
+    "gateup_waves": 4,
+    "gateup_ch": 2,
+    "gateup_ks": 1,
+    "gateup_pw": 2,
+    "gateup_pa": 2,
+    "w_cache": 0,
+    "down_nbd": 2,
+    "down_waves": 4,
+    "down_pw": 2,
+    "down_coalesce": true
+  },
+  "m16": {"tile_m": 16},
+  "m64": {"tile_m": 64}
+}
