@@ -415,14 +415,14 @@ def test_flydsl_stage1_kernels_aiter_rejects_for_the_shape_are_unsupported_not_f
     assert f(kw4, 4096) is None  # 1024 is whole tiles
     assert f(kw4, 3586) == "model_dim=3586 not divisible by k_wave=4"
     big = "flydsl_moe1_abf16_wbf16_bf16_t32x16x256_bnt0_kw4"
-    assert f(big, 3072, "gfx942") == "LDS 128 KiB > budget 64 KiB (MOEBUG-061)"
+    assert f(big, 3072, "gfx942") == "stage-1 LDS 128 KiB > budget 64 KiB (MOEBUG-061)"
     assert f(big, 3072, "gfx950") is None
     edge = "flydsl_moe1_abf16_wbf16_bf16_t128x128x128_bnt0"
-    assert f(edge, 3072, "gfx942").startswith(
-        "LDS 64 KiB = budget 64 KiB and tile_m 128"
-    )
+    assert (
+        f(edge, 3072, "gfx942") is None
+    )  # exactly 64 KiB launches (its stage 2 does not)
     assert f("flydsl_moe1_afp4_wfp4_bf16_t32x32x256_bnt0_gui", 3584) is None
-    assert f("flydsl_moe2_afp4_wfp4_bf16_t32x128x128_atomic", 3584) is None  # stage 2
+    assert f("flydsl_moe2_afp4_wfp4_bf16_t32x128x128_atomic", 3584) is None  # no rule
     assert f("moe_ck2stages_gemm1_x", 3584) is None
 
 

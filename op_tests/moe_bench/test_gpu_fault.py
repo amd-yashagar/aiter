@@ -26,19 +26,23 @@ def test_stage_1_configs_over_the_arch_lds_budget_are_unsupported_with_the_reaso
     for name in BIG:
         assert (
             unsupported(name, 3072, "gfx942")
-            == "LDS 128 KiB > budget 64 KiB (MOEBUG-061)"
+            == "stage-1 LDS 128 KiB > budget 64 KiB (MOEBUG-061)"
         ), name
         assert unsupported(name, 3072, "gfx950") is None  # 160 KiB budget
     assert unsupported(SMALL, 3072, "gfx942") is None
     assert unsupported(BIG[0], 3072, None) is None  # arch unknown: not guessed
-    # stage 2 and non-a16 kernels have no LDS rule here
+    # a stage 2 within the budget, and non-a16 kernels (no LDS rule here)
     assert (
         unsupported("flydsl_moe2_abf16_wbf16_bf16_t32x128x128_atomic", 3072, "gfx942")
         is None
     )
+    assert (
+        unsupported("flydsl_moe1_afp4_wfp4_bf16_t32x32x256_bnt0", 3072, "gfx942")
+        is None
+    )
 
 
-def test_every_enumerated_a16w16_config_over_64_kib_is_dropped_on_gfx942():
+def test_every_enumerated_a16w16_stage_1_config_over_64_kib_is_dropped_on_gfx942():
     from aiter.ops.flydsl import moe_kernels as mk
 
     names = mk.get_flydsl_stage1_kernels_a16w16("bf16")
@@ -47,8 +51,7 @@ def test_every_enumerated_a16w16_config_over_64_kib_is_dropped_on_gfx942():
     for n in names:
         p = mk.get_flydsl_kernel_params(n)
         need = mk._gemm1_lds_bytes(p["tile_m"], p["tile_n"], p["tile_k"], p["k_wave"])
-        over = need > 64 * 1024 or (need == 64 * 1024 and p["tile_m"] >= 128)
-        assert (n in dropped) == over, n
+        assert (n in dropped) == (need > 64 * 1024), n  # exactly 64 KiB launches
         assert unsupported(n, 3072, "gfx950") is None
 
 
@@ -92,26 +95,59 @@ def test_a_poisoning_fault_is_recorded_with_its_error_before_the_restart():
     assert job.cand_table.rows[1]["detail"] == "worker exit -11"
 
 
-def test_exactly_at_the_budget_runs_below_tile_m_128_and_is_dropped_at_128_on_gfx942():
-    """The code objects give 64 KiB for all of these; the launches split by tile_m."""
-    ok = [
-        "flydsl_moe1_abf16_wbf16_bf16_t64x128x256_bnt0",  # 64 KiB, tile_m 64: runs
-        "flydsl_moe1_abf16_wbf16_bf16_t32x16x128_bnt0_kw4",  # 64 KiB, tile_m 32: runs
-        "flydsl_moe1_abf16_wbf16_bf16_t16x16x256_bnt0_kw4",  # 64 KiB, tile_m 16: runs
-    ]
-    for name in ok:
-        assert unsupported(name, 3072, "gfx942") is None, name
+def test_stage_1_at_exactly_the_budget_launches_and_the_tile_m_128_stage_2_is_what_fails():
+    """MOEBUG-061: t128x128x128 stage 1 is exactly 64 KiB and launches on its own; the
+    tile_m 128 atomic stage 2 (an A tile plus a BM x TILE_N fp32 staging area) needs 96 and
+    128 KiB, and the sort block is the stage-2 tile, so every tile_m 128 pair dies at its
+    stage-2 launch on gfx942."""
     for name in (
-        "flydsl_moe1_abf16_wbf16_bf16_t128x128x128",
-        "flydsl_moe1_abf16_wbf16_bf16_t128x128x128_bnt0",
-        "flydsl_moe1_abf16_wbf16_bf16_t128x64x128",
+        "flydsl_moe1_abf16_wbf16_bf16_t64x128x256_bnt0",  # 64 KiB
+        "flydsl_moe1_abf16_wbf16_bf16_t32x16x128_bnt0_kw4",
+        "flydsl_moe1_abf16_wbf16_bf16_t16x16x256_bnt0_kw4",
+        "flydsl_moe1_abf16_wbf16_bf16_t128x128x128",  # 64 KiB too, launches
         "flydsl_moe1_abf16_wbf16_bf16_t128x64x128_bnt0",
     ):
-        why = unsupported(name, 3072, "gfx942")
-        assert why and "LDS 64 KiB = budget 64 KiB" in why and "MOEBUG-061" in why, name
+        assert unsupported(name, 3072, "gfx942") is None, name
+    assert unsupported(
+        "flydsl_moe2_abf16_wbf16_bf16_t128x128x128_atomic", 3072, "gfx942"
+    ) == ("stage-2 LDS 96 KiB > budget 64 KiB (MOEBUG-061)")
+    assert unsupported(
+        "flydsl_moe2_abf16_wbf16_bf16_t128x128x256_atomic", 3072, "gfx942"
+    ) == ("stage-2 LDS 128 KiB > budget 64 KiB (MOEBUG-061)")
+    # the smaller stage 2: tile_m 64 at exactly 64 KiB launches; gfx950 has room for all
+    assert (
+        unsupported("flydsl_moe2_abf16_wbf16_bf16_t64x128x256_atomic", 3072, "gfx942")
+        is None
+    )
+    for name in (
+        "flydsl_moe2_abf16_wbf16_bf16_t128x128x128_atomic",
+        "flydsl_moe2_abf16_wbf16_bf16_t128x128x256_atomic",
+    ):
         assert unsupported(name, 3072, "gfx950") is None
     # over the budget stays over
-    assert unsupported(BIG[0], 3072, "gfx942").startswith("LDS 128 KiB > budget 64 KiB")
+    assert unsupported(BIG[0], 3072, "gfx942").startswith(
+        "stage-1 LDS 128 KiB > budget"
+    )
+
+
+def test_the_stage_2_lds_model_mirrors_aiters_and_every_enumerated_stage_2_follows_it():
+    from aiter.ops.flydsl import moe_kernels as mk
+    from op_tests.moe_bench.candidates.fused_cfg import _gemm2_lds_bytes
+
+    assert _gemm2_lds_bytes(128, 128, 128, "atomic") == 96 * 1024
+    assert _gemm2_lds_bytes(128, 128, 256, "atomic") == 128 * 1024
+    assert _gemm2_lds_bytes(128, 128, 128, "reduce") == 32 * 1024  # overlays the A tile
+    names = mk.get_flydsl_stage2_kernels_a16w16("bf16")
+    for n in names:
+        p = mk.get_flydsl_kernel_params(n)
+        need = _gemm2_lds_bytes(p["tile_m"], p["tile_n"], p["tile_k"], p["mode"])
+        assert bool(unsupported(n, 3072, "gfx942")) == (need > 64 * 1024), n
+        assert unsupported(n, 3072, "gfx950") is None
+        if hasattr(mk, "_gemm2_lds_bytes"):  # a tree with aiter's own model agrees
+            assert (
+                mk._gemm2_lds_bytes(p["tile_m"], p["tile_n"], p["tile_k"], p["mode"])
+                == need
+            )
 
 
 def test_the_lds_model_is_the_code_objects_size_where_artifacts_exist():

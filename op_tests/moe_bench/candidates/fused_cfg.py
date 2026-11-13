@@ -268,27 +268,36 @@ class ForcedConfig(Candidate):
 
 
 LDS_BUDGET_KIB = {"gfx942": 64, "gfx950": 160}  # per workgroup, the arch's real limit
-# A config whose kernel needs exactly the budget runs on gfx942 for tile_m <= 64 (767 of 767
-# launches in the bf16 tier-1 bars) and fails to launch for tile_m 128 (10 of 10), though
-# its code object's group_segment_fixed_size is exactly 64 KiB, within the limit
-# (``lds_real`` reads them: the model is the code objects' size for all 1131 of them).
-AT_BUDGET_MIN_TILE_M = {"gfx942": 128}
 
 
-def flydsl_stage1_unsupported(name, model_dim, gfx=None):
-    """Why a FlyDSL stage-1 kernel cannot run this shape on this arch (None when it can).
+def _gemm2_lds_bytes(tile_m, tile_n, tile_k, mode):
+    """LDS bytes ``compile_gemm2_a16w4_port`` allocates (no ``reuse_lds``) for a stage-2
+    tile; aiter's ``moe_kernels._gemm2_lds_bytes`` (MOEBUG-061), which stock trees lack: the
+    ``BM x TILE_K`` bf16 A tile plus, for the atomic epilogue, a ``BM x TILE_N`` fp32
+    staging area (the reduce epilogue stages bf16 and overlays the A tile)."""
+    a_bytes = int(tile_m) * int(tile_k) * 2
+    if mode == "reduce":
+        return max(a_bytes, int(tile_m) * int(tile_n) * 2)
+    return a_bytes + int(tile_m) * int(tile_n) * 4
 
-    * aiter's own validity check: the K a block reduces over (after the split-K batches and
-      the intra-block K waves) must be a whole number of ``tile_k`` tiles. The kernel
-      raises at build time, so such a kernel is inapplicable to the shape, not broken.
-    * LDS (MOEBUG-061): ``moe_kernels`` filters the a16 (bf16 activation) configs at the
-      gfx950 budget (160 KiB) on every arch; a config that needs more than the arch's
-      real budget (64 KiB on gfx942) faults at its first launch (``hipErrorIllegalState``)
-      and poisons the context, so it is never tried. The code object's size is the model's
-      (``lds_real``), so a config at exactly the budget is within it; the tile_m 128 ones
-      there still fail to launch, as observed (``AT_BUDGET_MIN_TILE_M``), and are dropped
-      on that evidence, not on the size."""
-    if not str(name).startswith("flydsl_moe1_"):
+
+def flydsl_unsupported(name, model_dim, gfx=None):
+    """Why a FlyDSL kernel cannot run this shape on this arch (None when it can).
+
+    * aiter's own validity check (stage 1): the K a block reduces over (after the split-K
+      batches and the intra-block K waves) must be a whole number of ``tile_k`` tiles. The
+      kernel raises at build time, so such a kernel is inapplicable to the shape.
+    * LDS (MOEBUG-061), a16 (bf16 activation) kernels: ``moe_kernels`` filtered at the gfx950
+      budget (160 KiB) on every arch and had no stage-2 check. A kernel whose static LDS
+      (``group_segment_fixed_size``, the model's size for every code object checked: see
+      ``lds_real``) is over the arch's real budget (64 KiB on gfx942) builds and then fails
+      its first launch with hipErrorIllegalState, which poisons the HIP context. Stage 1 is
+      judged by ``_gemm1_lds_bytes``, stage 2 by ``_gemm2_lds_bytes`` (the tile_m 128
+      atomic stage 2, 96 and 128 KiB, is over on gfx942: since the sort block is the
+      stage-2 tile, every tile_m 128 pair is unlaunchable there, though its stage 1, exactly
+      64 KiB, launches on its own)."""
+    name = str(name)
+    if not name.startswith(("flydsl_moe1_", "flydsl_moe2_")):
         return None
     from aiter.ops.flydsl.moe_kernels import _gemm1_lds_bytes, get_flydsl_kernel_params
 
@@ -296,26 +305,27 @@ def flydsl_stage1_unsupported(name, model_dim, gfx=None):
     if not p:
         return None
     tile_k = int(p.get("tile_k") or 0)
-    batches = int(p.get("k_batch") or 1)
-    waves = int(p.get("k_wave") or 1)
     if str(p.get("a_dtype")) in ("bf16", "fp16") and gfx in LDS_BUDGET_KIB:
-        need = _gemm1_lds_bytes(int(p["tile_m"]), int(p["tile_n"]), tile_k, waves)
         budget = LDS_BUDGET_KIB[gfx] * 1024
+        if name.startswith("flydsl_moe1_"):
+            need = _gemm1_lds_bytes(
+                int(p["tile_m"]), int(p["tile_n"]), tile_k, int(p.get("k_wave") or 1)
+            )
+            stage = "stage-1"
+        else:
+            need = _gemm2_lds_bytes(
+                p["tile_m"], p["tile_n"], tile_k, str(p.get("mode") or "atomic")
+            )
+            stage = "stage-2"
         if need > budget:
             return (
-                f"LDS {need // 1024} KiB > budget {LDS_BUDGET_KIB[gfx]} KiB "
+                f"{stage} LDS {need // 1024} KiB > budget {LDS_BUDGET_KIB[gfx]} KiB "
                 "(MOEBUG-061)"
             )
-        if need == budget and int(p["tile_m"]) >= AT_BUDGET_MIN_TILE_M.get(
-            gfx, 1 << 30
-        ):
-            return (
-                f"LDS {need // 1024} KiB = budget {LDS_BUDGET_KIB[gfx]} KiB and tile_m "
-                f"{p['tile_m']} does not launch on {gfx} (hipErrorIllegalState; "
-                "MOEBUG-061)"
-            )
-    if not tile_k:
+    if not name.startswith("flydsl_moe1_") or not tile_k:
         return None
+    batches = int(p.get("k_batch") or 1)
+    waves = int(p.get("k_wave") or 1)
     k = int(model_dim)
     if batches > 1:
         if k % batches or (k // batches) % tile_k:
@@ -327,6 +337,9 @@ def flydsl_stage1_unsupported(name, model_dim, gfx=None):
         if (k // waves) % tile_k:
             return f"K per group={k // waves} not divisible by tile_k={tile_k}"
     return None
+
+
+flydsl_stage1_unsupported = flydsl_unsupported  # the older name
 
 
 @register
@@ -404,11 +417,23 @@ class FusedCfgSource(Source):
             lst2 = s2.get(key)
             if not lst2:
                 continue
+            ok2 = []
+            for rec2 in lst2:
+                why2 = flydsl_unsupported(
+                    rec2[0], a["model_dim"], ctx.dispatch_meta["gfx"]
+                )
+                if why2:
+                    unsupported.append((rec2[0], rec2[1], len(lst1), why2))
+                else:
+                    ok2.append(rec2)
+            lst2 = ok2
+            if not lst2:
+                continue
             for k1, bm, flat, v2, nt in lst1:
                 m = re.search(r"_sk(\d+)$", k1)
                 ks = int(m.group(1)) if m else 0
                 name1 = re.sub(r"_sk\d+$", "", k1)
-                why = flydsl_stage1_unsupported(
+                why = flydsl_unsupported(
                     name1, a["model_dim"], ctx.dispatch_meta["gfx"]
                 )
                 if why:
