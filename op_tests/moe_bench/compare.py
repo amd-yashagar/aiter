@@ -290,7 +290,9 @@ def rounds_more(bar_key, new_key):
     return ",".join(out)
 
 
-ACC_GATE = [f"{ref}_{k}" for ref in ("path", "exact") for k in ("rel_l2", "max_norm")]
+ACC_GATE = [
+    f"{ref}_{k}" for ref in ("path", "exact") for k in ("rel_l2", "max_norm", "max_abs")
+]
 
 
 def _same_rounding(a, b):
@@ -325,7 +327,8 @@ def rule_differs(bar_key, new_key):
 
 def acc_ok(bar, new):
     """Accuracy rule of the plan: mean(new) <= mean(bar) + 2 * std(bar) + 1% of mean(bar)
-    for rel_l2 and max_norm (mean and std over seeds and repeats). When the new kernel's
+    for rel_l2 and max_abs (max_norm for outputs that lack it; mean and std over seeds and
+    repeats). When the new kernel's
     rounding points equal the bar's, against both references; when they differ, against
     ref_exact only. Also needs the new kernel to pass aiter's rule.
 
@@ -335,7 +338,16 @@ def acc_ok(bar, new):
         return (None if new.get("new_acc_pass", "") == "" else False), ""
     same = _same_rounding(bar.get("bar_numerics"), new.get("new_numerics"))
     form = "both" if same else "exact"
-    names = ACC_GATE if same else [n for n in ACC_GATE if n.startswith("exact_")]
+    refs = ("path", "exact") if same else ("exact",)
+    names = []
+    for ref in refs:
+        names.append(f"{ref}_rel_l2")
+        # the raw max abs error against the high-precision reference; outputs from before
+        # it was recorded compare on the row-normalized max_norm
+        has = f"bar_{ref}_max_abs_mean" in bar and f"new_{ref}_max_abs_mean" in new
+        has = has and _f(bar.get(f"bar_{ref}_max_abs_mean")) is not None
+        has = has and _f(new.get(f"new_{ref}_max_abs_mean")) is not None
+        names.append(f"{ref}_max_abs" if has else f"{ref}_max_norm")
     ok = True
     for name in names:
         bm, bs = _f(bar.get(f"bar_{name}_mean")), _f(bar.get(f"bar_{name}_std"))

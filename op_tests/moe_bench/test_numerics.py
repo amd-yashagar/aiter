@@ -673,3 +673,46 @@ def test_a_numerics_key_core_added_stops_the_run_with_one_clear_message(tmp_path
         job._drain()
     assert "update the harness" in str(stop.value)
     assert isinstance(stop.value, runner.HarnessStale)
+
+
+def test_max_abs_is_the_raw_largest_error_next_to_the_row_normalized_max_norm():
+    import torch
+
+    ref = torch.tensor([[1.0, 2.0, 3.0], [100.0, 200.0, 300.0]], dtype=torch.float64)
+    y = ref.clone()
+    y[0, 1] += 0.5  # a small row, error 0.5
+    y[1, 0] += 3.0  # a large row, error 3.0
+    m = accuracy.row_metrics(y.float(), ref.float())
+    assert m["max_abs"] == 3.0  # the raw maximum |y - ref|
+    assert m["max_norm"] < 1.0 and m["max_norm"] != m["max_abs"]
+    assert "max_abs" in accuracy.METRICS and "max_abs" in accuracy.GATE_METRICS
+    cols = accuracy.seed_columns()
+    assert "path_max_abs_mean" in cols and "exact_max_abs_s0" in cols
+    assert "bar_path_max_abs_mean" in accuracy.gate_columns("bar")
+
+
+def test_the_accuracy_rule_compares_on_max_abs_and_falls_back_to_max_norm():
+    from op_tests.moe_bench import compare
+
+    def row(who, rel, mabs=None, mnorm=1.0):
+        d = {f"{who}_acc_pass": "True", f"{who}_numerics": "act=none;inter=bf16"}
+        for ref in ("path", "exact"):
+            d[f"{who}_{ref}_rel_l2_mean"] = str(rel)
+            d[f"{who}_{ref}_rel_l2_std"] = "0.0"
+            d[f"{who}_{ref}_max_norm_mean"] = str(mnorm)
+            d[f"{who}_{ref}_max_norm_std"] = "0.0"
+            if mabs is not None:
+                d[f"{who}_{ref}_max_abs_mean"] = str(mabs)
+                d[f"{who}_{ref}_max_abs_std"] = "0.0"
+        return d
+
+    # same rel_l2, a larger raw max error: not ok (max_norm alone would have passed it)
+    ok, form = compare.acc_ok(row("bar", 0.01, mabs=1.0), row("new", 0.01, mabs=2.0))
+    assert ok is False and form == "both"
+    ok, _ = compare.acc_ok(row("bar", 0.01, mabs=1.0), row("new", 0.01, mabs=1.0))
+    assert ok is True
+    # an older bar without max_abs compares on max_norm as before
+    ok, _ = compare.acc_ok(row("bar", 0.01), row("new", 0.01, mabs=9.0))
+    assert ok is True
+    ok, _ = compare.acc_ok(row("bar", 0.01, mnorm=1.0), row("new", 0.01, mnorm=5.0))
+    assert ok is False

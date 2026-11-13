@@ -38,9 +38,9 @@ SAMPLE_ROWS = 256
 OUTLIER_FRAC = 0.01
 OUTLIER_SCALE = (20.0, 50.0)
 FP64_CHUNK_BYTES = 3 << 30
-METRICS = ("rel_l2", "max_norm", "cos", "allclose")
+METRICS = ("rel_l2", "max_norm", "max_abs", "cos", "allclose")
 REFS = ("path", "exact")
-GATE_METRICS = ("rel_l2", "max_norm")
+GATE_METRICS = ("rel_l2", "max_norm", "max_abs")
 # aiter's strict rule (op_tests/test_moe_2stage.py:667-675, test_fmoe with
 # strict_accuracy): NaN fails; a nonzero checkAllclose mismatch fraction (rtol=atol=1e-2)
 # fails only together with logits_diff above 0.01; asm FLAT MXFP4 rows use
@@ -911,7 +911,10 @@ def references(S, ref_w, bias, hidden, tw, ti, mask, rows, numerics=None):
 
 
 def row_metrics(y, ref):
-    """rel_l2, max_norm, cosine distance, checkAllclose mismatch fraction, logits_diff."""
+    """rel_l2, max_norm (row-rms normalized), max_abs (raw), cosine distance, checkAllclose
+    mismatch fraction, logits_diff. Two paths are compared by rel_l2 and max_abs against the
+    high-precision reference; logits_diff is a pass/fail threshold only (it rewards outputs
+    inflated in magnitude)."""
     y64, r64 = y.double(), ref.double()
     d = (y64 - r64).abs()
     ref_norm = r64.norm().clamp_min(1e-300)
@@ -921,6 +924,7 @@ def row_metrics(y, ref):
     return {
         "rel_l2": float(d.pow(2).sum().sqrt() / ref_norm),
         "max_norm": float((d / rms[:, None]).max()),
+        "max_abs": float(d.max()),
         "cos": float(
             1.0 - (y64 * r64).sum() / (y64.norm() * r64.norm()).clamp_min(1e-300)
         ),
