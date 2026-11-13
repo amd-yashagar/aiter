@@ -3,13 +3,15 @@
 """CK 2-stage modules that cannot be built must be refused before the JIT build.
 
 With no tuned row, ``get_2stage_cfgs`` falls to the default CK pair, whose module is
-built at the first call. Three combinations never build (checked with host builds for
+built at the first call. Four combinations cannot be used (checked with host builds for
 gfx950 and gfx942, no GPU):
 
 * any activation Situv2: ``gen_instances.py`` rejects it;
 * mxfp8 (fp8 x fp8 per_1x32), any activation: every instance fails to compile;
-* MXFP4 weights with Swiglu on gfx950: ``static_assert`` in ``gridwise_moe_mx_gemm``
-  (on gfx942 the MXFP4 instances are compiled out, so that case is left alone).
+* MXFP4 weights with Swiglu on gfx950: ``static_assert`` in ``gridwise_moe_mx_gemm``;
+* MXFP4 weights, any activation, on gfx942: ``gen_instances.py`` compiles the instances
+  out for gfx942, the module builds empty, and its launch aborts the process in the HIP
+  runtime ("Cannot find Symbol", core dump) instead of raising.
 
 The call used to die minutes later inside the build; it now raises NotImplementedError
 at dispatch. Every neighbouring combination that does build keeps its route.
@@ -127,9 +129,6 @@ def test_situv2_default_ck_route_is_refused(monkeypatch, tmp_path, arch):
 @pytest.mark.parametrize(
     "qa,qw,qt,act,shuffled",
     [
-        (dtypes.fp8, dtypes.fp4x2, QuantType.per_1x32, ActivationType.Silu, False),
-        (dtypes.fp8, dtypes.fp4x2, QuantType.per_1x32, ActivationType.Gelu, False),
-        (dtypes.fp4x2, dtypes.fp4x2, QuantType.per_1x32, ActivationType.Silu, False),
         (dtypes.fp8, dtypes.fp8, QuantType.per_Token, ActivationType.Silu, True),
         (dtypes.fp8, dtypes.fp8, QuantType.per_Token, ActivationType.Swiglu, True),
         (dtypes.fp8, dtypes.fp8, QuantType.per_1x128, ActivationType.Silu, True),
@@ -204,6 +203,45 @@ def _mixed(monkeypatch, tmp_path, arch):
         monkeypatch.setattr(fused_moe_module, "cfg_2stages", None)
 
 
+@pytest.mark.parametrize(
+    "qa,act",
+    [
+        (dtypes.fp8, ActivationType.Silu),
+        (dtypes.fp8, ActivationType.Gelu),
+        (dtypes.fp4x2, ActivationType.Silu),
+    ],
+)
+def test_mxfp4_default_ck_route_still_builds_on_gfx950(monkeypatch, tmp_path, qa, act):
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("native gfx950 only")
+    meta = _default_route(
+        monkeypatch, tmp_path, "native", qa, dtypes.fp4x2, QuantType.per_1x32, act
+    )
+    assert meta.stage1.func is fused_moe_module.ck_moe_stage1
+
+
+@pytest.mark.parametrize(
+    "qa,act",
+    [
+        (dtypes.fp8, ActivationType.Silu),
+        (dtypes.fp8, ActivationType.Gelu),
+        (dtypes.fp4x2, ActivationType.Silu),
+        (dtypes.fp4x2, ActivationType.Gelu),
+    ],
+)
+def test_mxfp4_default_ck_route_is_refused_on_gfx942(monkeypatch, tmp_path, qa, act):
+    with pytest.raises(NotImplementedError, match="compiled out for gfx942"):
+        _default_route(
+            monkeypatch,
+            tmp_path,
+            "gfx942",
+            qa,
+            dtypes.fp4x2,
+            QuantType.per_1x32,
+            act,
+        )
+
+
 def test_tuned_row_with_a_ck_stage2_for_mxfp4_swiglu_is_refused_on_gfx950(
     monkeypatch, tmp_path
 ):
@@ -213,8 +251,11 @@ def test_tuned_row_with_a_ck_stage2_for_mxfp4_swiglu_is_refused_on_gfx950(
         _mixed(monkeypatch, tmp_path, "native")
 
 
-def test_same_row_is_left_alone_on_gfx942(monkeypatch, tmp_path):
-    assert not _mixed(monkeypatch, tmp_path, "gfx942").run_1stage
+def test_tuned_row_with_a_ck_stage2_for_mxfp4_is_refused_on_gfx942(
+    monkeypatch, tmp_path
+):
+    with pytest.raises(NotImplementedError, match="compiled out for gfx942"):
+        _mixed(monkeypatch, tmp_path, "gfx942")
 
 
 if __name__ == "__main__":

@@ -4114,8 +4114,7 @@ def _ck_2stage_unbuildable_reason(q_type, q_dtype_a, q_dtype_w, activation, gfx)
 
     Each case below was built on the host (no GPU) for gfx950 and gfx942: the module
     request fails at codegen or compile time, so the first call dies deep in the JIT
-    build. Anything not listed builds (or, for MXFP4 weights on gfx942, builds with no
-    instances, which fails at launch instead).
+    build. Anything not listed builds.
     """
     if activation == ActivationType.Situv2:
         return "gen_instances.py has no Situv2 activation"
@@ -4127,6 +4126,14 @@ def _ck_2stage_unbuildable_reason(q_type, q_dtype_a, q_dtype_w, activation, gfx)
         return (
             "CK has no mxfp8 (fp8 x fp8 per_1x32) 2-stage instance: every instance "
             "fails to compile"
+        )
+    if gfx == "gfx942" and q_dtype_w == dtypes.fp4x2:
+        # gen_instances.py wraps every FP4 instance in "#ifndef __gfx942__", so the module
+        # builds with no device code and its launch aborts the process in the HIP runtime
+        # ("Cannot find Symbol", core dump) for any activation.
+        return (
+            "the CK MXFP4 2-stage instances are compiled out for gfx942 (the launch "
+            "would abort the process)"
         )
     if (
         gfx == "gfx950"
