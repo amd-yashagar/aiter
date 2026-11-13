@@ -279,7 +279,7 @@ def test_the_bar_row_carries_the_tag_and_the_subtraction():
         }
     }
     fh = io.StringIO()
-    S = SimpleNamespace(kind="x")
+    S = SimpleNamespace(kind="x", D=1, I=1, E=1, topk=1)
     bar_worker._emit_summary(
         fh,
         SimpleNamespace(id="c1"),

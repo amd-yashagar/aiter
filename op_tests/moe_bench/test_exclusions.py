@@ -84,7 +84,7 @@ def row_of(results, pre=None):
     fh = io.StringIO()
     S = SimpleNamespace(kind="x", D=5120, I=1536, E=41, topk=10)
     bar_worker._emit_summary(
-        fh, SimpleNamespace(id="c1"), S, "warm", results, {"gpu": "g", "sku": ""}, [], "bar",
+        fh, SimpleNamespace(id="c1"), S, "warm", results, {"gpu": "g", "sku": "", "gfx": "gfx950"}, [], "bar",
         pre_excluded=pre,
     )  # fmt: skip
     return next(
@@ -138,44 +138,84 @@ def test_a_pre_excluded_note_reaches_the_row_and_the_column_exists():
     assert "bar_exclusions" in bar_runner.BAR_COLS
 
 
-UNSAFE = "_ZN5aiter45fmoe_stage1_bf16_pertokenFp8_g1u1_32x256_2tg_pf2E"  # X08/X09 at 5120/1536/E41/top10
+UNSAFE = "_ZN5aiter45fmoe_stage1_bf16_pertokenFp8_g1u1_32x256_2tg_pf2E"  # X08 on gfx950
 UNSAFE_OTHER_TILE = (
     "_ZN5aiter45fmoe_stage1_bf16_pertokenFp8_g1u1_32x256_2tg_pf3E"  # X05/X06/X10 passed
 )
 
 
-def test_the_unsafe_table_holds_every_failed_pair_of_the_verification_files():
+def test_the_unsafe_list_holds_every_failed_kernel_of_the_verification_files():
     t = exclusions.unsafe_table()
-    assert (5120, 1536, 41, 10, "32x256_2tg_pf2") in t and (
-        5120,
-        1536,
-        40,
-        8,
+    for tile in (
         "64x128_2tg_pf3",
-    ) in t
-    assert (5120, 1536, 41, 10, "32x128_3tg_pf2") in t
-    assert (5120, 1536, 41, 10, "32x256_2tg_pf3") not in t  # a PASS row
-    assert (4096, 384, 128, 8, "32x64_4tg_pf3") in t  # meta tuned row R24 (gfx942)
+        "32x128_3tg_pf2",
+        "32x256_2tg_pf2",
+        "128x64_pf2",
+        "16x64_5tg_pf3",
+    ):
+        assert ("gfx950", tile) in t, tile
+    assert ("gfx942", "32x64_4tg_pf3") in t  # meta tuned rows R24
+    assert ("gfx950", "32x256_2tg_pf3") not in t  # a PASS row
+    assert "buffer probe" in t[("gfx950", "64x128_2tg_pf3")]
     assert exclusions.stage1_tile(UNSAFE) == "32x256_2tg_pf2"
     assert exclusions.stage1_tile("moe_ck2stages_gemm1_x") is None
-
-
-def test_an_unsafe_pair_is_excluded_at_its_shape_only():
-    shape = (5120, 1536, 41, 10)
-    assert "unsafe pair" in exclusions.unsafe_reason(shape, UNSAFE)
-    assert exclusions.unsafe_reason(shape, UNSAFE_OTHER_TILE) == ""
-    assert exclusions.unsafe_reason((5120, 1536, 40, 8), UNSAFE) == ""  # another shape
-    assert exclusions.unsafe_reason(None, UNSAFE) == ""
-    got = exclusions.excluded(
-        [("a", UNSAFE, "ok"), ("b", UNSAFE_OTHER_TILE, "ok")], shape
+    # another .co (doweight, blockscale) with the same tile is not the listed kernel
+    assert (
+        exclusions.stage1_tile(
+            "_ZN5aiter51fmoe_stage1_bf16_pertokenFp8_doweight_g1u1_32x64_4tg_pf3E"
+        )
+        is None
     )
-    assert set(got) == {"a"} and got["a"].startswith("MOEBUG-064 unsafe pair")
-    assert "unsafe pair at this shape" in exclusions.note(got)
+    assert (
+        exclusions.stage1_tile(
+            "fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1_64x128_2tg_pf3E"
+        )
+        is None
+    )
+
+
+def test_an_unsafe_kernel_is_excluded_at_every_shape_on_its_arch_only():
+    assert "unsafe kernel" in exclusions.unsafe_reason("gfx950", UNSAFE)
+    assert exclusions.unsafe_reason("gfx950", UNSAFE_OTHER_TILE) == ""
+    assert (
+        exclusions.unsafe_reason("gfx942", UNSAFE) == ""
+    )  # a separate .co, not on the list
+    assert (
+        exclusions.unsafe_reason("", UNSAFE) == ""
+        and exclusions.unsafe_reason(None, UNSAFE) == ""
+    )
+    got = exclusions.excluded(
+        [("a", UNSAFE, "ok"), ("b", UNSAFE_OTHER_TILE, "ok")], "gfx950"
+    )
+    assert set(got) == {"a"} and got["a"].startswith("MOEBUG-064 unsafe kernel")
+    assert "unsafe kernel" in exclusions.note(got)
     assert exclusions.excluded([("a", UNSAFE, "ok")], None) == {}
 
 
-def test_an_unsafe_pair_never_sets_the_bar_at_its_shape():
+def test_an_unsafe_kernel_never_sets_the_bar_on_its_arch():
     fast = f"fused_moe|{UNSAFE}|{CK}|bm32|ks0|nt0"
     slow = f"fused_moe|{UNSAFE_OTHER_TILE}|{CK}|bm32|ks0|nt0"
     row = row_of({fast: result(fast, 50.0), slow: result(slow, 70.0)})
-    assert row["bar_id"] == slow and "unsafe pair" in row["bar_exclusions"]
+    assert row["bar_id"] == slow and "unsafe kernel" in row["bar_exclusions"]
+
+
+def test_the_list_is_extended_by_appending_verdicts_in_one_file(tmp_path):
+    path = str(tmp_path / "unsafe.csv")
+    rows = [
+        {"gfx": "gfx950", "stage1_tile": "64x128_2tg_pf3", "source": "a.csv", "row_id": "X01", "evidence": "e"},
+        {"gfx": "gfx950", "stage1_tile": "64x128_2tg_pf3", "source": "b.csv", "row_id": "Y1", "evidence": "dup"},
+        {"gfx": "gfx942", "stage1_tile": "64x128_2tg_pf3E", "also_on": "gfx950", "source": "c.csv", "row_id": "Z", "evidence": "e"},
+    ]  # fmt: skip
+    assert (
+        exclusions.append_verdicts(rows, path) == 2
+    )  # the duplicate (arch, kernel) is not added; the other arch is its own entry
+    assert exclusions.append_verdicts(rows[:1], path) == 0
+    src = tmp_path / "verdicts.csv"
+    src.write_text(
+        "row_id,stage1_kernel,verdict,uniform_bad_reps,hot1_bad_reps\r\nX9,32x128_3tg_pf2E,FAIL,1/6,0/6\r\nX10,32x256_2tg_pf3,PASS,0/6,0/6\r\n"
+    )
+    got = exclusions.ingest(str(src), "gfx950", also_on="gfx951")
+    assert [r["stage1_tile"] for r in got] == ["32x128_3tg_pf2"] and got[0][
+        "also_on"
+    ] == "gfx951"
+    assert exclusions.append_verdicts(got, path) == 1

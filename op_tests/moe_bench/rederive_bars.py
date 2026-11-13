@@ -89,7 +89,7 @@ def discover(roots):
     return out
 
 
-def derive(bars, cands):
+def derive(bars, cands, gfx=None):
     """Per (case, mode) of the bar rows: old and re-derived winners. Returns (rows,
     unverifiable) where rows are dicts with the old (recorded), derived and new bars."""
     by_case = {}
@@ -131,8 +131,7 @@ def derive(bars, cands):
             for c in rows
             if c.get("status") in ("ok", "fail")
         ]
-        shape = tuple(b.get(k) for k in ("model_dim", "inter_dim", "expert", "topk"))
-        skip = exclusions.excluded(entries, shape)
+        skip = exclusions.excluded(entries, gfx)
         best0 = min(ok, key=lambda c: float(c["median_us"]))
         keep = [c for c in ok if c["cand_id"] not in skip]
         best1 = min(keep, key=lambda c: float(c["median_us"])) if keep else None
@@ -244,8 +243,8 @@ def run(roots, pairs, route_trees, rel="", route_files=()):
             rows, rj = read_mapped(cp, "cand")
             cands += rows
             rej_c += rj
-        derived, unver = derive(bars, cands)
         gfx = meta.get("gfx") or next((b.get("gfx") for b in bars if b.get("gfx")), "")
+        derived, unver = derive(bars, cands, gfx)
         harness = meta.get("harness_sha") or next(
             (b.get("harness_sha") for b in bars if schema.column_ok("harness_sha", b.get("harness_sha") or "") and b.get("harness_sha")), ""
         )  # fmt: skip

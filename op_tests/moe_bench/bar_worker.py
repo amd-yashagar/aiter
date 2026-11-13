@@ -1040,7 +1040,7 @@ def run_bar_group(cases, spec, fh):
                 why = (
                     exclusions.MOEBUG_064
                     if exclusions.tile64(s1)
-                    else exclusions.unsafe_reason((S.D, S.I, S.E, S.topk), s1)
+                    else exclusions.unsafe_reason(ident["gfx"], s1)
                 )
                 if why:
                     pre_excluded.append(x.id)
@@ -1095,7 +1095,7 @@ def run_bar_group(cases, spec, fh):
                 main_failures.get(c.id),
                 (acct, incomplete),
                 (
-                    f"{len(pre_excluded)} candidates not run, MOEBUG-064 (tile_n=64 or an unsafe pair at this shape)"
+                    f"{len(pre_excluded)} candidates not run, MOEBUG-064 (tile_n=64 or an unsafe kernel)"
                     if pre_excluded
                     else ""
                 ),
@@ -1280,7 +1280,7 @@ def _add_review(row, ok, results, mode):
     row.update(_gate("lr", lr.get("acc"), lr.get("numerics", "")))
 
 
-def _bar_exclusions(results, shape=None):
+def _bar_exclusions(results, gfx=None):
     """{candidate id: reason} of the results a bar must not count (see ``exclusions``)."""
     entries = []
     for cid, r in results.items():
@@ -1291,7 +1291,7 @@ def _bar_exclusions(results, shape=None):
             getattr(cand, "id", cid), (r.get("route") or {}).get("kernel1", "")
         )
         entries.append((cid, s1, r.get("outcome")))
-    return exclusions.excluded(entries, shape)
+    return exclusions.excluded(entries, gfx)
 
 
 def _emit_summary(
@@ -1314,7 +1314,7 @@ def _emit_summary(
         for cid, r in results.items()
         if r.get("ok") and mode in r.get("by_mode", {})
     }
-    skip = _bar_exclusions(results, (S.D, S.I, S.E, S.topk))
+    skip = _bar_exclusions(results, ident.get("gfx"))
     for cid in skip:
         ok.pop(cid, None)
     row = {
