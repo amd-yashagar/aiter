@@ -25,6 +25,7 @@ need validation of aiter's MX quant ops on gfx950 and raise NotImplementedError.
 
 import contextlib
 import os
+import re
 import types
 
 import torch
@@ -669,6 +670,60 @@ def dispatch_rounds_more(S, M, gfx=None):
         f"activations requested {short[want]}, dispatched as {short[bits[got]]} "
         f"(M={M}, gate_mode={S.gate_mode}); the call runs a4w4/a8w4 math, scored on "
         "the requested math"
+    )
+
+
+# how fine an activation quantization is: a coarser one rounds the activations more than a
+# finer one the case asks for (per-token scales in a per-1x128 blockscale case)
+QUANT_COARSENESS = {
+    "No": 0,
+    "per_1x32": 1,
+    "per_1x128": 2,
+    "per_128x128": 2,
+    "per_Token": 3,
+    "per_Tensor": 4,
+}
+_CK_QUANT = {
+    0: "No",
+    1: "per_Tensor",
+    2: "per_Token",
+    3: "per_1x32",
+    4: "per_1x128",
+    5: "per_128x128",
+}
+
+
+def stage1_act_quant(kernel1):
+    """The activation quantization a stage-1 kernel applies, from its name (None when the
+    name does not say): ASM ``..._pertokenFp8_...`` takes per-token scales (also in its
+    ``_blockscale`` variants, which are the weights' blocks), ``..._blockscaleFp8_...``
+    per-128 block scales, and a CK gemm names its QuantType (``_Quant4_`` = per_1x128).
+    """
+    k = kernel1 or ""
+    if re.search(r"pertoken(Fp8|Int8)", k):
+        return "per_Token"
+    if re.search(r"blockscale", k, re.IGNORECASE):
+        return "per_1x128"
+    m = re.search(r"_Quant(\d+)_", k)
+    if m:
+        return _CK_QUANT.get(int(m.group(1)))
+    return None
+
+
+def candidate_rounds_more(S, kernel1):
+    """Why a candidate's stage 1 rounds the activations more than the case asks for, by
+    quantization granularity ("" when it does not or the name does not say): a forced
+    pair whose ASM stage 1 quantizes per token in a blockscale case is a coarser path than
+    the requested numerics (the same kind of thing as a4w4 in an a16w4 case)."""
+    got = stage1_act_quant(kernel1)
+    want = S.qtype.name
+    if got is None or got not in QUANT_COARSENESS or want not in QUANT_COARSENESS:
+        return ""
+    if QUANT_COARSENESS[got] <= QUANT_COARSENESS[want]:
+        return ""
+    return (
+        f"stage-1 activations quantized {got}, the case asks for {want} "
+        f"({str(kernel1)[:70]})"
     )
 
 

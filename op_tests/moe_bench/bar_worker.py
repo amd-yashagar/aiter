@@ -452,6 +452,12 @@ class Measurer:
                         },
                     )
                     ctx.dispatch_rounds_more = res["rounds_more"]
+            if getattr(cand, "id", "") != "dispatch":
+                res["coarse_quant"] = accuracy.candidate_rounds_more(
+                    ctx.S, route.get("kernel1", "")
+                )
+                if res["coarse_quant"]:
+                    base["rounds_more"] = res["coarse_quant"]
             reason = cand.verify(route) if hasattr(cand, "verify") else None
             if reason is None and hasattr(cand, "confirm"):
                 reason = cand.confirm(
@@ -1191,6 +1197,36 @@ def _accounting(enum_counts, stats, enum_errors, kind):
     return acct, "; ".join(reasons)
 
 
+def _flag(r):
+    return r.get("rounds_more") or r.get("coarse_quant") or ""
+
+
+def _add_review(row, ok, results, mode):
+    """The least-rounding bar for REVIEW rows: where the bar's winner (or dispatch) rounds the
+    activations more than the case asks for, ``lr_*`` is the fastest correct candidate that
+    does not. The full bar is not changed."""
+    best = min(ok.values(), key=lambda r: r["by_mode"][mode]["median_us"])
+    flag = _flag(best)
+    if flag:
+        row["bar_rounds_more"] = flag
+        row["review"] = "rounds-more"
+    if not (flag or row.get("dispatch_rounds_more")):
+        return
+    clean = [r for r in ok.values() if not _flag(r)]
+    if not clean:
+        row["lr_status"] = "none"
+        return
+    lr = min(clean, key=lambda r: r["by_mode"][mode]["median_us"])
+    row["lr_status"] = "ok"
+    row["lr_us"] = lr["by_mode"][mode]["median_us"]
+    row["lr_id"] = lr["cand"].id
+    row["lr_kernels"] = lr["cand"].describe().get("kernels", "") or getattr(
+        lr["cand"], "kernels", ""
+    )
+    row["lr_confirmed"] = getattr(lr["cand"], "confirmed", "")
+    row.update(_gate("lr", lr.get("acc"), lr.get("numerics", "")))
+
+
 def _emit_summary(
     fh, c, S, mode, results, ident, skipped, kind, main_failure=None, accounting=None
 ):
@@ -1225,15 +1261,6 @@ def _emit_summary(
             row["dispatch_rounds_more"] = disp["rounds_more"]
             if not disp.get("ok"):
                 row["dispatch_status"] = "rounds-more"
-    lr = results.get("dispatch_bf16bound")
-    if lr is not None:
-        row["lr_status"] = "ok" if lr.get("ok") else lr.get("outcome", "fail-or-error")
-        if lr.get("ok") and mode in lr["by_mode"]:
-            row["lr_us"] = lr["by_mode"][mode]["median_us"]
-            row["lr_id"] = lr["cand"].id
-            row["lr_kernels"] = lr["cand"].kernels
-            row["lr_confirmed"] = lr["cand"].confirmed
-        row.update(_gate("lr", lr.get("acc"), lr.get("numerics", "")))
     if kind in ("new", "off"):
         who = kind
         if ok:
@@ -1278,6 +1305,7 @@ def _emit_summary(
             bar_timing_mode=best.get("timing_mode", ""),
         )
         row.update(_gate("bar", best.get("acc"), best.get("numerics", "")))
+        _add_review(row, ok, results, mode)
     else:
         # a case no existing backend computes correctly has no bar
         row["status"] = "no-bar"

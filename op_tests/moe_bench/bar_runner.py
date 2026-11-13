@@ -47,6 +47,8 @@ BAR_COLS = (
         "dispatch_kernel2",
         "dispatch_route_family",
         "dispatch_rounds_more",
+        "bar_rounds_more",
+        "review",
         "lr_us",
         "lr_id",
         "lr_kernels",
@@ -135,6 +137,7 @@ CAND_COLS = [
     "aiter_sha",
     "date",
     "routes_disabled",
+    "rounds_more",
 ]
 
 
