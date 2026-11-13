@@ -293,6 +293,15 @@ def test_fmoe(
         runtime_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(qType, WQDType)
         if runtime_aq_dtype is not None:
             reference_aq_dtype = runtime_aq_dtype
+    # a16w4 Swiglu with separated gate/up weights is dispatched as a4w4 from the
+    # GPTOSS_SWIGLU_MXFP4_BF16_BOUND token count on, whatever the caller passed.
+    if (
+        _runtime_swiglu_mxfp4_q_dtype_a(
+            token, actType, gateMode, qType, AQDType, WQDType
+        )
+        == dtypes.fp4x2
+    ):
+        reference_aq_dtype = dtypes.fp4x2
 
     # Quant-ing a
     if qType == aiter.QuantType.per_128x128:
@@ -309,6 +318,12 @@ def test_fmoe(
         a1_qt, a1_scale = per_1x32_f8_scale_f8_quant(
             input, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
         )
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and reference_aq_dtype == dtypes.fp4x2
+        and WQDType == dtypes.fp4x2
+    ):
+        a1_qt, a1_scale = torch_quant(input, quant_dtype=dtypes.fp4x2)
     elif (
         (
             qType == aiter.QuantType.per_1x32
@@ -489,6 +504,12 @@ def test_fmoe(
                 getattr(w1_qt_aiter, "is_shuffled", False)
                 or getattr(w2_qt_aiter, "is_shuffled", False),
                 gateMode,
+                has_stage1_bias=exp_bias1_aiter is not None,
+                has_stage2_bias=exp_bias2_aiter is not None,
+                swiglu_limit=swiglu_limit,
+                opus_weights_shuffled=getattr(w1_qt_aiter, "is_shuffled", False)
+                and getattr(w2_qt_aiter, "is_shuffled", False),
+                gate_up_interleave=getattr(w1_qt_aiter, "gate_up_interleave", None),
             )
             if metadata.fuse_quant == "fp4":
                 # Fused Swiglu MXFP4 quantizes the f32 activation directly.
@@ -528,6 +549,14 @@ def test_fmoe(
         )
         a2_scale = a2_scale.view(token, topk, -1)
     elif asm_flat_mxfp4:
+        a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=dtypes.fp4x2)
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and reference_aq_dtype == dtypes.fp4x2
+        and WQDType == dtypes.fp4x2
+    ):
+        # R0 when stage 1 fuses the quant (out1_ref is fp32 then), R1 otherwise
+        # (out1_ref is rounded to bf16 first and stage 2 quantizes it).
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=dtypes.fp4x2)
     elif (
         qType == aiter.QuantType.per_1x32
