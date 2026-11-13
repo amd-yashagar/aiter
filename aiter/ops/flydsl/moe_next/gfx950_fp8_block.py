@@ -109,8 +109,14 @@ def _direct_route(cfg, spec, m, topk, combine):
         _decode_stage1(cfg, spec)
         and cfg.get("route", "direct") == "direct"
         and combine in ("atomic_bf16", "atomic_f32")
-        and m * topk <= DIRECT_MAX_ROUTES
+        and m * topk <= min(DIRECT_MAX_ROUTES, _DIRECT_ROUTES)
     )
+
+
+# Direct routing wins at every measured point up to 88 routes (DSV3 E257 M 1-8, Qwen3.5 M=8:
+# 0.80-0.92x the sorted path) and on DSV3 E257 up to 252, but GLM-5.x M=16 (144 routes, D 6144)
+# runs 1.19x slower than the sort; kept to decode until that crossover is understood.
+_DIRECT_ROUTES = 96
 
 
 def _tile_config(gpu, config, m, topk, experts):
