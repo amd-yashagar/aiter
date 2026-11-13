@@ -70,10 +70,13 @@ def compile_gateup(
     NTHR = NTG * KS
     SEGS = CH * 8  # 16-byte segments per row and chunk
     OOB = 0x7FFFFFF0
-    ROW_DW = SEGS * 4 + 4  # LDS row stride in dwords, padded by 16 bytes
+    # LDS rows are unpadded; 16-byte segments are XOR-swizzled by row % 8.
+    ROW_DW = SEGS * 4
     BUF_DW = S_MAX * 16 * ROW_DW
+    # two stages (double buffer) per K group when the chunk count is even
+    NBUF = 2 if (NCH % 2 == 0 and PW <= 2) else 1
     ACC_DW = 2 * S_MAX * 4 * 64  # one wave's partials
-    LDS_DW = max(KS * BUF_DW, WAVES * (KS - 1) * ACC_DW)
+    LDS_DW = max(KS * NBUF * BUF_DW, WAVES * (KS - 1) * ACC_DW)
     act = make_act(activation, swiglu_limit)
 
     @fx.struct
@@ -109,7 +112,7 @@ def compile_gateup(
             real = load_s1(p_live, t * 3 + 2)
             n_sub = (real + 15) // 16
             blk = bx * WAVES + cw
-            buf = kg * BUF_DW
+            buf = kg * (NBUF * BUF_DW)
             k0 = kg * NCH  # this group's first chunk
             w_rs = rsrc(fxh._as_ptr(p_w, fx.Uint8) + fx.Int64(e) * (N * K), N * K)
             x_rs = rsrc(fxh._as_ptr(p_x, fx.BFloat16), fx.Int64(M) * (K * 2))
@@ -134,7 +137,7 @@ def compile_gateup(
                         # rows past the chunk (idx >= n_seg) read past M: 0
                         tok = (idx < n_seg).select(tok, M)
                         g_off.append(tok * (K * 2) + seg * 16 + k0 * (CH * 128))
-                        l_off.append(buf + row * ROW_DW + seg * 4)
+                        l_off.append(buf + row * ROW_DW + (seg ^ (row % 8)) * 4)
 
                     def load_a(n, g_off=g_off, ROUNDS=ROUNDS):
                         live = n < NCH
@@ -146,13 +149,13 @@ def compile_gateup(
                             for i in range_constexpr(ROUNDS)
                         ]
 
-                    def store_a(regs, l_off=l_off, ROUNDS=ROUNDS, n_seg=n_seg):
+                    def store_a(regs, h=0, l_off=l_off, ROUNDS=ROUNDS, n_seg=n_seg):
                         for i in range_constexpr(ROUNDS):
                             if const_expr((i + 1) * NTG <= n_seg):
-                                lds_store_x4(a_lds, l_off[i], regs[i])
+                                lds_store_x4(a_lds, l_off[i] + h * BUF_DW, regs[i])
                             else:
                                 if tg + i * NTG < n_seg:
-                                    lds_store_x4(a_lds, l_off[i], regs[i])
+                                    lds_store_x4(a_lds, l_off[i] + h * BUF_DW, regs[i])
 
                     def load_w(n):
                         live = n < NCH
@@ -165,21 +168,45 @@ def compile_gateup(
                             out.append(load_x4(w_rs, ub, W_CACHE))
                         return out
 
-                    def compute(wv, acc, SV=SV):
+                    sw = c % 8
+
+                    def load_w_st(n, st):
+                        live = n < NCH
+                        g = ((k0 + n) * CH + st) * 1024
+                        gb = live.select(g_base + g, OOB)
+                        ub = live.select(u_base + g, OOB)
+                        return [load_x4(w_rs, gb, W_CACHE), load_x4(w_rs, ub, W_CACHE)]
+
+                    def compute(wv, acc, h=0, SV=SV, after_st=None, sw=sw):
                         acc = list(acc)
                         for st in range_constexpr(CH):
                             bw = []
                             for s in range_constexpr(SV):
-                                off = buf + (s * 16 + c) * ROW_DW + st * 32 + q * 8
-                                lo = lds_load_x4(a_lds, off)
-                                hi = lds_load_x4(a_lds, off + 4)
+                                rb = buf + h * BUF_DW + (s * 16 + c) * ROW_DW
+                                sg0 = st * 8 + q * 2
+                                lo = lds_load_x4(a_lds, rb + (sg0 ^ sw) * 4)
+                                hi = lds_load_x4(a_lds, rb + ((sg0 + 1) ^ sw) * 4)
                                 bw.append(
                                     [lo[d] for d in range_constexpr(4)]
                                     + [hi[d] for d in range_constexpr(4)]
                                 )
+                            # Convert this K step's fp8 words first, so their
+                            # registers are free, then issue the next chunk's
+                            # loads for this step ahead of the MFMAs (pinned:
+                            # LLVM otherwise sinks them to the chunk's end).
+                            wcv = [
+                                (
+                                    fp8_dword_to_bf16x4(wv[2 * st][j]),
+                                    fp8_dword_to_bf16x4(wv[2 * st + 1][j]),
+                                )
+                                for j in range_constexpr(4)
+                            ]
+                            if const_expr(after_st is not None):
+                                fx.rocdl.sched_barrier(0)
+                                after_st(st)
+                                fx.rocdl.sched_barrier(0)
                             for j in range_constexpr(4):
-                                wg = fp8_dword_to_bf16x4(wv[2 * st][j])
-                                wu = fp8_dword_to_bf16x4(wv[2 * st + 1][j])
+                                wg, wu = wcv[j]
                                 for s in range_constexpr(SV):
                                     b = bf16_pair(bw[s], j)
                                     acc[s] = mfma(wg, b, acc[s])
@@ -188,29 +215,57 @@ def compile_gateup(
 
                     zero = Vec.filled(4, 0.0, fx.Float32)
                     nw, na = 2 * CH, ROUNDS
-                    store_a(load_a(fx.Int32(0)))
+                    a_first = load_a(fx.Int32(0))
                     a_sets = []
                     for p in range_constexpr(1, PA):
                         a_sets += load_a(fx.Int32(p))
+                    if const_expr(NBUF == 2):
+                        fx.rocdl.sched_barrier(0)
                     w_sets = []
                     for p in range_constexpr(PW):
                         w_sets += load_w(fx.Int32(p))
+                    store_a(a_first)
                     gpu.barrier()
                     init = [zero] * (2 * SV) + w_sets + a_sets
                     results = init
-                    for iv, state in range(0, NCH, 1, init=init):
-                        acc_c = [Vec(v) for v in state[: 2 * SV]]
-                        w_c = [Vec(v) for v in state[2 * SV : 2 * SV + PW * nw]]
-                        a_c = [Vec(v) for v in state[2 * SV + PW * nw :]]
-                        n = fx.Int32(iv)
-                        a_n = load_a(n + PA)
-                        w_n = load_w(n + PW)
-                        acc_n = compute(w_c[:nw], acc_c)
-                        a_all = a_c + a_n
-                        gpu.barrier()
-                        store_a(a_all[:na])
-                        gpu.barrier()
-                        results = yield acc_n + w_c[nw:] + w_n + a_all[na:]
+                    if const_expr(NBUF == 2):
+                        # Two chunks per trip: chunk 2i reads stage 0 and stages
+                        # chunk 2i+1 into stage 1, and vice versa, so one barrier
+                        # per chunk orders both hazards and the prefetch register
+                        # sets rotate in Python with no loop-carried copies.
+                        for iv, state in range(0, NCH // 2, 1, init=init):
+                            acc_c = [Vec(v) for v in state[: 2 * SV]]
+                            w_c = [Vec(v) for v in state[2 * SV : 2 * SV + PW * nw]]
+                            a_c = [Vec(v) for v in state[2 * SV + PW * nw :]]
+                            for h in range_constexpr(2):
+                                n = fx.Int32(iv * 2 + h)
+                                w_n = []
+
+                                def after_st(st, n=n, w_n=w_n):
+                                    w_n.extend(load_w_st(n + PW, st))
+
+                                store_a(a_c[:na], 1 - h)
+                                fx.rocdl.sched_barrier(0)
+                                a_c = a_c[na:] + load_a(n + PA)
+                                fx.rocdl.sched_barrier(0)
+                                acc_c = compute(w_c[:nw], acc_c, h, after_st=after_st)
+                                w_c = w_c[nw:] + w_n
+                                gpu.barrier()
+                            results = yield acc_c + w_c + a_c
+                    else:
+                        for iv, state in range(0, NCH, 1, init=init):
+                            acc_c = [Vec(v) for v in state[: 2 * SV]]
+                            w_c = [Vec(v) for v in state[2 * SV : 2 * SV + PW * nw]]
+                            a_c = [Vec(v) for v in state[2 * SV + PW * nw :]]
+                            n = fx.Int32(iv)
+                            a_n = load_a(n + PA)
+                            w_n = load_w(n + PW)
+                            acc_n = compute(w_c[:nw], acc_c)
+                            a_all = a_c + a_n
+                            gpu.barrier()
+                            store_a(a_all[:na])
+                            gpu.barrier()
+                            results = yield acc_n + w_c[nw:] + w_n + a_all[na:]
                     acc = [Vec(v) for v in results[: 2 * SV]]
 
                     def epilogue(acc, SV=SV):

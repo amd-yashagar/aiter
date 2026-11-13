@@ -77,7 +77,7 @@ def _tile(config, gpu, model_dim, inter_dim):
         waves //= 2
     while nbd > 1 and model_dim % (16 * nbd * waves):
         nbd //= 2
-    pw, pa = int(cfg.get("gateup_pw", 2)), int(cfg.get("gateup_pa", 2))
+    pw, pa = int(cfg.get("gateup_pw", 1)), int(cfg.get("gateup_pa", 2))
     w_cache = int(cfg.get("w_cache", 2))
     pwd = int(cfg.get("down_pw", 2))
     coalesce = bool(cfg.get("down_coalesce", True))
