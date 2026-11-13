@@ -149,5 +149,33 @@
     "down_nbd": 2,
     "gateup_waves": 8,
     "gateup_ks": 2
+  },
+  "m32nbd2np": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "sort_pad_rows": false
+  },
+  "m32gw8np": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_waves": 8,
+    "sort_pad_rows": false
+  },
+  "m64nbd2np": {
+    "tile_m": 64,
+    "down_nbd": 2,
+    "sort_pad_rows": false
+  },
+  "m64gw8np": {
+    "tile_m": 64,
+    "down_nbd": 2,
+    "gateup_waves": 8,
+    "sort_pad_rows": false
+  },
+  "m32gw2np": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_waves": 2,
+    "sort_pad_rows": false
   }
 }

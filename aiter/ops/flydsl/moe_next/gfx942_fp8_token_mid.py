@@ -57,6 +57,7 @@ class _Tile:
     waves: int
     pwd: int
     coalesce: bool
+    pad_rows: bool
 
 
 def _tile(config, gpu, model_dim, inter_dim):
@@ -80,6 +81,7 @@ def _tile(config, gpu, model_dim, inter_dim):
     w_cache = int(cfg.get("w_cache", 2))
     pwd = int(cfg.get("down_pw", 2))
     coalesce = bool(cfg.get("down_coalesce", True))
+    pad_rows = bool(cfg.get("sort_pad_rows", True))
     return _Tile(
         int(cfg.get("tile_m", 64)),
         gw,
@@ -92,6 +94,7 @@ def _tile(config, gpu, model_dim, inter_dim):
         waves,
         pwd,
         coalesce,
+        pad_rows,
     )
 
 
@@ -279,6 +282,7 @@ class Gfx942Fp8TokenMid(MoeKernel):
             num_local_tokens=nlt,
             zero_output=None if self.rows else out,
             with_loc_ids=self.rows,
+            pad_rows=t.pad_rows,
         )
         tiles = tm.max_tiles
         inter = torch.empty((tm.rows, I), dtype=torch.bfloat16, device=dev)
