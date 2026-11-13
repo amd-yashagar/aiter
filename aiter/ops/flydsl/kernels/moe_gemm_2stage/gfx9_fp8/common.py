@@ -18,7 +18,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as _raw
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
@@ -45,22 +44,16 @@ def _f32_to_bf16_rta(value):
 
 
 def _f32_to_bf16_rte(value):
+    # Integer RNE that matches ck_tile's float-to-bf16: ties go to even, NaN becomes
+    # 0x7FFF. It stays in plain VALU ops on purpose: an inline-asm version reads the
+    # MFMA accumulator with no wait states (LLVM does not pad MFMA results that are
+    # read inside inline asm), which corrupts values on gfx942.
+    bits = value.bitcast(fx.Uint32)
+    rounded = (bits + fx.Uint32(0x7FFF) + ((bits >> 16) & fx.Uint32(1))) >> 16
     if _SIMPLIFIED_BF16_RTE:
-        bits = value.bitcast(fx.Uint32)
-        rounded = bits + fx.Uint32(0x7FFF) + ((bits >> 16) & fx.Uint32(1))
-        return (rounded >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
-    # ck_tile/float_to_bf16_rtn_asm canonicalizes NaNs to 0x7FFF.
-    rounded = llvm.inline_asm(
-        T.i32,
-        [_raw(value), _raw(fx.Uint32(0x7FFF)), _raw(fx.Uint32(0x7FFF0000))],
-        "v_cmp_u_f32 vcc, $1, $1\n\t"
-        "v_bfe_u32 $0, $1, 16, 1\n\t"
-        "v_add3_u32 $0, $1, $0, $2\n\t"
-        "v_cndmask_b32 $0, $0, $3, vcc",
-        "=&v,v,v,v,~{vcc}",
-        has_side_effects=False,
-    )
-    return (fx.Uint32(rounded) >> 16).to(fx.Uint16).bitcast(fx.BFloat16)
+        return rounded.to(fx.Uint16).bitcast(fx.BFloat16)
+    is_nan = (bits & fx.Uint32(0x7FFFFFFF)) > fx.Uint32(0x7F800000)
+    return is_nan.select(fx.Uint32(0x7FFF), rounded).to(fx.Uint16).bitcast(fx.BFloat16)
 
 
 def _f32_to_bf16(value):
