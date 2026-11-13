@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """MOEBUG-064: tile_n=64 ASM fp8 stage-1 kernels and tainted stage-1 kernels never set a bar."""
 
+import csv
 import io
 import json
 from types import SimpleNamespace
@@ -293,3 +294,19 @@ def test_a_pair_that_failed_accuracy_in_the_screen_taints_too():
         json.loads(x) for x in fh.getvalue().splitlines() if '"event": "row"' in x
     )
     assert row["bar_id"] == other and "taint" in row["bar_exclusions"]
+
+
+def test_a_watch_row_is_recorded_and_not_excluded():
+    t = exclusions.unsafe_table()
+    assert ("gfx950", "fmoe_bf16_blockscaleFp8_g1u1_novs_silu_32x384") not in t
+    assert (
+        exclusions.unsafe_reason(
+            "gfx950", "_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_novs_silu_32x384E"
+        )
+        == ""
+    )
+    with open(exclusions.UNSAFE_CSV, newline="") as f:
+        watch = [r for r in csv.DictReader(f) if r["status"] == "watch"]
+    assert len(watch) == 4 and all(
+        "passes the harness blockscale accuracy rule" in r["evidence"] for r in watch
+    )

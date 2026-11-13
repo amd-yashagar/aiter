@@ -1,13 +1,17 @@
-gfx,stage1_tile,also_on,source,row_id,evidence
-gfx950,64x128_2tg_pf3,,results/smci355-moebug064-gfx950.csv,X01,"uniform 3/6, hot1 6/6 bad reps; buffer probe (results/smci355-moebug064-x01-x07-buffer-probe-gfx950.csv): fails with fresh sorting, re-launched buffers, zero or junk output/sort/moe_buf buffers, 4 to 11 of 16 reps, no variant removes it"
-gfx950,32x128_3tg_pf2,,results/smci355-moebug064-gfx950.csv,X07,"uniform 0/6, hot1 2/6 bad reps; buffer probe (results/smci355-moebug064-x01-x07-buffer-probe-gfx950.csv): fails with fresh sorting, re-launched buffers, zero or junk output/sort/moe_buf buffers, 4 to 11 of 16 reps, no variant removes it"
-gfx950,32x256_2tg_pf2,,results/smci355-moebug064-gfx950.csv,X08,"uniform 0/6, hot1 1/6 bad reps"
-gfx950,128x64_pf2,,results/smci355-moebug064-gfx950.csv,H02,"uniform 1/6, hot1 0/6 bad reps"
-gfx950,128x64_pf3,,results/smci355-moebug064-gfx950.csv,H06,"uniform 1/6, hot1 0/6 bad reps"
-gfx950,16x64_5tg_pf3,,results/smci355-moebug064-gfx950.csv,H07,"uniform 6/6, hot1 6/6 bad reps"
-gfx950,32x64_4tg_pf2,,results/smci355-moebug064-gfx950.csv,H10,"uniform 6/6, hot1 6/6 bad reps"
-gfx950,32x64_4tg_pf3,,results/smci355-moebug064-gfx950.csv,H13,"uniform 6/6, hot1 6/6 bad reps"
-gfx950,64x64_2tg_pf3,,results/smci355-moebug064-gfx950.csv,H16,"uniform 6/6, hot1 6/6 bad reps"
-gfx950,64x64_3tg_pf2,,results/smci355-moebug064-gfx950.csv,H19,"uniform 0/6, hot1 1/6 bad reps"
-gfx942,32x64_4tg_pf3,,status/meta-moebug064-tuned-rows.csv,R24,"uniform 6/6, hot1 6/6 bad reps"
-gfx950,fmoe_bf16_pertokenFp8_g1u1_tkw1_silu_1tg_32x64,,results/smci355-moebug064-gfx950.csv,"P01,P03,P04,P05","1-stage kernel, shipped ds_v3 rows 346-350 (aiter-integ): P01 uniform 2/6 hot1 1/6, P03 1/6 0/6, P04 4/6 1/6 (non-finite and 1e10 seen), P05 3/6 0/6 bad reps; P02 passed"
+gfx,stage1_tile,also_on,source,row_id,evidence,status
+gfx950,64x128_2tg_pf3,,results/smci355-moebug064-gfx950.csv,X01,"uniform 3/6, hot1 6/6 bad reps; buffer probe (results/smci355-moebug064-x01-x07-buffer-probe-gfx950.csv): fails with fresh sorting, re-launched buffers, zero or junk output/sort/moe_buf buffers, 4 to 11 of 16 reps, no variant removes it",exclude
+gfx950,32x128_3tg_pf2,,results/smci355-moebug064-gfx950.csv,X07,"uniform 0/6, hot1 2/6 bad reps; buffer probe (results/smci355-moebug064-x01-x07-buffer-probe-gfx950.csv): fails with fresh sorting, re-launched buffers, zero or junk output/sort/moe_buf buffers, 4 to 11 of 16 reps, no variant removes it",exclude
+gfx950,32x256_2tg_pf2,,results/smci355-moebug064-gfx950.csv,X08,"uniform 0/6, hot1 1/6 bad reps",exclude
+gfx950,128x64_pf2,,results/smci355-moebug064-gfx950.csv,H02,"uniform 1/6, hot1 0/6 bad reps",exclude
+gfx950,128x64_pf3,,results/smci355-moebug064-gfx950.csv,H06,"uniform 1/6, hot1 0/6 bad reps",exclude
+gfx950,16x64_5tg_pf3,,results/smci355-moebug064-gfx950.csv,H07,"uniform 6/6, hot1 6/6 bad reps",exclude
+gfx950,32x64_4tg_pf2,,results/smci355-moebug064-gfx950.csv,H10,"uniform 6/6, hot1 6/6 bad reps",exclude
+gfx950,32x64_4tg_pf3,,results/smci355-moebug064-gfx950.csv,H13,"uniform 6/6, hot1 6/6 bad reps",exclude
+gfx950,64x64_2tg_pf3,,results/smci355-moebug064-gfx950.csv,H16,"uniform 6/6, hot1 6/6 bad reps",exclude
+gfx950,64x64_3tg_pf2,,results/smci355-moebug064-gfx950.csv,H19,"uniform 0/6, hot1 1/6 bad reps",exclude
+gfx942,32x64_4tg_pf3,,status/meta-moebug064-tuned-rows.csv,R24,"uniform 6/6, hot1 6/6 bad reps",exclude
+gfx950,fmoe_bf16_pertokenFp8_g1u1_tkw1_silu_1tg_32x64,,results/smci355-moebug064-gfx950.csv,"P01,P03,P04,P05","1-stage kernel, shipped ds_v3 rows 346-350 (aiter-integ): P01 uniform 2/6 hot1 1/6, P03 1/6 0/6, P04 4/6 1/6 (non-finite and 1e10 seen), P05 3/6 0/6 bad reps; P02 passed",exclude
+gfx950,fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_32x256,,results/smci355-moebug064-gfx950.csv,B266,"14/38 hot1 events, max 0.0446; watch: partial corruption (rel_l2 0.02-0.08 against a healthy 0.012-0.014, so logits_diff <= 0.0035 < the 0.01 rule limit and rel_l2 << 0.5): passes the harness blockscale accuracy rule, not excluded",watch
+gfx950,fmoe_bf16_blockscaleFp8_g1u1_novs_silu_1tg_ps_32x256,,results/smci355-moebug064-gfx950.csv,B222,"4/76 hot1 events, max 0.0832; watch: partial corruption (rel_l2 0.02-0.08 against a healthy 0.012-0.014, so logits_diff <= 0.0035 < the 0.01 rule limit and rel_l2 << 0.5): passes the harness blockscale accuracy rule, not excluded",watch
+gfx950,fmoe_bf16_blockscaleFp8_g1u1_novs_silu_32x384,,results/smci355-moebug064-gfx950.csv,"B153,B169","5/76 and 4/38 hot1 events, max 0.0459; watch: partial corruption (rel_l2 0.02-0.08 against a healthy 0.012-0.014, so logits_diff <= 0.0035 < the 0.01 rule limit and rel_l2 << 0.5): passes the harness blockscale accuracy rule, not excluded",watch
+gfx950,fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_64x384,,results/smci355-moebug064-gfx950.csv,"B170,B171","2/38 and 2/76 hot1 events, max 0.0306; watch: partial corruption (rel_l2 0.02-0.08 against a healthy 0.012-0.014, so logits_diff <= 0.0035 < the 0.01 rule limit and rel_l2 << 0.5): passes the harness blockscale accuracy rule, not excluded",watch

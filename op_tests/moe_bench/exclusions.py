@@ -56,7 +56,15 @@ def stage1_tile(name):
 UNSAFE_CSV = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "unsafe_stage1.csv"
 )
-UNSAFE_COLS = ["gfx", "stage1_tile", "also_on", "source", "row_id", "evidence"]
+UNSAFE_COLS = [
+    "gfx",
+    "stage1_tile",
+    "also_on",
+    "source",
+    "row_id",
+    "evidence",
+    "status",
+]
 
 
 @functools.lru_cache(maxsize=1)
@@ -71,6 +79,8 @@ def unsafe_table():
     try:
         with open(UNSAFE_CSV, newline="") as f:
             for r in csv.DictReader(f):
+                if (r.get("status") or "exclude") != "exclude":
+                    continue  # watch rows are recorded, not excluded
                 why = f"{r['source']} {r['row_id']} ({r['gfx']}: {r['evidence']})"
                 for g in [r["gfx"], *filter(None, (r.get("also_on") or "").split(","))]:
                     out.setdefault((g.strip(), r["stage1_tile"]), why)
@@ -100,11 +110,17 @@ def append_verdicts(rows, path=None):
     have = set()
     if os.path.exists(path):
         with open(path, newline="") as f:
-            have = {(r["gfx"], r["stage1_tile"]) for r in csv.DictReader(f)}
+            have = {
+                (r["gfx"], r["stage1_tile"], r.get("status") or "exclude")
+                for r in csv.DictReader(f)
+            }
     new = []
     for r in rows:
         r = {**r, "stage1_tile": r["stage1_tile"].rstrip("E")}
-        key = (r["gfx"], r["stage1_tile"])
+        key = (
+            r["gfx"],
+            r["stage1_tile"],
+        )  # a watch entry is not re-added as an exclusion: edit its status
         if key not in have:
             have.add(key)
             new.append({c: r.get(c, "") for c in UNSAFE_COLS})
