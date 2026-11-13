@@ -226,7 +226,11 @@ class _Fp8BlockGfx950(MoeKernel):
                     compile_stage1,
                 )
 
-                kw = {"direct_topk": topk if zero_v4 else 0, "zero_row_v4": zero_v4}
+                kw = {
+                    "direct_topk": topk if zero_v4 else 0,
+                    "zero_row_v4": zero_v4,
+                    "w1_cache": cfg.get("w1_cache", 3),
+                }
             s1 = compile_stage1(
                 model_dim=spec.model_dim,
                 inter_dim=spec.inter_dim,

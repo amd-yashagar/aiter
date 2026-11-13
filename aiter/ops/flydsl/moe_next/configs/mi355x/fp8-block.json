@@ -12,6 +12,23 @@
       "splits": "auto",
       "route": "sort"
     },
+    "d16c": {
+      "tile_m": 16,
+      "tile_n2": 128,
+      "splits": "auto",
+      "w1_cache": 0
+    },
+    "d16n": {
+      "tile_m": 16,
+      "tile_n2": 64,
+      "splits": "auto"
+    },
+    "d16cn": {
+      "tile_m": 16,
+      "tile_n2": 64,
+      "splits": "auto",
+      "w1_cache": 0
+    },
     "d32": {
       "tile_m": 32,
       "tile_n2": 128

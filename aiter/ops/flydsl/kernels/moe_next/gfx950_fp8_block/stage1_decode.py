@@ -60,7 +60,7 @@ CPOL_COHERENT = 0x1 | 0x10
 
 def _build_stage1(
     *, model_dim, inter_dim, experts, tile_m, act, doweight_stage1, wide_k, splits,
-    direct_topk=0, zero_row_v4=0
+    direct_topk=0, zero_row_v4=0, w1_cache=3
 ):
     elem_t = fx.Float8E4M3FN
     DROUTE = int(direct_topk)
@@ -107,7 +107,7 @@ def _build_stage1(
 
     _val_per_thr = 16
     _swz_params = (3, 4, 3)
-    NT_B = 3  # W1 load cache policy (0 cached, 2 nt)
+    NT_B = int(w1_cache)  # W1 load cache policy (0 cached, 2 nt, 3 nt|sc0)
     DIRECT_A = bool(wide_k)  # A tile straight to MFMA operand VGPRs, no LDS/barrier in loop
     # Direct A reads x as bf16 and quantizes it in the K loop (no separate quant launch);
     # the gather path reads the pre-quantized fp8 x.
@@ -938,6 +938,7 @@ def compile_stage1(
     splits=1,
     direct_topk=0,
     zero_row_v4=0,
+    w1_cache=3,
 ):
     """splits > 1: split-K over hidden into that many workgroups per (tile, block); the
     launcher then also takes the fp32 workspace (splitk_workspace_floats) and one
@@ -947,7 +948,7 @@ def compile_stage1(
     (M * topk <= core direct.DIRECT_MAX_ROUTES), stage 1 writes the tiles' sorted ids, weights
     (from the x_scale slot, which then takes topk_weight as f32), expert ids and row count in
     the sort's layout and zeroes that output's first M rows (zero_row_v4 16-byte vectors a
-    row). direct_topk = 0: both are unused."""
+    row). direct_topk = 0: both are unused. w1_cache: the W1 loads' cache bits."""
     return _build_stage1(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -959,4 +960,5 @@ def compile_stage1(
         splits=splits,
         direct_topk=direct_topk,
         zero_row_v4=zero_row_v4,
+        w1_cache=w1_cache,
     )
