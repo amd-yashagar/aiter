@@ -516,7 +516,7 @@ def _build_stage2(
                     cache=atom_cache,
                 )
             else:
-                c_out.copy(buf_atom, blk_n, rd)
+                c_out.copy(buf_atom, blk_n, rd, row_limit=tokens)
 
     @flyc.jit
     def launch_fp8b_stage2(

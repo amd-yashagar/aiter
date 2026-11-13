@@ -215,10 +215,21 @@ class TensorWithIndex:
                             )
                 continue
             if const_expr(rank == 3):
-                # [tokens, topk, N] rows: (token, slot) from the packed sorted id
-                tensor_sub_block = tensor_block[
-                    None, self.index_frag[0, m] & 0xFFFFFF, self.index_frag[0, m] >> 24
-                ]
+                # [tokens, topk, N] rows: (token, slot) from the packed sorted id. Padding slots
+                # (token >= row_limit) are skipped: token * topk * N can pass int32 for a large
+                # pad token and wrap back inside the buffer, past the descriptor's bounds check.
+                tok3 = self.index_frag[0, m] & 0xFFFFFF
+                tensor_sub_block = tensor_block[None, tok3, self.index_frag[0, m] >> 24]
+                if tok3 < fx.Int32(row_limit):
+                    for k in range_constexpr(rep_k):
+                        offset_block = fx.crd2idx((0, m, k), layout).to_py_value()
+                        offset_k_in_tile = offset_block // self.tile_m + self.offset_thread_k
+                        mem = fx.make_view(
+                            fx.get_iter(tensor_sub_block) + offset_k_in_tile,
+                            fx.make_layout(value_size, stride_size),
+                        )
+                        fx.copy(copy_atom, frag[None, m, k], mem)
+                continue
             else:
                 tensor_sub_block = tensor_block[None, self.index_frag[0, m] & 0xFFFFFF]
             for k in range_constexpr(rep_k):
