@@ -121,3 +121,26 @@ def test_large_case_times_through_graph_replay():
     assert len(ts) == 2500 and min(ts) > 0
     st = t.time(cold=False)
     assert st["iters"] >= 50 and st["median_us"] > 0
+
+
+def test_model_weight_looks_up_the_whole_string_before_splitting_on_the_bar():
+    from op_tests.moe_bench import compare
+
+    w = {"Mixtral-8x22B|Grok-1": 2.09, "Mixtral-8x22B": 1.2, "Grok-1": 1.1}
+    assert compare.model_weight("Mixtral-8x22B|Grok-1", w) == 2.09
+    # not listed whole: the parts, the heaviest wins (a weight list without the joined name)
+    del w["Mixtral-8x22B|Grok-1"]
+    assert compare.model_weight("Mixtral-8x22B|Grok-1", w) == 1.2
+    assert compare.model_weight("Unknown", w) == 1.0
+    assert compare.model_weight("", w) == 1.0
+
+
+def test_a_model_string_with_a_note_in_parentheses_takes_the_listed_models_weight():
+    from op_tests.moe_bench import compare
+
+    w = {"DeepSeek-V3/R1": 5.0, "DeepSeek-V4.1(hidden5120)": 4.6}
+    assert (
+        compare.model_weight("DeepSeek-V3/R1 (default shape; shared expert)", w) == 5.0
+    )
+    assert compare.model_weight("DeepSeek-V4.1(hidden5120)", w) == 4.6  # listed as is
+    assert compare.model_weight("Other (note)", w) == 1.0

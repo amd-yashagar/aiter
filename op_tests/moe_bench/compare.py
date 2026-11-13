@@ -14,6 +14,7 @@ import csv
 import json
 import math
 import os
+import re
 import statistics
 import sys
 from pathlib import Path
@@ -225,8 +226,19 @@ def read_weights(path):
 
 
 def model_weight(model, weights):
-    names = [m.strip() for m in (model or "").replace("?", "").split("|") if m.strip()]
-    hits = [weights[m] for m in names if m in weights]
+    """Weight of a case's model string. The whole string is looked up first (a listed name
+    may itself contain ``|``: "Mixtral-8x22B|Grok-1"), then its ``|`` parts; a name with a
+    trailing note in parentheses ("DeepSeek-V3/R1 (default shape; shared expert)") falls
+    back to the name before it, as the listed name has no note."""
+    whole = (model or "").replace("?", "").strip()
+    if whole in weights:
+        return weights[whole]
+    hits = []
+    for part in [p.strip() for p in whole.split("|") if p.strip()]:
+        for name in (part, re.sub(r"\s+\([^)]*\)\s*$", "", part)):
+            if name in weights:
+                hits.append(weights[name])
+                break
     return max(hits) if hits else 1.0
 
 
