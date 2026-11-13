@@ -1,3 +1,11 @@
 family,model_dim,inter_dim,experts,topk,act,doweight_stage1,m_min,m_max,kernel,config,verified,note
-fp8-token,4096,128,513,11,silu,0,17,20,gfx942_fp8_token.mid,m16,gate:dell300x-lo17-946a02adc-c34eba73d,Qwen3.5-397B mid band below 25: no worse than bar warm and cold
-fp8-token,4096,128,513,11,silu,0,21,24,gfx942_fp8_token.mid,m32gw2,gate:dell300x-lo17-946a02adc-c34eba73d,Qwen3.5-397B mid band below 25: no worse than bar warm and cold
+fp8-token,4096,128,513,11,silu,0,17,20,gfx942_fp8_token.mid,m16,gate:dell300x-gate4+ep-946a02adc-c30b8f19d,Qwen3.5-397B: warm -6.6 to -6.9% / cold -39 to -40% vs bar
+fp8-token,4096,128,513,11,silu,0,21,24,gfx942_fp8_token.mid,m32gw2,gate:dell300x-gate4+ep-946a02adc-c30b8f19d,Qwen3.5-397B: M 21 warm tie (-1.0%) / cold -37%; M 24 -5.1% / -36.5%
+fp8-token,4096,128,513,11,silu,0,25,64,gfx942_fp8_token.mid,m32nbd2,gate:dell300x-gate4+ep-946a02adc-c30b8f19d,Qwen3.5-397B: M 25 warm tie (-0.1%) / cold -33%; M 64 -12.3% / -29.5%
+fp8-token,4096,128,513,11,silu,0,65,160,gfx942_fp8_token.mid,m32gw8,gate:dell300x-gate4+ep-946a02adc-c30b8f19d,Qwen3.5-397B: M 65 -5.7% / -25.2%; M 160 -6.4% / -21.9%
+fp8-token,4096,128,513,11,silu,0,161,1024,gfx942_fp8_token.mid_atomic,m32gw8,gate:dell300x-gate4+ep-946a02adc-c30b8f19d,Qwen3.5-397B: M 161 -10.9% / -25.9%; M 1024 -10.6% / -24.1%
+fp8-token,4096,128,513,11,silu,0,1792,2048,gfx942_fp8_token.mid,m64gw8,gate:dell300x-gate4+ep-946a02adc-c30b8f19d,Qwen3.5-397B above the band: -10.3 to -12.1% / -17.7 to -20.2%
+fp8-token,6144,384,129,5,swiglu,0,16,512,gfx942_fp8_token.mid,m32nbd2,gate:dell300x-gate4+ep-946a02adc-c30b8f19d,MiniMax-M3 E129: M 16 -12.5% / -39.1%; M 512 -18.6% / -31.0%
+fp8-token,6144,384,129,5,swiglu,0,513,768,gfx942_fp8_token.mid,m64nbd2,gate:dell300x-gate4+ep-946a02adc-c30b8f19d,MiniMax-M3 E129: M 513 -4.1% / -14.7%; M 768 -1.6% / -13.4% (M 1024 loses warm: aiter)
+fp8-token,4096,192,128,8,silu,0,16,257,gfx942_fp8_token.mid_atomic,m32gw2,gate:dell300x-gate4+ep-946a02adc-c30b8f19d,Qwen3-235B: M 16 -9.0% / -37.9%; M 257 -5.9% / -31.6% (M 320 +0.2% warm and M 512 lose: aiter)
+fp8-token,4096,192,128,8,silu,0,897,1024,gfx942_fp8_token.mid,m64nbd2,gate:dell300x-gate4+ep-946a02adc-c30b8f19d,Qwen3-235B: M 897 -2.6% / -12.6%; M 960 -0.7% / -8.2%; M 1024 -2.5% / -13.8%
