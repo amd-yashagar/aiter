@@ -4109,6 +4109,38 @@ def _can_reroute_bf16_to_a16wmix(
     return _swiglu_limit_is_active(swiglu_limit)
 
 
+def _ck_2stage_unbuildable_reason(q_type, q_dtype_a, q_dtype_w, activation, gfx):
+    """Why the CK 2-stage module for this combination cannot be built, or None.
+
+    Each case below was built on the host (no GPU) for gfx950 and gfx942: the module
+    request fails at codegen or compile time, so the first call dies deep in the JIT
+    build. Anything not listed builds (or, for MXFP4 weights on gfx942, builds with no
+    instances, which fails at launch instead).
+    """
+    if activation == ActivationType.Situv2:
+        return "gen_instances.py has no Situv2 activation"
+    if (
+        q_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp8
+    ):
+        return (
+            "CK has no mxfp8 (fp8 x fp8 per_1x32) 2-stage instance: every instance "
+            "fails to compile"
+        )
+    if (
+        gfx == "gfx950"
+        and q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and activation == ActivationType.Swiglu
+    ):
+        return (
+            "the CK MXFP4 2-stage kernels have no Swiglu epilogue (static_assert in "
+            "gridwise_moe_mx_gemm)"
+        )
+    return None
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -5070,6 +5102,21 @@ def get_2stage_cfgs(
     is_cktile2 = isinstance(kernelName2, str) and kernelName2.startswith("cktile_")
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
     if is_opus1 or is_flydsl1 or is_flydsl2:
+        _ck_stage1 = not (is_opus1 or is_flydsl1)
+        _ck_stage2 = not (is_flydsl2 or is_cktile2 or is_opus2)
+        if _ck_stage1 or _ck_stage2:
+            _unbuildable = _ck_2stage_unbuildable_reason(
+                q_type, q_dtype_a, q_dtype_w, activation, gfx
+            )
+            if _unbuildable is not None:
+                raise NotImplementedError(
+                    f"The tuned row pairs {kernelName1!r} with {kernelName2!r}, which "
+                    f"needs a CK 2-stage module for {activation} with "
+                    f"q_type={q_type.name}, q_dtype_a={q_dtype_a}, "
+                    f"q_dtype_w={q_dtype_w} on {gfx}: {_unbuildable} (token={token}, "
+                    f"model_dim={model_dim}, inter_dim={inter_dim}, expert={expert}, "
+                    f"topk={topk})."
+                )
         enable_bias = (
             activation == ActivationType.Swiglu
             and _needs_swiglu_bias_support(dtype, q_type)
@@ -5538,6 +5585,16 @@ def get_2stage_cfgs(
             ]
         )
     ):
+        _unbuildable = _ck_2stage_unbuildable_reason(
+            q_type, q_dtype_a, q_dtype_w, activation, gfx
+        )
+        if _unbuildable is not None:
+            raise NotImplementedError(
+                f"No CK 2-stage module can be built for {activation} with "
+                f"q_type={q_type.name}, q_dtype_a={q_dtype_a}, q_dtype_w={q_dtype_w} "
+                f"on {gfx}: {_unbuildable} (token={token}, model_dim={model_dim}, "
+                f"inter_dim={inter_dim}, expert={expert}, topk={topk})."
+            )
         if kernelName2 and kernelName2.startswith("flydsl_"):
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
