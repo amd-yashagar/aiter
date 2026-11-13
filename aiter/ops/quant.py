@@ -14,7 +14,7 @@ from torch import Tensor
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..plugin import route as _route
 from ..utility import dtypes, fp4_utils
 from ..utility import mx_types as _mx_types
@@ -328,7 +328,9 @@ def per_1x32_f8_scale_f8_quant(
         # The legacy f32_to_e8m0(amax / floor_pow2(max)) bypassed the default
         # and diverged by one exponent on ~1/8 of groups vs the RoundUp kernel.
         fp8_mx_dtype = (
-            MxDtypeInt.FP8_E4M3_FNUZ if get_gfx() == "gfx942" else MxDtypeInt.FP8_E4M3
+            MxDtypeInt.FP8_E4M3_FNUZ
+            if get_gfx_runtime() == "gfx942"
+            else MxDtypeInt.FP8_E4M3
         )
         scale_e8m0_biased = fp4_utils.f32_to_mx_e8m0_scale(
             max_abs, mode=MX_DEFAULT_ROUND_MODE, dtype=fp8_mx_dtype
@@ -1129,7 +1131,7 @@ def quant_mxfp4_hip(
         and not a16w4_shuffle
         and not gate_up
         and not shuffle_weight
-        and get_gfx() != "gfx942"
+        and get_gfx_runtime() != "gfx942"
     ):
         return per_1x32_f4_quant_hip(x, shuffle=e8m0_shuffle)
 

@@ -9,7 +9,7 @@ import os
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx, get_gfx_runtime
+from ..jit.utils.chip_info import get_gfx, get_gfx_runtime  # noqa: F401
 from ..utility import dtypes
 from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
@@ -135,7 +135,7 @@ def _use_flydsl_herd(
     if gating_output.dim() != 2:
         return False
     tokens = gating_output.shape[0]
-    if get_gfx() != "gfx950" or not (
+    if get_gfx_runtime() != "gfx950" or not (
         _FLYDSL_HERD_MIN_M <= tokens <= _FLYDSL_HERD_MAX_M
     ):
         return False
@@ -1251,7 +1251,7 @@ def _should_use_flydsl_topk_decode(
     ):
         return False
 
-    arch = get_gfx()
+    arch = get_gfx_runtime()
     if arch not in _FLYDSL_TOPK_DECODE_GATES:
         return False
 

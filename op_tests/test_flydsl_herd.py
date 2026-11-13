@@ -59,6 +59,7 @@ def test_legacy_topk_and_atom_candidates(monkeypatch, gfx, wave):
     topk = importlib.import_module("aiter.ops.topk")
     herd = importlib.import_module("aiter.ops.flydsl.herd_topk")
     monkeypatch.setattr(topk, "get_gfx", lambda: gfx)
+    monkeypatch.setattr(topk, "get_gfx_runtime", lambda: gfx)
     monkeypatch.setattr(topk, "_FLYDSL_USE_HERD", True)
     monkeypatch.setattr(topk, "_FLYDSL_HERD_MIN_M", 16)
     monkeypatch.setattr(topk, "_FLYDSL_HERD_MAX_M", 128)
