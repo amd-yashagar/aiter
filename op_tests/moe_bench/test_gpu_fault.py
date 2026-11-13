@@ -401,3 +401,60 @@ def test_a_worker_exits_when_its_gpu_has_no_live_claim_of_its_parent(tmp_path):
     r, took = run({"MOE_BENCH_GPU": "3"})
     assert r.returncode == 71 and took < 6, (r.returncode, r.stderr[-300:])
     assert "no live claim on gpu3" in r.stderr
+
+
+def test_a_claim_held_by_any_ancestor_covers_a_nested_launcher_none_run(
+    monkeypatch, tmp_path
+):
+    """``gpu_claim -- script`` holds the claim; the script runs ``--launcher none``, so the
+    worker's parent is the runner and the claim owner is further up. Such a worker keeps
+    running; a live claim of a process that is not an ancestor still stops it."""
+    import os
+    import subprocess
+    import sys
+
+    from op_tests.moe_bench import gpu_claim
+
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    me = os.getpid()
+    assert gpu_claim.ancestors(me)[:2] == [me, os.getppid()]
+    monkeypatch.setattr(gpu_claim, "CLAIM_DIR", str(tmp_path))
+    _claim(tmp_path, 3, me)
+    assert gpu_claim.claim_is_live(3, [me, 1]) and not gpu_claim.claim_is_live(3, [1])
+
+    worker = (
+        "import time\n"
+        "from op_tests.moe_bench import gpu_claim\n"
+        "gpu_claim.watch_claim(period=0.2)\n"
+        "time.sleep(3)\n"
+        "print('SURVIVED')\n"
+    )
+    # runner -> worker, with the test process (the outer claim owner) two levels up
+    runner = (
+        "import subprocess, sys\n"
+        f"r = subprocess.run([sys.executable, '-c', {worker!r}], capture_output=True, text=True)\n"
+        "sys.stdout.write(r.stdout); sys.stderr.write(r.stderr); sys.exit(r.returncode)\n"
+    )
+    env = dict(
+        os.environ,
+        PYTHONPATH=here,
+        MOE_BENCH_CLAIM_DIR=str(tmp_path),
+        MOE_BENCH_GPU="3",
+    )
+
+    def run():
+        return subprocess.run(
+            [sys.executable, "-c", runner], env=env, cwd=here,
+            capture_output=True, text=True, timeout=60, check=False,
+        )  # fmt: skip
+
+    r = run()
+    assert r.returncode == 0 and "SURVIVED" in r.stdout, r.stderr[-300:]
+    other = subprocess.Popen(["sleep", "30"])  # alive, not an ancestor of the worker
+    try:
+        _claim(tmp_path, 3, other.pid)
+        r = run()
+        assert r.returncode == 71 and "no live claim on gpu3" in r.stderr
+    finally:
+        other.kill()
+        other.wait()

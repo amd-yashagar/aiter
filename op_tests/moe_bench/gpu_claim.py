@@ -183,24 +183,41 @@ def die_with_parent():
     return preexec
 
 
-def claim_is_live(gpu, parent_pid, worker=None):
-    """Whether the claim file of ``gpu`` names ``parent_pid`` (alive) as its owner."""
+def ancestors(pid):
+    """``pid`` and its parent chain up to init (read from /proc; a vanished process ends it)."""
+    chain = []
+    while pid > 0 and pid not in chain:
+        chain.append(pid)
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                # comm may hold spaces and parentheses: the fields start after the last ")"
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return chain
+
+
+def claim_is_live(gpu, owner, worker=None):
+    """Whether the claim file of ``gpu`` names a live process among ``owner`` (a pid, or
+    several: a worker accepts any ancestor, so a ``--launcher none`` run inside an outer
+    ``gpu_claim -- script`` is covered by the outer claim) as its owner."""
+    owners = {owner} if isinstance(owner, int) else set(owner)
     try:
         with open(claim_path(gpu)) as f:
             c = json.load(f)
     except (OSError, ValueError):
         return False
-    if int(c.get("pid") or 0) != parent_pid or not os.path.exists(
-        f"/proc/{parent_pid}"
-    ):
+    pid = int(c.get("pid") or 0)
+    if pid not in owners or not os.path.exists(f"/proc/{pid}"):
         return False
     return worker is None or c.get("worker") == worker
 
 
 def watch_claim(period=15.0, exit_code=71):
     """In a worker: when ``MOE_BENCH_GPU`` names a GPU (the claim launcher set it), exit if
-    the claim file of that GPU stops naming this worker's parent: a worker never runs on a
-    GPU without a live claim. Returns the thread (None when there is no claim to watch).
+    the claim file of that GPU stops naming a live ancestor of this worker (its parent for a
+    claim launcher's shard, a further ancestor when the run sits inside an outer
+    ``gpu_claim -- script``): a worker never runs on a GPU without a live claim. Returns the thread (None when there is no claim to watch).
     """
     import threading
 
@@ -213,7 +230,7 @@ def watch_claim(period=15.0, exit_code=71):
     def loop():
         while True:
             time.sleep(period)
-            if os.getppid() != parent or not claim_is_live(gpu, parent):
+            if os.getppid() != parent or not claim_is_live(gpu, ancestors(parent)):
                 print(
                     f"moe_bench worker: no live claim on gpu{gpu} (parent {parent}); exiting",
                     file=sys.stderr,
