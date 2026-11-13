@@ -442,6 +442,84 @@ class FusedCfgSource(Source):
             out.append(ForcedConfig(f"fused_moe|graph|{cs}", k1, row, "whole-graph"))
         return out
 
+    BASE_TRIES = 24  # attempts to find a stage pair that runs, per block_m group
+    UNRANKED_CAP = (
+        64  # pairs timed directly, per group, that the marginal sweep skipped
+    )
+
+    def _marginal(self, lst, measure):
+        """Marginal-effect timing of one block_m group's stage pairs.
+
+        ``measure(candidate)`` returns {"ok", "us"}. Returns None when no pair of the group
+        runs, else (t1, t2, find, predicted): ``t1`` times every stage-1 kernel with one
+        stage-2 partner, ``t2`` every stage-2 kernel with the best stage 1, ``find`` maps
+        (stage 1, stage 2) to the candidate, and ``predicted`` the pair times: the sum of
+        the stages' effects for pairs the sweep covers, a direct timing for a pair the sweep
+        could not reach because its stage kernel is not paired with the partner used (a
+        group is not always the full product). A kernel that ran and failed stays out.
+        """
+        s1_names = sorted({c.meta["s1"] for c in lst})
+        s2_names = sorted({c.meta["s2"] for c in lst})
+        find = {(c.meta["s1"], c.meta["s2"]): c for c in lst}
+        base, tries = None, 0
+        for k1 in s1_names:
+            for k2 in s2_names:
+                c = find.get((k1, k2))
+                if c is None:
+                    continue
+                res = measure(c)
+                tries += 1
+                if res["ok"]:
+                    base = (k1, k2, res["us"])
+                    break
+                if tries >= self.BASE_TRIES:
+                    break
+            if base or tries >= self.BASE_TRIES:
+                break
+        if base is None:
+            return None
+        t1, missing1 = {}, set()
+        for k1 in s1_names:
+            c = find.get((k1, base[1]))
+            if c is None:
+                missing1.add(k1)
+                continue
+            res = measure(c)
+            if res["ok"]:
+                t1[k1] = res["us"]
+        if not t1:
+            return None
+        best1 = min(t1, key=t1.get)
+        t2, missing2 = {}, set()
+        for k2 in s2_names:
+            c = find.get((best1, k2))
+            if c is None:
+                missing2.add(k2)
+                continue
+            res = measure(c)
+            if res["ok"]:
+                t2[k2] = res["us"]
+        if not t2:
+            return None
+        ref = t2.get(base[1], base[2])
+        predicted = {
+            c.id: t1[k1] + t2[k2] - ref
+            for (k1, k2), c in find.items()
+            if k1 in t1 and k2 in t2
+        }
+        unreached = [
+            c for (k1, k2), c in find.items() if k1 in missing1 or k2 in missing2
+        ]
+        for c in unreached[: self.UNRANKED_CAP]:
+            res = measure(c)
+            if res["ok"]:
+                predicted[c.id] = res["us"]
+        if len(unreached) > self.UNRANKED_CAP:
+            self.unreached_skipped = getattr(self, "unreached_skipped", 0) + (
+                len(unreached) - self.UNRANKED_CAP
+            )
+        return t1, t2, find, predicted
+
     def rank(self, ctx, cands, runner):
         """Timing-only ranking for two-phase bar screening: [(predicted us, candidate)],
         fastest first, over every candidate.
@@ -461,46 +539,15 @@ class FusedCfgSource(Source):
             {}
         )  # group -> (stage-1 times, stage-2 times, {(k1, k2): cand})
         for group, lst in by_bm.items():
-            s1_names = sorted({c.meta["s1"] for c in lst})
-            s2_names = sorted({c.meta["s2"] for c in lst})
-            find = {(c.meta["s1"], c.meta["s2"]): c for c in lst}
-            base = None
-            for k2 in s2_names:
-                c = find.get((s1_names[0], k2))
-                if c is None:
-                    continue
-                res = runner.measure(c, quick=True, check=False)
-                if res["ok"]:
-                    base = (s1_names[0], k2, res["us"])
-                    break
-            if base is None:
+            got = self._marginal(
+                lst, lambda c: runner.measure(c, quick=True, check=False)
+            )
+            if got is None:
                 continue
-            t1 = {}
-            for k1 in s1_names:
-                c = find.get((k1, base[1]))
-                if c is None:
-                    continue
-                res = runner.measure(c, quick=True, check=False)
-                if res["ok"]:
-                    t1[k1] = res["us"]
-            if not t1:
-                continue
-            best1 = min(t1, key=t1.get)
-            t2 = {}
-            for k2 in s2_names:
-                c = find.get((best1, k2))
-                if c is None:
-                    continue
-                res = runner.measure(c, quick=True, check=False)
-                if res["ok"]:
-                    t2[k2] = res["us"]
-            if not t2:
-                continue
-            ref = t2.get(base[1], base[2])
+            t1, t2, find, predicted = got
             self.last_stage[group] = (t1, t2, find)
-            for (k1, k2), c in find.items():
-                if k1 in t1 and k2 in t2:
-                    ranked.append((t1[k1] + t2[k2] - ref, c))
+            by_id = {c.id: c for c in lst}
+            ranked += [(us, by_id[cid]) for cid, us in predicted.items()]
         for c in singles:
             res = runner.measure(c, quick=True, check=False)
             if res["ok"]:
@@ -519,43 +566,13 @@ class FusedCfgSource(Source):
         stage_marg = {}
         best_overall = []
         for lst in by_bm.values():
-            s1_names = sorted({c.meta["s1"] for c in lst})
-            s2_names = sorted({c.meta["s2"] for c in lst})
-            find = {(c.meta["s1"], c.meta["s2"]): c for c in lst}
-            base = None
-            for k2 in s2_names:
-                res = runner.measure(find[(s1_names[0], k2)], quick=True)
-                if res["ok"]:
-                    base = (s1_names[0], k2, res["us"])
-                    break
-            if base is None:
+            got = self._marginal(lst, lambda c: runner.measure(c, quick=True))
+            if got is None:
                 continue
-            t1 = {}
-            for k1 in s1_names:
-                c = find.get((k1, base[1]))
-                if c is None:
-                    continue
-                res = runner.measure(c, quick=True)
-                if res["ok"]:
-                    t1[k1] = res["us"]
-            if not t1:
-                continue
-            best1 = min(t1, key=t1.get)
-            t2 = {}
-            for k2 in s2_names:
-                c = find.get((best1, k2))
-                if c is None:
-                    continue
-                res = runner.measure(c, quick=True)
-                if res["ok"]:
-                    t2[k2] = res["us"]
-            if not t2:
-                continue
-            ref = t2.get(base[1], base[2])
-            for (k1, k2), c in find.items():
-                if k1 in t1 and k2 in t2:
-                    stage_marg[c.id] = t1[k1] + t2[k2] - ref
-                    best_overall.append(c)
+            by_id = {c.id: c for c in lst}
+            for cid, us in got[3].items():
+                stage_marg[cid] = us
+                best_overall.append(by_id[cid])
         best_overall.sort(key=lambda c: stage_marg[c.id])
         keep += best_overall[:CONFIRM_PAIRS]
         timed = []
