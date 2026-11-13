@@ -52,8 +52,10 @@ def compile_gateup(
     activation="silu",
     swiglu_limit=None,
     W_CACHE=0,
+    PER_TENSOR=False,
 ):
-    """N = 2 * inter_dim (gate rows then up rows), K = model_dim. Weights are
+    """N = 2 * inter_dim (gate rows then up rows), K = model_dim; PER_TENSOR takes
+    one W1 scale per expert ([E]) in place of one per channel. Weights are
     prefetched PW chunks ahead and token rows PA chunks ahead; prefetches past
     the last chunk read out of range (no traffic). KS groups of WAVES waves
     split K, each staging its own token chunk, and fold their FP32 partials in
@@ -271,10 +273,20 @@ def compile_gateup(
                     def epilogue(acc, SV=SV):
                         ch = blk * 16 + q * 4
                         s_rs = rsrc(fxh._as_ptr(p_w_scale, fx.Float32))
-                        sg = Vec(buffer_ops.buffer_load(s_rs, e * N + ch, vec_width=4))
-                        su = Vec(
-                            buffer_ops.buffer_load(s_rs, e * N + I + ch, vec_width=4)
-                        )
+                        if const_expr(PER_TENSOR):
+                            w_e = fx.Float32(
+                                buffer_ops.buffer_load(s_rs, e, vec_width=1)
+                            )
+                            sg = su = [w_e] * 4
+                        else:
+                            sg = Vec(
+                                buffer_ops.buffer_load(s_rs, e * N + ch, vec_width=4)
+                            )
+                            su = Vec(
+                                buffer_ops.buffer_load(
+                                    s_rs, e * N + I + ch, vec_width=4
+                                )
+                            )
                         for s in range_constexpr(SV):
                             y = [
                                 act(acc[s][i] * sg[i], acc[SV + s][i] * su[i])

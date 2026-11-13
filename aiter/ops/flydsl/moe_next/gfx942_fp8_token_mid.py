@@ -99,7 +99,7 @@ def _tile(config, gpu, model_dim, inter_dim):
 
 
 @functools.cache
-def _gateup(N, K, s_max, waves, ch, ks, pw, pa, w_cache, act, swiglu_limit):
+def _gateup(N, K, s_max, waves, ch, ks, pw, pa, w_cache, act, swiglu_limit, pt):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token_mid.gateup import (
         compile_gateup,
     )
@@ -116,11 +116,12 @@ def _gateup(N, K, s_max, waves, ch, ks, pw, pa, w_cache, act, swiglu_limit):
         W_CACHE=w_cache,
         activation=act,
         swiglu_limit=swiglu_limit,
+        PER_TENSOR=pt,
     )
 
 
 @functools.cache
-def _down(N, K, topk, s_max, nbd, waves, pwd, rows, w_cache, coalesce):
+def _down(N, K, topk, s_max, nbd, waves, pwd, rows, w_cache, coalesce, pt):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token_mid.down import (
         compile_down,
     )
@@ -136,6 +137,7 @@ def _down(N, K, topk, s_max, nbd, waves, pwd, rows, w_cache, coalesce):
         ROWS=rows,
         W_CACHE=w_cache,
         COALESCE=coalesce,
+        PER_TENSOR=pt,
     )
 
 
@@ -161,10 +163,12 @@ class Gfx942Fp8TokenMid(MoeKernel):
         "combine": "bf16_rows_fp32_sum",
     }
     rows: ClassVar[bool] = True
+    # The quant type this id serves; per-tensor takes one weight scale per expert.
+    quant: ClassVar = QuantType.per_Token
 
     def supports(self, spec, m, topk, call=None):
-        if spec.quant != QuantType.per_Token:
-            return "needs per_Token"
+        if spec.quant != self.quant:
+            return f"needs {self.quant.name}"
         if spec.w_dtype != dtypes.fp8 or not spec.g1u1 or not spec.w_shuffled:
             return "needs shuffled fp8 g1u1 weights"
         if spec.act not in _ACTS:
@@ -200,8 +204,18 @@ class Gfx942Fp8TokenMid(MoeKernel):
                 return "contiguous fp32 weight scales only"
             if call.w1_scale.dtype != torch.float32:
                 return "fp32 weight scales only"
-            if call.w1_scale.numel() != spec.experts * 2 * I:
-                return "per-channel w1 scales only"
+            per_tensor = self.quant == QuantType.per_Tensor
+            n1, n2 = (
+                (spec.experts,) * 2
+                if per_tensor
+                else (spec.experts * 2 * I, spec.experts * D)
+            )
+            if call.w1_scale.numel() != n1 or call.w2_scale.numel() != n2:
+                return (
+                    "per-tensor weight scales"
+                    if per_tensor
+                    else "per-channel weight scales"
+                )
             if call.a1_scale is not None or call.a2_scale is not None:
                 return "prequantized activations"
             if call.output is not None and not call.output.is_contiguous():
@@ -235,6 +249,7 @@ class Gfx942Fp8TokenMid(MoeKernel):
                 t.w_cache,
                 act,
                 limit,
+                self.quant == QuantType.per_Tensor,
             )
             types = (fx.BFloat16, fx.Uint8, fx.BFloat16) + (fx.Int32,) * 3
             types += (fx.Float32,)
@@ -250,6 +265,7 @@ class Gfx942Fp8TokenMid(MoeKernel):
                 self.rows,
                 t.w_cache,
                 t.coalesce,
+                self.quant == QuantType.per_Tensor,
             )
             types = (fx.BFloat16, fx.Uint8, fx.BFloat16, fx.Int32, fx.Float32)
             types += (fx.Int32, fx.Int32, fx.Float32)
@@ -300,6 +316,7 @@ class Gfx942Fp8TokenMid(MoeKernel):
                 t.w_cache,
                 act,
                 limit,
+                self.quant == QuantType.per_Tensor,
             ),
             x,
             call.w1,
@@ -326,6 +343,7 @@ class Gfx942Fp8TokenMid(MoeKernel):
                 self.rows,
                 t.w_cache,
                 t.coalesce,
+                self.quant == QuantType.per_Tensor,
             ),
             inter,
             call.w2,
@@ -362,3 +380,21 @@ class Gfx942Fp8TokenMidAtomic(Gfx942Fp8TokenMid):
         "combine": "bf16_atomic",
     }
     rows: ClassVar[bool] = False
+
+
+@register_kernel
+class Gfx942Fp8TensorMid(Gfx942Fp8TokenMid):
+    """Per-tensor weights: the same kernels with one scale per expert. Activations
+    stay unquantized bf16, so a dynamic per-tensor activation scale is never formed;
+    a caller's static a1_scale is declined, as the family decode does."""
+
+    id = "gfx942_fp8_tensor.mid"
+    family = "fp8-tensor"
+    quant: ClassVar = QuantType.per_Tensor
+
+
+@register_kernel
+class Gfx942Fp8TensorMidAtomic(Gfx942Fp8TokenMidAtomic):
+    id = "gfx942_fp8_tensor.mid_atomic"
+    family = "fp8-tensor"
+    quant: ClassVar = QuantType.per_Tensor

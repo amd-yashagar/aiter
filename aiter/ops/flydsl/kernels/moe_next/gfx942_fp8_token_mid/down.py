@@ -52,8 +52,10 @@ def compile_down(
     ROWS=True,
     W_CACHE=0,
     COALESCE=True,
+    PER_TENSOR=False,
 ):
-    """N = model_dim, K = inter_dim. Each wave walks NBD channel blocks with W2
+    """N = model_dim, K = inter_dim; PER_TENSOR takes one W2 scale per expert. Each
+    wave walks NBD channel blocks with W2
     prefetched PWD blocks ahead; the tile's intermediate rows are staged once
     per workgroup in LDS. COALESCE transposes each wave's NBD x 16 output
     channels through LDS so every lane writes (or adds) 16 contiguous bytes of
@@ -143,14 +145,18 @@ def compile_down(
                         slots.append(fx.Int32(sid >> 24))
                         facs.append(rws[r])
                         oks.append(s * 16 + c < real)
-                    scs = [
-                        Vec(
-                            buffer_ops.buffer_load(
-                                s_rs, e * N + (nb0 + b) * 16 + q * 4, vec_width=4
+                    if const_expr(PER_TENSOR):
+                        w_e = fx.Float32(buffer_ops.buffer_load(s_rs, e, vec_width=1))
+                        scs = [[w_e] * 4] * NBD
+                    else:
+                        scs = [
+                            Vec(
+                                buffer_ops.buffer_load(
+                                    s_rs, e * N + (nb0 + b) * 16 + q * 4, vec_width=4
+                                )
                             )
-                        )
-                        for b in range_constexpr(NBD)
-                    ]
+                            for b in range_constexpr(NBD)
+                        ]
                     w_sets = []
                     for p in range_constexpr(PWD):
                         w_sets += load_w(fx.Int32(p))
