@@ -37,6 +37,14 @@
       "tile_m": 64,
       "tile_n2": 128
     },
+    "p64m": {
+      "tile_m": 64,
+      "tile_n2": 128,
+      "splits": 7,
+      "tail_max": 192,
+      "ring3": true,
+      "s2_mid": true
+    },
     "p128": {
       "tile_m": 128,
       "tile_n2": 128

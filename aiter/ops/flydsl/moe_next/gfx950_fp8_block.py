@@ -57,6 +57,17 @@ def _splits(cfg, spec, m, topk):
     return best
 
 
+def _tail_slots(cfg):
+    """Stage-1 workgroups resident at once (two 4-wave workgroups per CU at 2 waves/SIMD): a config
+    with tail_max splits K only for the pairs past the last whole round of these."""
+    if not cfg.get("tail_max"):
+        return 0
+    try:
+        return 2 * torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    except (RuntimeError, AssertionError):  # compile-only host: MI355X has 256 CUs
+        return 2 * int(os.getenv("CU_NUM", "256"))
+
+
 def _splitk_counters(device, n):
     """Split-K arrival counters for the current stream: zeroed once, and the last split
     of each (tile, block) puts its counter back to zero, so later calls (and graph
@@ -237,6 +248,8 @@ class _Fp8BlockGfx950(MoeKernel):
                     "zero_row_v4": zero_v4,
                     "w1_cache": cfg.get("w1_cache", 3),
                 }
+            elif cfg.get("ring3") or cfg.get("tail_max"):
+                kw = {"ring3": bool(cfg.get("ring3")), "tail_slots": _tail_slots(cfg), "tail_max": cfg.get("tail_max", 0)}
             s1 = compile_stage1(
                 model_dim=spec.model_dim,
                 inter_dim=spec.inter_dim,
@@ -258,6 +271,7 @@ class _Fp8BlockGfx950(MoeKernel):
             combine=self._combine or cfg.get("combine", "atomic_bf16"),
             rows_nt=bool(cfg.get("rows_nt", False)),
             atom_cache=_atom_cache(cfg),
+            mid_tune=bool(cfg.get("s2_mid")),
         )
         return s1, s2
 
@@ -367,8 +381,11 @@ class _Fp8BlockGfx950(MoeKernel):
                 splitk_workspace_floats,
             )
 
+            # a split tail holds at most tail_max (tile, block) pairs in the workspace
             ws = torch.empty(
-                splitk_workspace_floats(tm, tiles, I, splits),
+                splitk_workspace_floats(tm, cfg["tail_max"], 128, splits)
+                if _tail_slots(cfg)
+                else splitk_workspace_floats(tm, tiles, I, splits),
                 dtype=torch.float32,
                 device=x.device,
             )

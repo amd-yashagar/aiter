@@ -47,7 +47,8 @@ CPOL_COHERENT = 0x1 | 0x10
 
 
 def _build_stage1(
-    *, model_dim, inter_dim, experts, tile_m, act, doweight_stage1, wide_k, splits
+    *, model_dim, inter_dim, experts, tile_m, act, doweight_stage1, wide_k, splits, ring3=False,
+    tail_slots=0, tail_max=0
 ):
     elem_t = fx.Float8E4M3FN
     K = int(model_dim)
@@ -65,6 +66,17 @@ def _build_stage1(
     assert act in ("silu", "gelu")
     assert KB % SPLITS == 0 and KS % 2 == 0, f"{KB} K tiles do not split {SPLITS} ways"
     assert SPLITS == 1 or wide_k, "split-K is built on the wide-K path"
+    # ring3: W1 prefetched two K tiles ahead through a 3-slot ring (non-temporal W1, 2 waves/SIMD).
+    RING3 = bool(ring3)
+    assert not RING3 or (wide_k and KB % 3 == 2 and KS % 3 == 2), "the depth-2 W1 ring peels two tiles after 3-tile trips"
+    # tail_slots > 0: only the ragged last round's (tile, block) pairs split K (the first tail_slots pairs
+    # per round run all of K in their split-0 workgroup); at most tail_max pairs use the workspace.
+    TAIL = SPLITS > 1 and int(tail_slots) > 0
+    SLOTS = int(tail_slots)
+    TMAX = int(tail_max)
+    NBUF = 3 if RING3 else 2
+    # ring3 holds 240 VGPRs: 2 waves/SIMD, two 4-wave workgroups per CU
+    _ATTRS = {**_NO_PACKED_F32, "rocdl.waves_per_eu": 2} if RING3 else _NO_PACKED_F32
 
     # The A gather copies 256 // (TILE_K / 16) = 32 rows per pass: a tile_m 16 buffer
     # must still hold 32 rows, or the copy runs into the other ping-pong buffer.
@@ -72,9 +84,17 @@ def _build_stage1(
     a_lds_size = max(BM, _gather_rows) * TILE_K
 
     @fx.struct
-    class GemmBuffers:
+    class GemmBuffers2:
         a_ping: fx.Array[elem_t, a_lds_size, 16]
         a_pong: fx.Array[elem_t, a_lds_size, 16]
+
+    @fx.struct
+    class GemmBuffers3:
+        a_ping: fx.Array[elem_t, a_lds_size, 16]
+        a_pong: fx.Array[elem_t, a_lds_size, 16]
+        a_third: fx.Array[elem_t, a_lds_size, 16]
+
+    GemmBuffers = GemmBuffers3 if RING3 else GemmBuffers2
 
     @fx.union
     class SharedStorage:
@@ -89,7 +109,7 @@ def _build_stage1(
     _m_per_wave = _thrs_m // 4
 
     def _gemm(
-        blk_n, arg_p_input, arg_p_weight, lds, M, a_scale_t, w_scale_t, expert_id, k0
+        blk_n, arg_p_input, arg_p_weight, lds, M, a_scale_t, w_scale_t, expert_id, k0, nk=None
     ):
         tid = gpu.thread_idx.x
         mma_atom, tiled_mma = fxh.make_1x4_tiled_mma(elem_t, wide_k)
@@ -131,7 +151,10 @@ def _build_stage1(
         swz = fx.SwizzleType.get(*_swz_params)
         uni_cp_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_t)
         a_lds_w_bufs, a_lds_r_bufs, a_frag_bufs, a_frag_retile_bufs = [], [], [], []
-        for _buf_ptr in (lds.gemm.a_ping.ptr, lds.gemm.a_pong.ptr):
+        _a_ptrs = (lds.gemm.a_ping.ptr, lds.gemm.a_pong.ptr)
+        if const_expr(RING3):
+            _a_ptrs = _a_ptrs + (lds.gemm.a_third.ptr,)
+        for _buf_ptr in _a_ptrs:
             a_lds = fx.make_view(
                 _buf_ptr,
                 fx.make_composed_layout(
@@ -155,7 +178,7 @@ def _build_stage1(
                 .retile(a_frag)
             )
         a_cp_frag_bufs = [
-            fx.make_fragment_like(a_mem_thr[None, None, None, 0]) for _ in range(2)
+            fx.make_fragment_like(a_mem_thr[None, None, None, 0]) for _ in range(NBUF)
         ]
         a_cp_frag_retile_bufs = [
             fx.make_tiled_copy(
@@ -173,13 +196,16 @@ def _build_stage1(
             None, None, blk_n * 2 + 1, None
         ]
         b_g2r = fx.make_tiled_copy_A(buf_cp_atom_r, tiled_mma).get_slice(tid)
+        # ring3: W1 streams once per (tile, block) through an XCD whose L2 cannot hold it, so
+        # non-temporal loads keep the gathered x rows and the scales L2-resident
+        b_cp_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(2), elem_t) if RING3 else buf_cp_atom_r
         bl_g2r = b_g2r.partition_S(bl_tile)
         br_g2r = b_g2r.partition_S(br_tile)
         bl_frag_bufs = [
-            tiled_mma.make_fragment_A(bl_tile[None, None, 0]) for _ in range(2)
+            tiled_mma.make_fragment_A(bl_tile[None, None, 0]) for _ in range(NBUF)
         ]
         br_frag_bufs = [
-            tiled_mma.make_fragment_A(br_tile[None, None, 0]) for _ in range(2)
+            tiled_mma.make_fragment_A(br_tile[None, None, 0]) for _ in range(NBUF)
         ]
         bl_ret_bufs = [b_g2r.retile(f) for f in bl_frag_bufs]
         br_ret_bufs = [b_g2r.retile(f) for f in br_frag_bufs]
@@ -221,8 +247,8 @@ def _build_stage1(
         def _load_gmem(kt, s):
             kb = fx.Int32(kt)
             a_idx.copy(buf_cp_atom_r, kb, a_cp_frag_bufs[s])
-            fx.copy(buf_cp_atom_r, bl_g2r[None, None, None, kb], bl_ret_bufs[s])
-            fx.copy(buf_cp_atom_r, br_g2r[None, None, None, kb], br_ret_bufs[s])
+            fx.copy(b_cp_atom, bl_g2r[None, None, None, kb], bl_ret_bufs[s])
+            fx.copy(b_cp_atom, br_g2r[None, None, None, kb], br_ret_bufs[s])
 
         def _scales(kt):
             kb = fx.Int32(kt)
@@ -295,31 +321,80 @@ def _build_stage1(
                         pending = (acc, m, n, Vec(p), sa[n] * sw)
             _fold(*pending)
 
-        # This workgroup's K tiles: [k0, k0 + KS) (all of K without split-K).
-        _load_gmem(k0, 0)
-        rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile))
-        _write_a_lds(0)
-        gpu.barrier()
-        if const_expr(not wide_k):
-            _read_a_lds(0)
-        # Rolled K loop, two tiles per trip so the ping-pong buffers stay static. The
-        # prefetch past the last tile is clamped to it (loaded and ignored), so every
-        # trip issues the same loads and waits on the same vmcnt.
-        k_end = k0 + fx.Int32(KS)
-        last = k_end - fx.Int32(1)
-        for kt2 in range(0, KS, 2):
-            for u in range_constexpr(2):
-                kt = k0 + fx.Int32(kt2) + fx.Int32(u)
+        if const_expr(RING3):
+            # This workgroup's K tiles: [k0, k0 + n). W1 is prefetched two K tiles ahead through a
+            # 3-slot register ring (and A through 3 LDS buffers), so each wave keeps two tiles of the
+            # HBM stream in flight instead of one. vmcnt drains in order, so A is loaded two tiles
+            # ahead too: the wait for A(t+1) then leaves B(t+1), tile t's scales and the t+2 loads
+            # outstanding. The loop is unrolled by 3 so every slot index is static; both trip counts
+            # (KB, KS) are 2 mod 3, so the last two tiles are peeled and issue no loads.
+            _a_loads = fx.size(fx.get_shape(a_cp_frag_bufs[0])).to_py_value() // _val_per_thr
+            _s_loads = n_reps + 2
+            _ahead = _b_loads_per_tile + _s_loads + _a_loads + _b_loads_per_tile
+            n_k = fx.Int32(KS) if nk is None else nk
+            k_end = k0 + n_k
+            # Tile t's scales are loaded one tile early, ahead of A(t+1): the fold's wait for them
+            # then cannot force B(t+1) to land.
+            sc_bufs = [fx.make_rmem_tensor(n_reps + 2, fx.Float32) for _ in range(3)]
+
+            def _load_scales(kt, s):
                 sa, sg, su = _scales(kt)
-                kn = kt + fx.Int32(1)
-                kn = (kn < k_end).select(kn, last)
-                _load_gmem(kn, 1 - u)
-                rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile))
-                _write_a_lds(1 - u)
-                _mfma_fold(u, sa, sg, su)
-                gpu.barrier()
-                if const_expr(not wide_k):
-                    _read_a_lds(1 - u)
+                sc_bufs[s].store(Vec.from_elements(list(sa) + [sg, su], fx.Float32))
+
+            def _get_scales(s):
+                v = Vec(sc_bufs[s].load())
+                return [v[n] for n in range(n_reps)], v[n_reps], v[n_reps + 1]
+
+            _load_scales(k0, 0)
+            _load_gmem(k0, 0)
+            _load_gmem(k0 + fx.Int32(1), 1)
+            rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_a_loads + 2 * _b_loads_per_tile))
+            _write_a_lds(0)
+            gpu.barrier()
+            for kt3 in range(0, n_k - fx.Int32(2), 3):
+                for u in range_constexpr(3):
+                    kt = k0 + fx.Int32(kt3) + fx.Int32(u)
+                    _load_scales(kt + fx.Int32(1), (u + 1) % 3)
+                    _load_gmem(kt + fx.Int32(2), (u + 2) % 3)
+                    rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_ahead))
+                    _write_a_lds((u + 1) % 3)
+                    _mfma_fold(u, *_get_scales(u))
+                    gpu.barrier()
+            # peeled tiles n-2 (slot 0) and n-1 (slot 1): nothing left to prefetch
+            kt = k_end - fx.Int32(2)
+            _load_scales(kt + fx.Int32(1), 1)
+            rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile + _s_loads))
+            _write_a_lds(1)
+            _mfma_fold(0, *_get_scales(0))
+            gpu.barrier()
+            _mfma_fold(1, *_get_scales(1))
+            gpu.barrier()
+        else:
+            # This workgroup's K tiles: [k0, k0 + KS) (all of K without split-K).
+            _load_gmem(k0, 0)
+            rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile))
+            _write_a_lds(0)
+            gpu.barrier()
+            if const_expr(not wide_k):
+                _read_a_lds(0)
+            # Rolled K loop, two tiles per trip so the ping-pong buffers stay static. The
+            # prefetch past the last tile is clamped to it (loaded and ignored), so every
+            # trip issues the same loads and waits on the same vmcnt.
+            k_end = k0 + fx.Int32(KS)
+            last = k_end - fx.Int32(1)
+            for kt2 in range(0, KS, 2):
+                for u in range_constexpr(2):
+                    kt = k0 + fx.Int32(kt2) + fx.Int32(u)
+                    sa, sg, su = _scales(kt)
+                    kn = kt + fx.Int32(1)
+                    kn = (kn < k_end).select(kn, last)
+                    _load_gmem(kn, 1 - u)
+                    rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile))
+                    _write_a_lds(1 - u)
+                    _mfma_fold(u, sa, sg, su)
+                    gpu.barrier()
+                    if const_expr(not wide_k):
+                        _read_a_lds(1 - u)
         return c_gate, c_up
 
     _gemm = ASTRewriter.transform(_gemm)
@@ -449,7 +524,12 @@ def _build_stage1(
             in_ptr, fx.make_layout((M, fx.Int32(K)), (fx.Int32(K), 1))
         )
         num_valid = fxh_view_i32(arg_num_valid_ids)[0]
-        if e_idx * fx.Int32(BM) < num_valid:
+        live = e_idx * fx.Int32(BM) < num_valid
+        if const_expr(TAIL):
+            # split z > 0 workgroups only for the pairs of the split tail
+            live = live & ((gpu.block_idx.z == fx.Int32(0))
+                           | (e_idx * fx.Int32(IB) + blk_n >= _tail_head(num_valid)))
+        if live:
             lds = fx.SharedAllocator().allocate(SharedStorage)
             lds.sorted_lds = lds.sorted_lds.peek()
             lds.gemm = lds.gemm.peek()
@@ -493,6 +573,11 @@ def _build_stage1(
             if const_expr(doweight_stage1):
                 tw_frag = fxh.load_sorted_weight_frag(arg_sorted_weights, row0, BM, tid)
             split = gpu.block_idx.z
+            if const_expr(TAIL):
+                _tail_body(blk_n, e_idx, split, num_valid, arg_p_input, arg_p_weight, lds, M, a_scale_t,
+                           w_scale_t, expert_id, tw_frag, tid, row0, arg_inter, arg_inter_scale, i32_rows,
+                           arg_ws, arg_cnt)
+                return
             c_gate, c_up = _gemm(
                 blk_n,
                 arg_p_input,
@@ -551,18 +636,32 @@ def _build_stage1(
 
     def _sum_partials(c_gate, c_up, ws_rsrc, slot0, tid):
         slots = _partial_slots(c_gate, c_up)
-        for j, (acc, m, n) in enumerate(slots):
-            total = None
-            for s in range_constexpr(SPLITS):
-                off = (((slot0 + fx.Int32(s)) * fx.Int32(len(slots)) + fx.Int32(j)) * fx.Int32(256)
-                       + tid) * fx.Int32(4)
-                p = Vec(
-                    buffer_ops.buffer_load(
-                        ws_rsrc, off, vec_width=4, cache_modifier=CPOL_COHERENT
+        if const_expr(TAIL):
+            for j, (acc, m, n) in enumerate(slots):
+                off = ((slot0 * fx.Int32(len(slots)) + fx.Int32(j)) * fx.Int32(256) + tid) * fx.Int32(4)
+                acc[None, m, n].store(Vec(buffer_ops.buffer_load(
+                    ws_rsrc, off, vec_width=4, cache_modifier=CPOL_COHERENT)))
+            # the same split-order left fold; a rolled loop over splits keeps one split's loads
+            # in flight, not SPLITS x 16 vec4 (which spilled at SPLITS 7)
+            for s in range(1, SPLITS, 1):
+                for j, (acc, m, n) in enumerate(slots):
+                    off = (((slot0 + fx.Int32(s)) * fx.Int32(len(slots)) + fx.Int32(j)) * fx.Int32(256)
+                           + tid) * fx.Int32(4)
+                    p = Vec(buffer_ops.buffer_load(ws_rsrc, off, vec_width=4, cache_modifier=CPOL_COHERENT))
+                    acc[None, m, n].store(Vec(acc[None, m, n].load()) + p)
+        else:
+            for j, (acc, m, n) in enumerate(slots):
+                total = None
+                for s in range_constexpr(SPLITS):
+                    off = (((slot0 + fx.Int32(s)) * fx.Int32(len(slots)) + fx.Int32(j)) * fx.Int32(256)
+                           + tid) * fx.Int32(4)
+                    p = Vec(
+                        buffer_ops.buffer_load(
+                            ws_rsrc, off, vec_width=4, cache_modifier=CPOL_COHERENT
+                        )
                     )
-                )
-                total = p if total is None else total + p
-            acc[None, m, n].store(total)
+                    total = p if total is None else total + p
+                acc[None, m, n].store(total)
 
     def _epilogue(c_gate, c_up, tw_frag, lds, tid, blk_n, row0, arg_inter, arg_inter_scale, i32_rows):
         _activate(c_gate, c_up, tw_frag)
@@ -591,6 +690,48 @@ def _build_stage1(
     _store_partials = ASTRewriter.transform(_store_partials)
     _sum_partials = ASTRewriter.transform(_sum_partials)
     _epilogue = ASTRewriter.transform(_epilogue)
+
+    def _tail_head(num_valid):
+        pairs = (num_valid + fx.Int32(BM - 1)) // fx.Int32(BM) * fx.Int32(IB)
+        rem = pairs % fx.Int32(SLOTS)
+        split_tail = (pairs > fx.Int32(SLOTS)) & (rem <= fx.Int32(TMAX))
+        return split_tail.select(pairs - rem, pairs)
+
+    def _tail_body(blk_n, e_idx, split, num_valid, arg_p_input, arg_p_weight, lds, M, a_scale_t, w_scale_t,
+                   expert_id, tw_frag, tid, row0, arg_inter, arg_inter_scale, i32_rows, arg_ws, arg_cnt):
+        head = _tail_head(num_valid)
+        pair = e_idx * fx.Int32(IB) + blk_n
+        whole = pair < head
+        if True:
+            k0 = whole.select(fx.Int32(0), split * fx.Int32(KS))
+            nk = whole.select(fx.Int32(KB), fx.Int32(KS))
+            c_gate, c_up = _gemm(blk_n, arg_p_input, arg_p_weight, lds, M, a_scale_t, w_scale_t, expert_id,
+                                 k0, nk)
+            if whole:
+                _epilogue(c_gate, c_up, tw_frag, lds, tid, blk_n, row0, arg_inter, arg_inter_scale, i32_rows)
+            else:
+                ws_rsrc = fx.rocdl.get_buffer_rsrc(
+                    fx.get_iter(fx.rocdl.make_buffer_tensor(arg_ws, max_size=False))
+                )
+                tslot = (pair - head) * fx.Int32(SPLITS)
+                _store_partials(c_gate, c_up, ws_rsrc, tslot + split, tid)
+                rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=0))
+                gpu.barrier()
+                flag = fx.make_view(lds.amax.peek().ptr, fx.make_layout(4 * 128, 1))
+                cnt_addr = fx.Int64(fx.ptrtoint(fx.get_iter(arg_cnt))) + fx.Int64(pair) * fx.Int64(4)
+                if tid == fx.Int32(0):
+                    old = fx.Int32(comm_ops.atomic_add_agent(cnt_addr, fx.Int32(1)))
+                    flag[0] = old.to(fx.Float32)
+                gpu.barrier()
+                is_last = flag[0] == fx.Float32(SPLITS - 1)
+                gpu.barrier()
+                if is_last:
+                    _sum_partials(c_gate, c_up, ws_rsrc, tslot, tid)
+                    if tid == fx.Int32(0):
+                        comm_ops.atomic_add_agent(cnt_addr, fx.Int32(-SPLITS))
+                    _epilogue(c_gate, c_up, tw_frag, lds, tid, blk_n, row0, arg_inter, arg_inter_scale, i32_rows)
+
+    _tail_body = ASTRewriter.transform(_tail_body)
 
     def fxh_view_i32(t):
         return fx.make_view(
@@ -629,7 +770,7 @@ def _build_stage1(
             arg_x,
             i32_tokens,
             i32_rows,
-            value_attrs=_NO_PACKED_F32,
+            value_attrs=_ATTRS,
         ).launch(grid=(IB, fx.Int64(i32_tiles), 1), block=(256, 1, 1), stream=stream)
 
     @flyc.jit
@@ -666,7 +807,7 @@ def _build_stage1(
             arg_cnt,
             i32_tokens,
             i32_rows,
-            value_attrs=_NO_PACKED_F32,
+            value_attrs=_ATTRS,
         ).launch(
             grid=(IB, fx.Int64(i32_tiles), SPLITS), block=(256, 1, 1), stream=stream
         )
@@ -691,10 +832,16 @@ def compile_stage1(
     doweight_stage1=False,
     wide_k=True,
     splits=1,
+    ring3=False,
+    tail_slots=0,
+    tail_max=0,
 ):
     """splits > 1: split-K over hidden into that many workgroups per (tile, block); the
     launcher then also takes the fp32 workspace (splitk_workspace_floats) and one
-    int32 counter per (tile, block) pair, zero before the call and zero after it."""
+    int32 counter per (tile, block) pair, zero before the call and zero after it.
+    tail_slots > 0 (with splits > 1): only the pairs past the last whole round of tail_slots split
+    (when at most tail_max do); the workspace then holds tail_max pairs. ring3: W1 prefetched two K
+    tiles ahead (needs K tiles per split = 2 mod 3)."""
     return _build_stage1(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -704,4 +851,7 @@ def compile_stage1(
         doweight_stage1=doweight_stage1,
         wide_k=wide_k,
         splits=splits,
+        ring3=ring3,
+        tail_slots=tail_slots,
+        tail_max=tail_max,
     )

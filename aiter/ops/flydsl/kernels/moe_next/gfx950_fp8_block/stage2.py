@@ -61,6 +61,7 @@ def _build_stage2(
     wide_k,
     rows_nt=False,
     atom_cache=0,
+    mid_tune=False,
 ):
     elem_t = fx.Float8E4M3FN
     K = int(inter_dim)
@@ -89,7 +90,10 @@ def _build_stage2(
     # tile_m 128 only (DSV3 E257 M=4096 732 -> 684 us); with atomics they lose (740 us).
     ROWS_TUNE = (not atomic) and BM == 128
     # waves per SIMD: unhinted the backend takes 210 VGPRs (2 waves) to hoist the next K tile's loads
-    WAVES_PER_EU = 3 if ROWS_TUNE else 0
+    # mid_tune (tile_m 64 atomics, I = 256 so KB = 2: many short latency-bound workgroups): 4 waves/SIMD
+    # (128 VGPRs) puts a fourth workgroup per CU in flight, and every K tile's loads issue up front
+    MID = bool(mid_tune) and atomic and BM == 64
+    WAVES_PER_EU = 3 if ROWS_TUNE else (4 if MID else 0)
     a_lds_bytes = max(BM, 256 // (TILE_K // 16)) * TILE_K  # the A copy covers 32 rows
     cshuf_bytes = BM * BN * out_bytes
     region_bytes = max(2 * a_lds_bytes, cshuf_bytes)
@@ -225,7 +229,7 @@ def _build_stage2(
         # Short K (KB <= 4 at decode, I = 256 -> KB = 2): issue every K tile's scales,
         # A rows and W2 tile up front in separate register sets, so the tiles' memory
         # latencies overlap instead of running back to back.
-        _pre = DECODE and KB <= 4
+        _pre = (DECODE or MID) and KB <= 4
         nbuf = KB if _pre else 1
         a_cps = [a_cp_frag] + [
             fx.make_fragment_like(a_mem_thr[None, None, None, 0]) for _ in range(nbuf - 1)
@@ -631,6 +635,7 @@ def compile_stage2(
     wide_k=True,
     rows_nt=False,
     atom_cache=0,
+    mid_tune=False,
 ):
     return _build_stage2(
         model_dim=model_dim,
@@ -644,4 +649,5 @@ def compile_stage2(
         wide_k=wide_k,
         rows_nt=rows_nt,
         atom_cache=atom_cache,
+        mid_tune=mid_tune,
     )
