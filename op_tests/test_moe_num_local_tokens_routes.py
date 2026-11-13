@@ -376,8 +376,14 @@ def _stage2_time_us(M, D, I, E, topk, tokens, monkeypatch):
 def test_stage2_time_does_not_depend_on_the_pad_count(M, tokens, monkeypatch):
     # Before the sentinel fix this was 11x-28x slower than nlt = M.
     shape = (M, 2048, 192, 128, 8)
-    full = _stage2_time_us(*shape, M, monkeypatch)
-    partial = _stage2_time_us(*shape, tokens, monkeypatch)
-    assert (
-        partial < 2.0 * full
-    ), f"stage 2: {partial:.1f} us (nlt={tokens}) vs {full:.1f} us (nlt={M})"
+    # The pad bug is 6x-28x, so a GPU shared with other jobs can fail one
+    # attempt by noise but not all three.
+    seen = []
+    for _ in range(3):
+        full = _stage2_time_us(*shape, M, monkeypatch)
+        partial = _stage2_time_us(*shape, tokens, monkeypatch)
+        seen.append((partial, full))
+        if partial < 2.0 * full:
+            return
+    detail = ", ".join(f"{p:.1f} vs {f:.1f}" for p, f in seen)
+    pytest.fail(f"stage 2 (nlt={tokens} vs nlt={M}) us: {detail}")
