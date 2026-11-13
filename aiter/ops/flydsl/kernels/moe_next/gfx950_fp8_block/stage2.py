@@ -84,6 +84,12 @@ def _build_stage2(
     # The decode climb's changes (rotated K start, non-temporal W2, every K tile issued up front) were
     # measured at tile_m 16 only; larger tiles keep the plain K loop.
     DECODE = BM == 16
+    # The prefill stage-2 climb's changes (attlas prefill-s2-1: occupancy hint, both K tiles' scales at once, one
+    # token rep's A fragment live at a time, token ids read after the GEMM) were measured with the rows combine at
+    # tile_m 128 only (DSV3 E257 M=4096 732 -> 684 us); with atomics they lose (740 us).
+    ROWS_TUNE = (not atomic) and BM == 128
+    # waves per SIMD: unhinted the backend takes 210 VGPRs (2 waves) to hoist the next K tile's loads
+    WAVES_PER_EU = 3 if ROWS_TUNE else 0
     a_lds_bytes = max(BM, 256 // (TILE_K // 16)) * TILE_K  # the A copy covers 32 rows
     cshuf_bytes = BM * BN * out_bytes
     region_bytes = max(2 * a_lds_bytes, cshuf_bytes)
@@ -264,30 +270,63 @@ def _build_stage2(
                     fxh.encode_waitcnt(vmcnt=_b_loads_per_tile + (KB - 1 - iv) * _tile_loads)
                 )
             else:
+                if const_expr(ROWS_TUNE and iv == 0):
+                    # both K tiles' scales at once: adjacent dwords merge into dwordx2 gathers
+                    scl = []
+                    for jv in range_constexpr(KB):
+                        scl.append((
+                            [a_scale_t[pos_rows[n] + _kb2(jv)] for n in range_constexpr(n_reps)],
+                            [w_scale_t[sw_base[m] + _kb2(jv)] for m in range_constexpr(m_reps)],
+                        ))
                 a_idx.copy(buf_cp_atom_r, kb, a_cp_frag)
                 fx.copy(b_cp_atom_nt, b_g2r_s[None, None, None, kb], b_ret)
-                sa = [a_scale_t[pos_rows[n] + kb] for n in range_constexpr(n_reps)]
-                sb = [w_scale_t[sw_base[m] + kb] for m in range_constexpr(m_reps)]
+                if const_expr(ROWS_TUNE):
+                    sa, sb = scl[iv]
+                else:
+                    sa = [a_scale_t[pos_rows[n] + kb] for n in range_constexpr(n_reps)]
+                    sb = [w_scale_t[sw_base[m] + kb] for m in range_constexpr(m_reps)]
                 rocdl.s_waitcnt(fxh.encode_waitcnt(vmcnt=_b_loads_per_tile))
             gpu.barrier()
             fx.copy(uni_cp_atom, a_cp_rets[bi], a_lds_w)
             gpu.barrier()
-            for ki in range_constexpr(k_iters):
-                fx.copy(
-                    uni_cp_atom, a_lds_r[None, None, ki], a_frag_retile[None, None, ki]
-                )
-            p_frag.fill(0)
-            fx.gemm(mma_atom, p_frag, b_frags[bi], a_frag, p_frag)
-            for n in range_constexpr(n_reps):
-                for m in range_constexpr(m_reps):
-                    f = sa[n] * sb[m]
-                    p = p_frag[None, m, n].load()
-                    c = c_frag[None, m, n].load()
-                    c_frag[None, m, n].store(
-                        Vec.from_elements(
-                            [fx.fma(p[v], f, c[v]) for v in range(4)], fx.Float32
-                        )
+            if const_expr(_pre or k_iters != 1 or not ROWS_TUNE):
+                for ki in range_constexpr(k_iters):
+                    fx.copy(
+                        uni_cp_atom, a_lds_r[None, None, ki], a_frag_retile[None, None, ki]
                     )
+                p_frag.fill(0)
+                fx.gemm(mma_atom, p_frag, b_frags[bi], a_frag, p_frag)
+                for n in range_constexpr(n_reps):
+                    for m in range_constexpr(m_reps):
+                        f = sa[n] * sb[m]
+                        p = p_frag[None, m, n].load()
+                        c = c_frag[None, m, n].load()
+                        c_frag[None, m, n].store(
+                            Vec.from_elements(
+                                [fx.fma(p[v], f, c[v]) for v in range(4)], fx.Float32
+                            )
+                        )
+            else:
+                # one token rep at a time: its A fragment is read from LDS just ahead of its MFMAs, so a
+                # K tile's whole A operand (64 VGPRs) is never live at once
+                for n in range_constexpr(n_reps):
+                    fx.copy(uni_cp_atom, a_lds_r[None, n, None], a_frag_retile[None, n, None])
+                    af = fx.make_rmem_tensor(32, elem_t)
+                    af.store(a_frag[None, n, 0].load())
+                    for m in range_constexpr(m_reps):
+                        bf = fx.make_rmem_tensor(32, elem_t)
+                        bf.store(b_frags[bi][None, m, 0].load())
+                        pf = fx.make_rmem_tensor(4, fx.Float32)
+                        pf.store(Vec.filled(4, 0.0, fx.Float32))
+                        fx.gemm(mma_atom, pf, bf, af, pf)
+                        f = sa[n] * sb[m]
+                        p = pf.load()
+                        c = c_frag[None, m, n].load()
+                        c_frag[None, m, n].store(
+                            Vec.from_elements(
+                                [fx.fma(p[v], f, c[v]) for v in range(4)], fx.Float32
+                            )
+                        )
         return c_frag
 
     _gemm = ASTRewriter.transform(_gemm)
@@ -434,7 +473,7 @@ def _build_stage2(
                 fx.make_layout(((_cshuffle_nlane, _n_row_thr), 1), ((0, 1), 0)),
                 fx.make_tile(_n_row_thr),
             )
-            if const_expr(not DECODE):
+            if const_expr(not DECODE and not ROWS_TUNE):
                 c_out_index_frag = fxh.read_sorted_index(
                     c_index_copy, tid, lds.index.ids, BM
                 )
@@ -463,6 +502,20 @@ def _build_stage2(
                 if tid < fx.Int32(BM):
                     ids_view[tid] = sid_t  # read after the C-shuffle barrier below
             c_out_frag = _weight_and_cast(c_frag, tw_frag)
+            if const_expr(ROWS_TUNE):
+                # token ids for the stores: read after the GEMM so they are not live across it
+                c_out_index_frag = fxh.read_sorted_index(
+                    c_index_copy, tid, lds.index.ids, BM
+                )
+                c_out = fxh.TensorWithIndex(
+                    out_tensor,
+                    BM,
+                    BN,
+                    c_out_index_frag,
+                    c_rw_copy,
+                    tid,
+                    is_read_from_mem=False,
+                )
 
             _, _tiled_mma = fxh.make_1x4_tiled_mma(elem_t, wide_k)
             cshuf_atom_w = fx.make_copy_atom(fx.UniversalCopy64b(), out_elem)
@@ -546,7 +599,7 @@ def _build_stage2(
             arg_num_valid_ids,
             i32_tokens,
             i32_rows,
-            value_attrs=_NO_PACKED_F32,
+            value_attrs={**_NO_PACKED_F32, **({"rocdl.waves_per_eu": WAVES_PER_EU} if WAVES_PER_EU else {})},
         ).launch(
             grid=(N // BN, fx.Int64(i32_tiles), 1), block=(256, 1, 1), stream=stream
         )
