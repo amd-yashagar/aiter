@@ -65,6 +65,7 @@ def _build_stage2(
     xcd=False,
     waves_per_eu=0,
     xcd_group=1,
+    stage_out=False,
 ):
     D = int(model_dim)
     INTER = int(inter_dim)
@@ -99,6 +100,14 @@ def _build_stage2(
     PRE = a_tile_resident(INTER, BM, a_dtype)
     assert PRE or NBW == 1, "channel-block persistence needs the whole K in LDS"
     lds_bytes = (KS if PRE else 2) * a_lds_bytes
+    # Route rows staged per wave in LDS (bf16), then stored as whole 128 B row
+    # segments: 8 rows per dwordx4 store instead of 16 rows x 32 B per dwordx2.
+    STG = bool(stage_out) and reduce and PRE
+    RT_OFF = lds_bytes
+    RS = 144
+    OUT_OFF = cm.pad_up(RT_OFF + BM * 4, 16)
+    if STG:
+        lds_bytes = OUT_OFF + 4 * BM * RS
     # Prefetch the next block's W2 while this one computes, when registers allow.
     W_AHEAD = 4 * KS * W_NDW <= 64
     XCD = bool(xcd) and not direct
@@ -125,7 +134,11 @@ def _build_stage2(
         wave = fx.Int32(rocdl.readfirstlane(T.i32, cm._raw(tid // fx.Int32(64))))
         ngrp = fx.Int32(gpu.block_id("x"))
         mblk = fx.Int32(gpu.block_id("y"))
-        if const_expr(XCD):
+        if const_expr(XCD and int(xcd_group) == 0):
+            ngrp, mblk = cm.xcd_slice(
+                ngrp, mblk, D // (BN * NBW), cm.global_ptr(arg_nvalid, T.i32)[0], BM
+            )
+        elif const_expr(XCD):
             ngrp, mblk = cm.xcd_tile(ngrp, mblk, D // (BN * NBW), int(xcd_group))
         m_row = mblk * fx.Int32(BM)
         eids = cm.global_ptr(arg_eids, T.i32)
@@ -366,7 +379,62 @@ def _build_stage2(
                                 out_buf[None, tok * fx.Int32(D) + ch + fx.Int32(2 * h)],
                             )
 
+            @flyc.jit
+            def store_row16(route, ch, v):
+                if route >= fx.Int32(0):
+                    cm.global_vec_store(
+                        v,
+                        arg_out,
+                        (fx.Int64(route) * fx.Int64(D) + fx.Int64(ch)) * fx.Int64(2),
+                        4,
+                    )
+
+            def epilogue_staged(b):
+                wb = fx.Int32(OUT_OFF) + wave * fx.Int32(BM * RS)
+                for j in range_constexpr(MT):
+                    for t in range_constexpr(4):
+                        v = Vec(acc[j][t].load())
+                        vals = [v[i] for i in range(4)]
+                        if const_expr(not doweight_stage1):
+                            vals = [x * row_w[j] for x in vals]
+                        pk = Vec.from_elements(vals, fx.Float32).to(BFloat16)
+                        off = (
+                            wb
+                            + (fx.Int32(j * 16) + lane16) * fx.Int32(RS)
+                            + (fx.Int32(t * 16) + lgrp * fx.Int32(4)) * fx.Int32(2)
+                        )
+                        fx.ptr_store(
+                            pk.bitcast(fx.Int32),
+                            lds_typed_ptr(lds_base, T.i32, align=8, byte_offset=off),
+                        )
+                chw = w_tile0(b) * fx.Int32(16)
+                c8 = lane % fx.Int32(8)
+                for it in range_constexpr(BM // 8):
+                    r = fx.Int32(it * 8) + lane // fx.Int32(8)
+                    v = Vec(
+                        lds_vec_load(
+                            lds_base,
+                            wb + r * fx.Int32(RS) + c8 * fx.Int32(16),
+                            Vec.make_type(4, fx.Int32),
+                            fx.Int32,
+                            align=16,
+                        )
+                    )
+                    route = fx.ptr_load(
+                        lds_typed_ptr(
+                            lds_base,
+                            T.i32,
+                            align=4,
+                            byte_offset=fx.Int32(RT_OFF) + r * fx.Int32(4),
+                        ),
+                        result_type=fx.Int32,
+                    )
+                    store_row16(route, chw + c8 * fx.Int32(8), v)
+
             def epilogue(b):
+                if const_expr(STG):
+                    epilogue_staged(b)
+                    return
                 ch0 = w_tile0(b) * fx.Int32(16) + lgrp * fx.Int32(4)
                 for j in range_constexpr(MT):
                     for t in range_constexpr(4):
@@ -388,6 +456,22 @@ def _build_stage2(
                 cur = load_block(0)
                 for ks in range_constexpr(KS):
                     store_a(a_all[ks], ks)
+                if const_expr(STG):
+                    rr = tid % fx.Int32(BM)
+                    pkd = stids[m_row + rr]
+                    rtok = pkd & fx.Int32(0xFFFFFF)
+                    rroute = (rtok < i32_tokens).select(
+                        rtok * fx.Int32(topk) + pkd.shrui(fx.Int32(24)), fx.Int32(-1)
+                    )
+                    fx.ptr_store(
+                        rroute,
+                        lds_typed_ptr(
+                            lds_base,
+                            T.i32,
+                            align=4,
+                            byte_offset=fx.Int32(RT_OFF) + rr * fx.Int32(4),
+                        ),
+                    )
                 gpu.barrier()
                 for b in range_constexpr(NBW):
                     nxt = None
@@ -473,7 +557,7 @@ def compile_stage2(**kw):
     return _build_stage2(**kw)
 
 
-def _build_reduce(*, model_dim, topk):
+def _build_reduce(*, model_dim, topk, nt_out=False):
     """out[t] = bf16(sum over slots of rows[t * topk + k]) in fp32, 8 columns per thread."""
     D = int(model_dim)
     TK = int(topk)
@@ -501,7 +585,7 @@ def _build_reduce(*, model_dim, topk):
                 for i in range_constexpr(8):
                     acc[i] = acc[i] + fx.Float32(b[i])
             pk = Vec.from_elements(acc, fx.Float32).to(BFloat16).bitcast(fx.Int32)
-            cm.global_vec_store(
+            (cm.global_vec_store_nt if const_expr(nt_out) else cm.global_vec_store)(
                 pk,
                 arg_out,
                 (fx.Int64(t) * fx.Int64(D) + fx.Int64(c * fx.Int32(8))) * fx.Int64(2),
@@ -524,8 +608,8 @@ def _build_reduce(*, model_dim, topk):
 
 
 @functools.lru_cache(maxsize=64)
-def compile_reduce(*, model_dim, topk):
-    return _build_reduce(model_dim=model_dim, topk=topk)
+def compile_reduce(*, model_dim, topk, nt_out=False):
+    return _build_reduce(model_dim=model_dim, topk=topk, nt_out=nt_out)
 
 
 def reduce_blocks(tokens, model_dim):

@@ -62,6 +62,16 @@ def global_vec_store(vec, base_i64, byte_off, n_i32):
     fx.ptr_store(vec, p)
 
 
+def global_vec_store_nt(vec, base_i64, byte_off, n_i32):
+    """global_vec_store with the non-temporal hint (data nobody re-reads)."""
+    from flydsl._mlir.dialects import llvm
+
+    p = global_ptr(fx.Int64(base_i64) + fx.Int64(byte_off), T.i32, 4 * min(n_i32, 4))
+    llvm.StoreOp(
+        _raw(vec), fx.to_llvm_ptr(p), alignment=4 * min(n_i32, 4), nontemporal=True
+    )
+
+
 def e8m0_ceil(amax_f32, maxpos, cap=0xFF):
     """aiter RoundUp: biased exponent of ceil_pow2(amax / maxpos), at most cap
     (0xFF keeps inf/nan; MXFP8 activations cap at 254 = 2^127 as aiter does)."""
@@ -170,6 +180,21 @@ def xcd_tile(bx, by, nx, group=1):
     s = q % fx.Int32(group)
     n = (q // fx.Int32(group)) % fx.Int32(nx)
     m = ((q // fx.Int32(group * nx)) * fx.Int32(8) + xc) * fx.Int32(group) + s
+    return n, m
+
+
+def xcd_slice(bx, by, nx, nvalid, bm):
+    """(column block, tile) with each XCD owning one contiguous slice of the live tiles
+    (all column blocks of a tile back to back), so an expert's tiles share one L2.
+    Workgroups past the slice get a tile past nvalid (they exit)."""
+    pid = by * fx.Int32(nx) + bx
+    xc = pid & fx.Int32(7)
+    i = pid >> fx.Int32(3)
+    live = (nvalid + fx.Int32(bm - 1)) // fx.Int32(bm)
+    per = (live + fx.Int32(7)) >> fx.Int32(3)
+    mi = i // fx.Int32(nx)
+    n = i - mi * fx.Int32(nx)
+    m = (mi < per).select(xc * per + mi, fx.Int32(1 << 20))
     return n, m
 
 

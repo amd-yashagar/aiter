@@ -73,6 +73,11 @@ def parse_config(config):
             "o1",
             "o2",
             "xg",
+            "sl",
+            "aa",
+            "so",
+            "rn",
+            "sa",
         )
         if key in keys and tok[len(key) :]:
             out[key] = int(tok[len(key) :])
@@ -238,6 +243,9 @@ class _MxGfx950(MoeKernel):
             sched_pin=bool(cfg.get("sp", 0)),
             waves_per_eu=cfg.get("o1", 0),
             xcd_group=xg,
+            scale_lds=bool(cfg.get("sl", 0)),
+            lds_pack=bool(cfg.get("sl", 0)),
+            a_ahead=cfg.get("aa", 2),
         )
         s2 = compile_stage2(
             model_dim=spec.model_dim,
@@ -255,9 +263,24 @@ class _MxGfx950(MoeKernel):
             xcd=xcd,
             waves_per_eu=cfg.get("o2", 0),
             xcd_group=xg,
+            stage_out=bool(cfg.get("so", 0)),
         )
-        r = compile_reduce(model_dim=spec.model_dim, topk=topk) if reduce else None
-        return bm, a, q, s1, s2, r, (direct, bool(cfg.get("iq", 0)), xcd, xg)
+        r = (
+            compile_reduce(
+                model_dim=spec.model_dim, topk=topk, nt_out=bool(cfg.get("rn", 0))
+            )
+            if reduce
+            else None
+        )
+        return (
+            bm,
+            a,
+            q,
+            s1,
+            s2,
+            r,
+            (direct, bool(cfg.get("iq", 0)), xcd, xg, bool(cfg.get("sa", 1))),
+        )
 
     def warmup(self, weights, m, topk, config):
         import flydsl.expr as fx
@@ -325,7 +348,8 @@ class _MxGfx950(MoeKernel):
                 tm.num_valid_ids,
             )
         else:
-            sids, sw, se, nv, out = moe_sorting(
+            # The reduce writes every row of out, so it needs no zero-filled buffer.
+            sids, sw, se, nv, buf = moe_sorting(
                 call.topk_ids,
                 call.topk_weight,
                 E,
@@ -333,10 +357,17 @@ class _MxGfx950(MoeKernel):
                 torch.bfloat16,
                 block_size=bm,
                 output=out,
+                accumulate=direct[4] or r is None,
             )
+            if out is None:
+                out = (
+                    buf
+                    if direct[4] or r is None
+                    else torch.empty((M, D), dtype=torch.bfloat16, device=dev)
+                )
         rows, mblocks = sids.numel(), se.numel()
         if direct[2]:
-            pad = 8 * direct[3]
+            pad = 8 * max(direct[3], 1)
             mblocks = (mblocks + pad - 1) // pad * pad
         stream = fx.Stream(torch.cuda.current_stream(dev))
         aq = torch.empty(
