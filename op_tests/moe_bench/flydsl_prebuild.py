@@ -31,10 +31,30 @@ def is_flydsl(cand):
     return any(m in k for m in FLYDSL_MARKERS)
 
 
-def dispatch_args_of(S):
-    """The get_2stage_cfgs arguments of the case, as the harness's route recorder gets them."""
+def dispatch_args_of(S, case=None):
+    """The get_2stage_cfgs arguments of the case, as the harness's route recorder gets them
+    from a real dispatch call.
+
+    They are read from a dry resolution of the case when it can be made (meta tensors, no
+    launch): ``fused_moe`` looks the tuned row up by the *padded* token count
+    (``get_padded_M``: 5 -> 8, 333 -> 512), so a forced one-row config built from the case's
+    own token count is never found for any M that is not a power of two, and the host build
+    then compiled the router's default route instead of the forced pair. The static
+    fallback pads the same way."""
+    if case is not None:
+        try:
+            from . import routes
+
+            got = []
+            routes.dry_route(case, S, args_out=got)
+            if got:
+                return got[-1]
+        except Exception:  # noqa: BLE001, S110  (the static form below)
+            pass
+    import aiter.fused_moe as fm
+
     return {
-        "token": S.M,
+        "token": fm.get_padded_M(S.M),
         "model_dim": S.D,
         "inter_dim": S.I,
         "expert": S.E,
@@ -55,7 +75,7 @@ def make_ctx(S, case, tmpdir, gfx, cu):
     return types.SimpleNamespace(
         S=S,
         case=case,
-        dispatch_args=dispatch_args_of(S),
+        dispatch_args=dispatch_args_of(S, case),
         dispatch_meta={"gfx": gfx, "cu_num": cu},
         tmpdir=tmpdir,
         enum_errors=[],
@@ -170,10 +190,20 @@ def build_slice(case, part, parts, tmpdir, indices=None):
             if k in params
         }
 
-        def one(cid, prepare):
+        def one(cid, prepare, cand=None):
+            from . import routes
+
             try:
                 prepare()
-                fm._fused_moe_impl(hs.clone(), aw["w1"], aw["w2"], tw, ti, **args)
+                with routes.RouteRecorder() as rec:
+                    fm._fused_moe_impl(hs.clone(), aw["w1"], aw["w2"], tw, ti, **args)
+                # a forced row the router did not take compiled something else (its
+                # default route): that is a candidate nothing was built for
+                if cand is not None and hasattr(cand, "verify") and rec.records:
+                    why = cand.verify(routes.route_from_record(rec.last()))
+                    if why:
+                        out.append((cid, False, f"forced row not honored: {why}"[:200]))
+                        return
                 out.append((cid, True, ""))
             except Exception as e:  # noqa: BLE001
                 out.append((cid, False, f"{type(e).__name__}: {str(e)[:200]}"))
@@ -184,7 +214,7 @@ def build_slice(case, part, parts, tmpdir, indices=None):
             unforce()
             one("dispatch", lambda: None)
         for c in mine:
-            one(c.id, lambda c=c: c.prepare(ctx))
+            one(c.id, lambda c=c: c.prepare(ctx), c)
         from .candidates.fused_cfg import unforce
 
         unforce()

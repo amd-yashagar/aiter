@@ -393,7 +393,7 @@ def _stub_full_impl(md):
     return dataclasses.replace(md, full_impl=stub)
 
 
-def dry_route(case, S=None, capture=None):
+def dry_route(case, S=None, capture=None, args_out=None):
     """Route for one fused case: returns a dict of ROUTE_COLS (never raises). ``capture``,
     a list, receives the resolved MOEMetadata (its stage functions are what a call runs).
     """
@@ -455,6 +455,8 @@ def dry_route(case, S=None, capture=None):
                 out["route_key"] = "unsupported:" + out["route_error"][:120]
                 return out
         args, _ = rec.last()
+        if args_out is not None and args:
+            args_out.append(args)
     fm.get_2stage_cfgs.cache_clear()
     if not full_descs:
         out["route_error"] = "no metadata resolved"

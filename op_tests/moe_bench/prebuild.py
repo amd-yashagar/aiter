@@ -988,6 +988,21 @@ def read_manifest():
         return {}
 
 
+# manifest entries written before a candidate's forced row was checked against the route
+# aiter took (padded-M lookup, see flydsl_prebuild.dispatch_args_of) may cover nothing
+FORCED_VERIFIED = 2
+
+
+def flydsl_covered(entry):
+    """A manifest entry counts only when its candidates' forced rows were verified and at
+    least one built."""
+    return bool(
+        entry
+        and entry.get("forced_verified") == FORCED_VERIFIED
+        and (entry.get("built", 0) > 0 or entry.get("candidates", 0) == 0)
+    )
+
+
 def flydsl_cases_missing(cases):
     """Case ids with FlyDSL bar candidates that no FlyDSL prebuild has covered."""
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx
@@ -1000,7 +1015,7 @@ def flydsl_cases_missing(cases):
     gfx, cu = get_gfx(), get_cu_num()
     out = []
     for c in cases:
-        if c.kind != "fused" or c.token <= 0 or c.id in done:
+        if c.kind != "fused" or c.token <= 0 or flydsl_covered(done.get(c.id)):
             continue
         try:
             _ctx, cands = enumerate_flydsl(workload.resolve(c), c, tmp, gfx, cu)
@@ -1149,6 +1164,7 @@ def run_flydsl_prebuild(
             candidates=n,
             wall_seconds=round(ended.get(c.id, 0) - started.get(c.id, 0), 1),
             arch=gfx,
+            forced_verified=FORCED_VERIFIED,
         )
         manifest[c.id] = r
         log(
