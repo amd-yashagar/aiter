@@ -125,6 +125,7 @@ CAND_COLS = [
     "iters",
     "raw_us",
     "topk_us",
+    "topk_alone_us",
     "tag",
     "err_ratio",
     "logits_diff",
@@ -151,13 +152,23 @@ BAR_COLS = list(dict.fromkeys(BAR_COLS))
 CAND_COLS = list(dict.fromkeys(CAND_COLS))
 
 
+def _history(kind):
+    """Column lists of earlier harness heads (``col_history.json``): a resume maps rows of
+    those widths exactly instead of rejecting them."""
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "col_history.json")) as f:
+            return json.load(f)[kind]
+    except (OSError, ValueError, KeyError):
+        return []
+
+
 class Table:
     """Append-only CSV with a flush per row."""
 
-    def __init__(self, path, cols, resume, key=("case_id", "mode")):
+    def __init__(self, path, cols, resume, key=("case_id", "mode"), history=()):
         self.key = key
         self.done = set()
-        self.out = schema.Appender(path, cols, resume)
+        self.out = schema.Appender(path, cols, resume, history)
         self.cols = self.out.cols
         if os.path.exists(path) and resume:
             for r in schema.read_csv(path):
@@ -477,10 +488,12 @@ def merge_off(args):
             r["off_us"] = o.get("off_us", "")
             r["off_kernel_id"] = o.get("off_kernel_id", "")
             r["off_host_us"] = o.get("off_host_us", "")
-    with open(new_path, "w", newline="") as f:
+    tmp = f"{new_path}.{os.getpid()}.tmp"
+    with open(tmp, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=BAR_COLS, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
+    os.replace(tmp, new_path)
 
 
 def run_first_calls(args):
@@ -602,7 +615,10 @@ def _run_pass(args, kind):
     main_failures = read_main_failures(args, args.cases)
     prefix = kind if kind in ("new", "off") else "bar"
     bar = Table(
-        os.path.join(args.out_dir, f"{prefix}-{tier}.csv"), BAR_COLS, args.resume
+        os.path.join(args.out_dir, f"{prefix}-{tier}.csv"),
+        BAR_COLS,
+        args.resume,
+        history=_history("bar"),
     )
     cand = Table(
         os.path.join(
@@ -612,6 +628,7 @@ def _run_pass(args, kind):
         CAND_COLS,
         args.resume,
         key=("case_id", "cand_id", "mode", "phase"),
+        history=_history("cand"),
     )
     meta = runner.probe_meta(tree, node, args.launcher, tmpdir)
     # bar mode measures aiter's own paths with the router hook off (AITER_MOE_DISABLE=1),
@@ -623,9 +640,14 @@ def _run_pass(args, kind):
             tree,
             tmpdir,
             args.launcher,
-            runner.worker_env(
-                tree, tmpdir, extra_path=runner.make_shim(tmpdir) if shimmed else None
-            ),
+            {
+                **runner.worker_env(
+                    tree,
+                    tmpdir,
+                    extra_path=runner.make_shim(tmpdir) if shimmed else None,
+                ),
+                "MOE_BENCH_OUT_DIR": os.path.abspath(args.out_dir),
+            },
             pkg="moe_bench_shim" if shimmed else "op_tests.moe_bench",
         )
         meta["preflight"] = {

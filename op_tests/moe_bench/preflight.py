@@ -39,6 +39,36 @@ def _check(name, fn, fix, required=True):
         }
 
 
+WRITABLE_ENV = ("AITER_JIT_DIR", "TMPDIR", "MOE_BENCH_OUT_DIR", "TRITON_CACHE_DIR")
+
+
+def _writable():
+    """The directories the run writes (shared JIT dir, TMPDIR, the out dir, the Triton
+    cache) must be writable by the user the probe runs as: a lease often runs as another
+    user than the one that built them."""
+    import pwd
+
+    me = os.geteuid()
+    bad = []
+    for var in WRITABLE_ENV:
+        path = os.environ.get(var)
+        if not path or not os.path.isdir(path):
+            continue
+        if not os.access(path, os.W_OK | os.X_OK):
+            try:
+                owner = pwd.getpwuid(os.stat(path).st_uid).pw_name
+            except KeyError:
+                owner = str(os.stat(path).st_uid)
+            bad.append(f"{var}={path} (owner {owner})")
+    if bad:
+        try:
+            me_name = pwd.getpwuid(me).pw_name
+        except KeyError:
+            me_name = str(me)
+        raise RuntimeError(f"not writable by {me_name}: " + "; ".join(bad))
+    return "writable"
+
+
 def _rocm():
     root, from_env = _rocm_root()
     missing = [
@@ -143,6 +173,12 @@ def run_probe():
             _rocm,
             "set ROCM_PATH to a ROCm install that has llvm/bin/ld.lld and amdgcn/bitcode "
             "(for example ROCM_PATH=/opt/rocm-7.2.4)",
+        ),
+        _check(
+            "writable directories",
+            _writable,
+            "chown -R <lease user> the JIT dir, TMPDIR and out dir (and the Triton cache), "
+            "or run the build and the lease as the same user",
         ),
         _check(
             "einops",

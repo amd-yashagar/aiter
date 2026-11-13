@@ -223,6 +223,24 @@ def enum_flags(enum, by_case):
     return flags
 
 
+def settle_soft(flags, enum):
+    """Where the replay enumerated the group, its verdict replaces the data-only guess:
+    ``base_failed?`` goes (a group that enumerates one stage-1 kernel has nothing else to
+    try, and one that enumerates more is ``base_dropped`` when it applies). A group the
+    replay does not know (not in today's enumeration) keeps the soft flag."""
+    for case_id in list(flags):
+        groups = enum.get(case_id)
+        if not groups or "error" in groups:
+            continue
+        kept = [
+            f for f in flags[case_id] if not (f[0] == "base_failed?" and f[1] in groups)
+        ]
+        if kept:
+            flags[case_id] = kept
+        else:
+            del flags[case_id]
+
+
 def _show(path, rel):
     for base in (rel, "/workspaces/meta/wt/GM-123"):
         if base and path.startswith(base + os.sep):
@@ -276,6 +294,7 @@ def audit(
             [b for b in bars if b.get("mode") == "warm"] or bars,
             meta["gfx"], meta.get("cu_num", 304), aiter_tree,
         )  # fmt: skip
+        settle_soft(flags, enum)
         for k, v in enum_flags(enum, by_case).items():
             flags[k] += v
     case_rows = {b["case_id"]: b for b in bars}

@@ -757,3 +757,43 @@ def test_workers_on_other_trees_or_chips_keep_each_others_plans(monkeypatch, tmp
         or True
     )
     assert len([k for k, e in entries.items() if e["case"] == "c-ptpc"]) == 2
+
+
+def test_the_opus_sorting_module_is_in_every_plan_and_has_a_build_recipe():
+    """fused_moe sorts with module_moe_sorting_opus unless AITER_USE_CK_MOE_SORTING=1: a
+    prebuild that skips it returns 0 and the first dispatch call fails NotPrebuilt."""
+    import json
+    import os
+
+    assert "module_moe_sorting_opus" in prebuild.STATIC
+    need = prebuild.plan([A16])
+    assert need["module_moe_sorting_opus"]["kind"] == "static"
+    assert need["module_moe_sorting_opus"]["cases"] == ["c-a16"]
+    here = os.path.dirname(os.path.abspath(prebuild.__file__))
+    cfg = os.path.join(here, "..", "..", "aiter", "jit", "optCompilerConfig.json")
+    with open(cfg) as f:
+        assert "module_moe_sorting_opus" in json.load(f)
+
+
+def test_preflight_names_a_directory_the_lease_user_cannot_write(monkeypatch, tmp_path):
+    import os
+
+    from op_tests.moe_bench import preflight
+
+    ok = tmp_path / "ok"
+    ok.mkdir()
+    monkeypatch.setenv("AITER_JIT_DIR", str(ok))
+    monkeypatch.setenv("TMPDIR", str(ok))
+    monkeypatch.delenv("MOE_BENCH_OUT_DIR", raising=False)
+    monkeypatch.delenv("TRITON_CACHE_DIR", raising=False)
+    assert preflight._writable() == "writable"
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    monkeypatch.setenv("MOE_BENCH_OUT_DIR", str(locked))
+    monkeypatch.setattr(os, "access", lambda p, m: str(p) != str(locked))
+    with pytest.raises(
+        RuntimeError, match=r"not writable by .*MOE_BENCH_OUT_DIR=.*locked"
+    ):
+        preflight._writable()
+    res = preflight._check("writable directories", preflight._writable, "chown")
+    assert not res["ok"] and "chown" in res["fix"]

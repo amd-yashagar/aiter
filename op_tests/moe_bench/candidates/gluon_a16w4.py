@@ -19,12 +19,15 @@ Routing. ``routing()`` takes logits, ``fused_moe`` takes ids: the candidate craf
 ids ``routing()`` selects equal the case's, row by row, for every input the accuracy check
 swaps in; a mismatch is a harness error, never a quiet pass.
 
-Fairness. ``fused_moe`` is timed with its ids given; the side call includes its own top-k
-(about 9.6 us warm, 13.3 us cold). The row's time is the whole call minus the top-k kernel
-timed alone, in the same process, in the same mode (warm or cold, graph or eager) and
-subtracted, so the candidate is not charged for work the others are handed. The raw time,
-the top-k time and the tag stay on the row so a report shows it. The id-to-bitmatrix
-prototype is not used.
+Fairness. ``fused_moe`` is timed with its ids given; the side call includes its own top-k.
+The row's time is the whole call minus what the top-k adds to it, so the candidate is not
+charged for work the others are handed. That is not the time of a graph of the top-k alone:
+each standalone replay is timed with the replay latency the whole call pays once anyway
+(about 4 us on gfx950, 15 us on gfx942), so subtracting it takes the latency off the whole
+call too. The cost is the slope of a graph of ``TOPK_COPIES`` top-k calls over a graph of
+one (the kernel and its inter-kernel gap), plus, cold, the first call's cold-cache penalty;
+see ``validation/topk_cost_study.py``. The raw time, the in-call top-k cost, the
+standalone graph time and the tag stay on the row. The id-to-bitmatrix prototype is not used.
 
 Triton compiles a kernel the first time a shape runs. A leased (run-only) bar must not: the
 candidate refuses a cache miss as a harness error (``harness-error``, the case's bar is
@@ -48,6 +51,7 @@ E_RANGE = (128, 512)
 GFX = "gfx950"
 MASKED_LOGIT = -1e4
 WEIGHT_SUM_TOL = 1e-3
+TOPK_COPIES = 9  # calls in the multi-call graph the top-k cost is a slope over
 
 
 class GluonHarnessError(HarnessError):
@@ -201,7 +205,7 @@ class GluonA16W4(Candidate):
         self._k = 0
         self._tw = self._ti = None
         self._logits = None
-        self._topk_timer = None
+        self._topk_timers = None
         self._w = None
         self.measure_host = False
 
@@ -246,7 +250,7 @@ class GluonA16W4(Candidate):
 
             prebuild.restore_triton_compiles()
             self._armed = False
-        self._topk_timer = None
+        self._topk_timers = None
 
     def _sync_inputs(self, ctx):
         """Refresh the crafted logits when the accuracy check swapped the case's routing
@@ -326,25 +330,53 @@ class GluonA16W4(Candidate):
 
         return run
 
-    def topk_call(self):
+    def topk_call(self, copies=1):
+        """The top-k kernel of ``routing()`` (same arguments), ``copies`` times in one call."""
         from aiter.ops.triton.moe.moe_routing.topk import topk
 
         logits, k = self._logits, self._k
 
         def run():
-            return topk(logits, k, apply_softmax=True, HIST_BLOCK_M=32)
+            out = None
+            for _ in range(copies):
+                out = topk(logits, k, apply_softmax=True, HIST_BLOCK_M=32)
+            return out
 
+        run.copies = copies
         return run
 
-    def adjust_timing(self, st, cold, quick):
-        """The whole call's stats minus the top-k kernel timed alone in this mode."""
+    def topk_cost(self, cold, quick):
+        """What the top-k adds to the whole call's graph, and what it costs as a graph of its
+        own. A graph of the top-k alone is timed per replay and so carries the replay
+        latency (about 4 us on gfx950, 15 us on gfx942) that the whole call pays once
+        whatever it contains: subtracting it would take that latency off the whole call too.
+        The cost inside the call is the kernel and its inter-kernel gap: the slope of a graph
+        of ``TOPK_COPIES`` calls over a graph of one. Cold, the first kernel after the flush
+        also pays the cold-cache penalty (one call cold minus one call warm). Returns
+        (in-call cost, alone)."""
         from ..timing import Timer
 
-        if self._topk_timer is None:
-            self._topk_timer = Timer(self.topk_call())
-            self._topk_timer.prepare_graph()
-        sub = self._topk_timer.time(cold=cold, quick=quick)["median_us"]
-        return subtract_topk(st, sub)
+        if self._topk_timers is None:
+            one, many = Timer(self.topk_call(1)), Timer(self.topk_call(TOPK_COPIES))
+            one.prepare_graph()
+            many.prepare_graph()
+            self._topk_timers = (one, many)
+        one, many = self._topk_timers
+        warm_one = one.time(cold=False, quick=quick)["median_us"]
+        warm_many = many.time(cold=False, quick=quick)["median_us"]
+        cost = max((warm_many - warm_one) / (TOPK_COPIES - 1), 0.0)
+        alone = warm_one
+        if cold:
+            alone = one.time(cold=True, quick=quick)["median_us"]
+            cost += max(alone - warm_one, 0.0)
+        return cost, alone
+
+    def adjust_timing(self, st, cold, quick):
+        """The whole call's stats minus the top-k kernel's cost inside the call."""
+        cost, alone = self.topk_cost(cold, quick)
+        out = subtract_topk(st, cost)
+        out["topk_alone_us"] = alone
+        return out
 
 
 def subtract_topk(st, topk_us):

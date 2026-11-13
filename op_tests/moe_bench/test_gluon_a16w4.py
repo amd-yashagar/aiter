@@ -184,26 +184,48 @@ def test_the_topk_time_is_subtracted_and_both_stay_on_the_row(monkeypatch):
     timed = []
 
     class FakeTimer:
+        """Replay latency 4 us per graph, 2.5 us per top-k call, 3 us more for a cold first call."""
+
         def __init__(self, call, *a):
             self.call = call
 
         def prepare_graph(self):
-            timed.append("graph")
+            timed.append(("graph", self.call.copies))
 
         def time(self, cold=False, quick=False):
-            timed.append(("cold" if cold else "warm", quick))
-            return {"median_us": 13.3 if cold else 9.6}
+            timed.append(("cold" if cold else "warm", self.call.copies))
+            us = 4.0 + 2.5 * self.call.copies
+            return {"median_us": us + (3.0 if cold and self.call.copies == 1 else 0.0)}
 
     from op_tests.moe_bench import timing
 
     monkeypatch.setattr(timing, "Timer", FakeTimer)
     cand = g.GluonA16W4()
-    monkeypatch.setattr(cand, "topk_call", lambda: (lambda: None))
-    cold = cand.adjust_timing({"median_us": 200.0}, True, False)
+    monkeypatch.setattr(cand, "_logits", object(), raising=False)
+    monkeypatch.setattr(
+        g.GluonA16W4, "topk_call", lambda self, copies=1: _calls(copies)
+    )
     warm = cand.adjust_timing({"median_us": 100.0}, False, True)
-    assert cold["median_us"] == pytest.approx(186.7) and cold["topk_us"] == 13.3
-    assert warm["median_us"] == pytest.approx(90.4)
-    assert timed == ["graph", ("cold", False), ("warm", True)]  # one graph, each mode
+    cold = cand.adjust_timing({"median_us": 200.0}, True, False)
+    # the in-call cost is the slope (2.5 us), not the standalone graph (6.5 us warm): the
+    # replay latency is not the top-k's
+    assert warm["topk_us"] == pytest.approx(2.5) and warm["median_us"] == pytest.approx(
+        97.5
+    )
+    assert warm["topk_alone_us"] == pytest.approx(6.5)
+    assert cold["topk_us"] == pytest.approx(5.5)  # slope plus the cold-cache penalty
+    assert cold["topk_alone_us"] == pytest.approx(9.5) and cold[
+        "median_us"
+    ] == pytest.approx(194.5)
+    assert timed.count(("graph", 1)) == 1 and timed.count(("graph", g.TOPK_COPIES)) == 1
+
+
+def _calls(copies):
+    def run():
+        return None
+
+    run.copies = copies
+    return run
 
 
 class Raises:

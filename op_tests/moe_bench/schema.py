@@ -160,10 +160,12 @@ def format_row(cols, row):
     return buf.getvalue()
 
 
-def migrate(path, cols):
+def migrate(path, cols, history=()):
     """Make ``path`` safe to append ``cols`` rows to. Rows are told apart by field count:
     a row that fits the file's header or the current columns is kept (mapped onto the
-    union header), any other (a row cut off by a kill, two writers' rows interleaved) goes
+    union header; ``history`` lists the column lists of earlier harness heads, and a row
+    whose width is one of theirs (and no other's) is mapped by that list), any other (a row
+    cut off by a kill, two writers' rows interleaved) goes
     to ``<path>.rejected`` and out of the file. Rewritten through a temp file and renamed,
     only when something differs. Returns (header, kept, rejected)."""
     csv.field_size_limit(1 << 28)
@@ -175,6 +177,9 @@ def migrate(path, cols):
     old = rows[0]
     header = list(cols) + [c for c in old if c not in cols]
     complete = text.endswith(("\n", "\r"))
+    by_width = {}
+    for h in history:
+        by_width.setdefault(len(h), []).append(list(h))
     kept, rejected = [], []
     for i, r in enumerate(rows[1:]):
         last_partial = i == len(rows) - 2 and not complete
@@ -184,6 +189,10 @@ def migrate(path, cols):
             kept.append(dict(zip(old, r, strict=True)))
         elif len(r) == len(cols):
             kept.append(dict(zip(cols, r, strict=True)))
+        elif len(by_width.get(len(r), ())) == 1:
+            h = by_width[len(r)][0]
+            header += [c for c in h if c not in header]
+            kept.append(dict(zip(h, r, strict=True)))
         else:
             rejected.append(r)
     if header == old and not rejected and complete:
@@ -206,12 +215,12 @@ class Appender:
     missing row, not a half one. Resuming first runs ``migrate`` (a changed column list
     or a cut-off row is repaired, not appended to)."""
 
-    def __init__(self, path, cols, resume):
+    def __init__(self, path, cols, resume, history=()):
         self.path = path
         new = not os.path.exists(path) or not resume
         self.cols = list(cols)
         if not new:
-            self.cols, _, n = migrate(path, cols)
+            self.cols, _, n = migrate(path, cols, history)
             if n:
                 print(
                     f"WARNING {path}: {n} malformed rows moved to {path}.rejected",

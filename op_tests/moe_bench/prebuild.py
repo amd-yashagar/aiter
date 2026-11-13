@@ -34,7 +34,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .candidates import HarnessError
 
-STATIC = ("module_aiter_core", "module_moe_asm", "module_moe_fmoe_asm", "module_quant")
+STATIC = (
+    "module_aiter_core",
+    "module_moe_asm",
+    "module_moe_fmoe_asm",
+    "module_quant",
+    "module_moe_sorting_opus",  # the sort every fused_moe call starts with (CK sorting is opt-in)
+)
 NO_BUILD_ENV = "MOE_BENCH_NO_BUILD"
 COMPILE_FAILED = "failed !!!!!!"  # aiter.jit.core.raise_build_error
 

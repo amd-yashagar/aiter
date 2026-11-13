@@ -89,3 +89,23 @@ def test_a_flagged_case_is_routed_when_its_shape_has_a_route_row_on_that_arch():
     ]
     assert audit_groups.routed(case, routes) == ["k.prefill"]
     assert audit_groups.routed(dict(case, token="1024"), routes) == []
+
+
+def test_the_replay_settles_the_soft_flag_of_a_group_it_enumerates():
+    soft = ("base_failed?", "bm16/ks0/nt0", "3 rows, one stage-1 kernel")
+    other = ("base_failed?", "bm64/ks0/nt0", "3 rows, one stage-1 kernel")
+    flags = {"c1": [soft, other], "c2": [soft], "c3": [soft]}
+    enum = {
+        "c1": {
+            "bm16/ks0/nt0": {"s1": 1, "pairs": 3}
+        },  # one stage-1 kernel: nothing lost
+        "c2": {"error": "replay failed"},
+        "c3": {"bm32/ks0/nt0": {"s1": 4, "pairs": 12}},
+    }
+    audit_groups.settle_soft(flags, enum)
+    assert flags["c1"] == [other]  # bm64 is not in today's enumeration: stays soft
+    assert flags["c2"] == [soft]  # no replay: stays soft
+    assert flags["c3"] == [soft]  # the group the flag names is not enumerated: stays
+    enum["c3"]["bm16/ks0/nt0"] = {"s1": 1, "pairs": 3}
+    audit_groups.settle_soft(flags, enum)
+    assert "c3" not in flags
