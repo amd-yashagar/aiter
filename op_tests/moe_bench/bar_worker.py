@@ -17,6 +17,7 @@ import sys
 import traceback
 from pathlib import Path
 
+from . import exclusions
 from .candidates import HarnessError
 from .worker import _err, _num_local, emit
 
@@ -940,6 +941,7 @@ def run_bar_group(cases, spec, fh):
         results = {}
         skipped = []
         enum_counts, enum_errors = {}, []
+        pre_excluded = []
         emit(fh, {"event": "case_start", "case_id": c.id, "phase": "run"})
         if mode_kind == "bar":
             if "dispatch" in bad.get(c.id, ()):
@@ -1032,6 +1034,33 @@ def run_bar_group(cases, spec, fh):
                         "detail": msg,
                     },
                 )
+            kept = []
+            for x in cands:
+                why = (
+                    exclusions.MOEBUG_064
+                    if exclusions.tile64(exclusions.stage1_of(x.id))
+                    else ""
+                )
+                if why:
+                    pre_excluded.append(x.id)
+                    emit(
+                        fh,
+                        {
+                            "event": "cand",
+                            "case_id": c.id,
+                            "cand_id": x.id,
+                            "source": src.name,
+                            "entry": getattr(x, "entry", ""),
+                            "kernels": x.kernels,
+                            "phase": "enumerate",
+                            "mode": modes[0],
+                            "status": "excluded",
+                            "detail": why,
+                        },
+                    )
+                else:
+                    kept.append(x)
+            cands = kept
             for x in cands:
                 b = routes.backend_of((x.kernels or "").split(" ")[0]) or "dispatch"
                 k = f"{src.name}:{b}"
@@ -1064,6 +1093,11 @@ def run_bar_group(cases, spec, fh):
                 mode_kind,
                 main_failures.get(c.id),
                 (acct, incomplete),
+                (
+                    f"{len(pre_excluded)} candidates not run, {exclusions.MOEBUG_064}"
+                    if pre_excluded
+                    else ""
+                ),
             )
         from .candidates.fused_cfg import unforce
 
@@ -1245,8 +1279,32 @@ def _add_review(row, ok, results, mode):
     row.update(_gate("lr", lr.get("acc"), lr.get("numerics", "")))
 
 
+def _bar_exclusions(results):
+    """{candidate id: reason} of the results a bar must not count (see ``exclusions``)."""
+    entries = []
+    for cid, r in results.items():
+        cand = r.get("cand")
+        if cand is None:
+            continue
+        s1 = exclusions.stage1_of(
+            getattr(cand, "id", cid), (r.get("route") or {}).get("kernel1", "")
+        )
+        entries.append((cid, s1, r.get("outcome")))
+    return exclusions.excluded(entries)
+
+
 def _emit_summary(
-    fh, c, S, mode, results, ident, skipped, kind, main_failure=None, accounting=None
+    fh,
+    c,
+    S,
+    mode,
+    results,
+    ident,
+    skipped,
+    kind,
+    main_failure=None,
+    accounting=None,
+    pre_excluded=None,
 ):
     from . import roofline
 
@@ -1255,6 +1313,9 @@ def _emit_summary(
         for cid, r in results.items()
         if r.get("ok") and mode in r.get("by_mode", {})
     }
+    skip = _bar_exclusions(results)
+    for cid in skip:
+        ok.pop(cid, None)
     row = {
         "event": "row",
         "case_id": c.id,
@@ -1266,6 +1327,9 @@ def _emit_summary(
         "main_failure": main_failure or "",
         "cand_accounting": json.dumps(accounting[0]) if accounting else "",
         "bar_incomplete": accounting[1] if accounting else "",
+        "bar_exclusions": "; ".join(
+            x for x in (exclusions.note(skip), pre_excluded or "") if x
+        ),
     }
     disp = results.get("dispatch")
     if disp is not None:

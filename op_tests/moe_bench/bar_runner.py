@@ -71,6 +71,7 @@ BAR_COLS = (
         "main_failure",
         "bar_incomplete",
         "gate_fail",
+        "bar_exclusions",
         "gate_fail",
         "cand_accounting",
         "new_us",
