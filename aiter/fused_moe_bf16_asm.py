@@ -378,12 +378,7 @@ def ck_moe_2stages(
         device=device,
     )
 
-    if activation == ActivationType.Silu:
-        act_op = 1  # silu_and_mul
-    else:
-        act_op = 0  # gelu_and_mul
-
-    aiter.ck_moe_stage1(
+    aiter.ck_moe_stage1_fwd(
         a1,
         w1,
         w2,
@@ -392,11 +387,12 @@ def ck_moe_2stages(
         num_valid_ids,
         a2,
         topk,
-        fc1_scale,
-        a1_scale,
-        block_size,
-        sorted_weights if doweight_stage1 else None,
-        act_op,
+        w1_scale=fc1_scale,
+        a1_scale=a1_scale,
+        block_m=block_size,
+        sorted_weights=sorted_weights if doweight_stage1 else None,
+        quant_type=quant_type,
+        activation=activation,
     )
 
     if quant_type == QuantType.per_Token:
@@ -404,7 +400,7 @@ def ck_moe_2stages(
     a2, a2_scale = quant_func(a2, scale=a2_scale, quant_dtype=q_dtype_a)
     a2 = a2.view(M, topk, -1)
 
-    aiter.ck_moe_stage2(
+    aiter.ck_moe_stage2_fwd(
         a2,
         w1,
         w2,
@@ -413,10 +409,12 @@ def ck_moe_2stages(
         num_valid_ids,
         moe_buf,
         topk,
-        fc2_scale,
-        a2_scale,
-        block_size,
-        sorted_weights if not doweight_stage1 else None,
+        w2_scale=fc2_scale,
+        a2_scale=a2_scale,
+        block_m=block_size,
+        sorted_weights=sorted_weights if not doweight_stage1 else None,
+        quant_type=quant_type,
+        activation=activation,
     )
     return moe_buf
 
