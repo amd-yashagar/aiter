@@ -409,3 +409,93 @@ def test_flydsl_stage1_kernels_aiter_rejects_for_the_shape_are_unsupported_not_f
     assert f("flydsl_moe1_afp4_wfp4_bf16_t32x32x256_bnt0_gui", 3584) is None
     assert f("flydsl_moe2_afp4_wfp4_bf16_t32x128x128_atomic", 3584) is None  # stage 2
     assert f("moe_ck2stages_gemm1_x", 3584) is None
+
+
+SWIGLU_MD = "module_moe_ck2stages_abi2_f8_fp4x2_preshuffle_on_b16_swiglu_per_1x32_mulWeightStage2"
+
+
+def _fake_plan(monkeypatch, tmp_path, child):
+    """A plan whose per-case child resolution is ``child(case)`` (the real one needs the
+    target arch's replay environment)."""
+    monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(prebuild, "routed_modules_in_child", child)
+    monkeypatch.setattr(prebuild, "fallback_modules", lambda S, c: {})
+    monkeypatch.setattr(prebuild, "_enumerate_all", lambda S, c: (None, []))
+
+
+def test_a_lease_on_cases_no_prebuild_covered_names_them_and_a_failed_module_is_not_a_refusal(
+    monkeypatch, tmp_path
+):
+    """The smci355 mismatch: the prebuild covered other cases; the lease's precheck then
+    resolved 00166 to the CK swiglu module, which nobody had tried, and refused."""
+    spec = {"md_name": SWIGLU_MD, "kind": "ck2stages", "blob_gen_cmd": ["gen"]}
+
+    def child(case):
+        prebuild.record_keymods(
+            case.id, {"pair-bm32-0-0-0|cktile|flydsl|": [SWIGLU_MD]}, {SWIGLU_MD: spec}
+        )
+        return {SWIGLU_MD: spec}
+
+    _fake_plan(monkeypatch, tmp_path, child)
+    for md in prebuild.modules_for_case(workload.resolve(A8W4)):
+        (tmp_path / f"{md}.so").write_text("")  # everything else is built
+    with pytest.raises(SystemExit) as e:
+        prebuild.require_prebuilt([A8W4])
+    msg = str(e.value)
+    assert SWIGLU_MD in msg and "no prebuild tried it" in msg and "c-a8w4" in msg
+    # a prebuild attempts it (it is in the plan), the compile fails, the failure is recorded
+    assert SWIGLU_MD in prebuild.plan([A8W4])
+    (tmp_path / "prebuild_failed.json").write_text(
+        '{"' + SWIGLU_MD + '": "static assertion"}'
+    )
+    prebuild.require_prebuilt([A8W4])  # no refusal: the module cannot be built
+    assert list(prebuild.excluded_keys("c-a8w4")) == ["pair-bm32-0-0-0|cktile|flydsl|"]
+    assert (
+        prebuild.excluded_keys("c-a8w4")["pair-bm32-0-0-0|cktile|flydsl|"][0]
+        == SWIGLU_MD
+    )
+
+
+def test_the_modules_keymods_lists_are_attempted_even_when_the_plan_step_fails(
+    monkeypatch, tmp_path
+):
+    spec = {"md_name": SWIGLU_MD, "kind": "ck2stages", "blob_gen_cmd": ["gen"]}
+
+    def boom(case):
+        raise RuntimeError("child failed")
+
+    _fake_plan(monkeypatch, tmp_path, boom)
+    prebuild.record_keymods("c-a8w4", {"k": [SWIGLU_MD]}, {SWIGLU_MD: spec})
+    need = prebuild.plan([A8W4])
+    assert SWIGLU_MD in need and need[SWIGLU_MD]["blob_gen_cmd"] == ["gen"]
+    assert (
+        "resolved routes: RuntimeError: child failed"
+        in prebuild.PLAN_ERRORS["c-a8w4"][0]
+    )
+    # a failing step does not hide the others
+    assert "module_moe_cktile2stages" in need
+
+
+def test_a_mixed_branch_pair_is_build_failed_with_the_moebug_054_reason():
+    import types
+
+    from op_tests.moe_bench import bar_worker
+
+    c = types.SimpleNamespace(
+        id="x",
+        kernels="k",
+        group="g",
+        meta={"s1": "cktile_a8w4_bm32", "s2": "flydsl_moe2_x"},
+    )
+    assert "MOEBUG-054" in bar_worker.mixed_branch_note(c)
+    c.meta = {"s1": "flydsl_moe1_x", "s2": "flydsl_moe2_x"}
+    assert bar_worker.mixed_branch_note(c) == ""
+    c.meta = {"s1": "_ZN5aiter48fmoe_stage1", "s2": "opus_moe2_x"}
+    assert "MOEBUG-054" in bar_worker.mixed_branch_note(c)
+
+
+def test_a_prebuild_records_what_it_tried(monkeypatch, tmp_path):
+    monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    prebuild.record_attempted({"a": "built"})
+    prebuild.record_attempted({"b": "failed"})
+    assert prebuild.read_attempted() == {"a": "built", "b": "failed"}

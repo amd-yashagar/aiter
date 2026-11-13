@@ -167,6 +167,20 @@ def assert_no_route():
         )
 
 
+def mixed_branch_note(c):
+    """MOEBUG-054: aiter's flydsl/opus 2-stage branch wraps a CK-Tile or ASM stage 1 in
+    ck_moe_stage1, so such a pair resolves to a CK module whatever the stage-1 name says.
+    """
+    m = getattr(c, "meta", None) or {}
+    s1, s2 = m.get("s1") or "", m.get("s2") or ""
+    if s1.startswith(("cktile_", "_ZN")) and s2.startswith(("flydsl_", "opus_")):
+        return (
+            " (MOEBUG-054: aiter resolves this stage-1 name through ck_moe_stage1 "
+            "in the flydsl/opus branch)"
+        )
+    return ""
+
+
 def drop_build_failed(fh, case_id, source, mode, cands):
     """Candidates whose module failed to build on a host prebuild never reach the lease:
     each is reported ``build_failed`` with the module's recorded error, not timed."""
@@ -182,6 +196,7 @@ def drop_build_failed(fh, case_id, source, mode, cands):
             keep.append(x)
             continue
         md, err = hit
+        note = mixed_branch_note(x)
         emit(
             fh,
             {
@@ -193,7 +208,7 @@ def drop_build_failed(fh, case_id, source, mode, cands):
                 "phase": "enumerate",
                 "mode": mode,
                 "status": "build_failed",
-                "detail": f"build_failed: {md}: {err[-200:]}",
+                "detail": f"build_failed: {md}: {err[-200:]}{note}",
             },
         )
     emit(

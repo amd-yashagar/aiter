@@ -238,9 +238,14 @@ def read_keymods():
         return {}
 
 
-def record_keymods(case_id, by_key):
+SPECS_KEY = "_specs"
+
+
+def record_keymods(case_id, by_key, specs=None):
     rec = read_keymods()
     rec[case_id] = by_key
+    if specs:
+        rec.setdefault(SPECS_KEY, {}).update(specs)
     tmp = keymods_path() + f".{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump(rec, f, indent=1)
@@ -290,7 +295,7 @@ def routed_modules_in_child(case):
     for line in r.stdout.splitlines():
         if line.startswith("ROUTED "):
             got = json.loads(line[len("ROUTED ") :])
-            record_keymods(case.id, got["by_key"])
+            record_keymods(case.id, got["by_key"], got["modules"])
             return got["modules"]
     raise RuntimeError(f"routed-modules child failed: {(r.stderr or r.stdout)[-400:]}")
 
@@ -400,12 +405,23 @@ def record_missing(md_name, spec=None, candidate=None):
     os.replace(tmp, missing_record_path())
 
 
+PLAN_ERRORS = {}  # case id -> [what failed while planning it]; run_prebuild logs them
+
+
 def plan(cases):
     """Deduplicated {md_name: spec} over every runnable fused case, with the case ids that
-    need each module."""
+    need each module.
+
+    Every step is its own try: a failing step is recorded in ``PLAN_ERRORS`` (and logged
+    by the prebuild) but never hides the modules of the others. The modules an earlier
+    plan resolved for a case (``prebuild_keymods.json``) are part of the plan too, so a
+    module the keymods file lists is a module the prebuild attempts."""
     from . import workload
 
     need = {}
+    PLAN_ERRORS.clear()
+    keymods = read_keymods()
+    specs = keymods.get(SPECS_KEY, {})
     for c in cases:
         if c.kind != "fused" or c.token <= 0:
             continue
@@ -414,13 +430,26 @@ def plan(cases):
         except Exception:  # noqa: BLE001, S112  (invalid rows are reported by run)
             continue
         mods = dict(modules_for_case(S))
-        try:
-            mods.update(fallback_modules(S, c))
-            cands = _enumerate_all(S, c)[1]
-            mods.update(candidate_modules(S, cands))
-            mods.update(routed_modules_in_child(c))
-        except Exception:  # noqa: BLE001, S110  (the bar reports enumeration errors)
-            pass
+
+        def step(name, fn, mods=mods, c=c):
+            try:
+                mods.update(fn() or {})
+            except Exception as e:  # noqa: BLE001
+                PLAN_ERRORS.setdefault(c.id, []).append(
+                    f"{name}: {type(e).__name__}: {str(e)[:200]}"
+                )
+
+        step("fallback", lambda S=S, c=c: fallback_modules(S, c))
+        step(
+            "candidate names",
+            lambda S=S, c=c: candidate_modules(S, _enumerate_all(S, c)[1]),
+        )
+        step("resolved routes", lambda c=c: routed_modules_in_child(c))
+        known = keymods.get(c.id, {})
+        for key_mods in known.values():
+            for md in key_mods:
+                if md in specs:
+                    mods.setdefault(md, specs[md])
         for md, spec in mods.items():
             need.setdefault(md, dict(spec, cases=[]))["cases"].append(c.id)
     for md, spec in read_missing_record().items():
@@ -457,15 +486,53 @@ def missing(need):
     return sorted(md for md in need if not os.path.exists(module_path(md)))
 
 
+def attempted_path():
+    return os.path.join(jit_dir(), "prebuild_attempted.json")
+
+
+def read_attempted():
+    try:
+        with open(attempted_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def record_attempted(results):
+    """{md_name: "built" | "failed"} of the modules a prebuild tried: what separates a
+    module that cannot be built (recorded in prebuild_failed.json) from one nobody tried.
+    """
+    rec = read_attempted()
+    rec.update(results)
+    tmp = attempted_path() + f".{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(rec, f, indent=1)
+    os.replace(tmp, attempted_path())
+
+
 def require_prebuilt(cases):
-    """Raise SystemExit naming every missing module: a leased run must never compile."""
+    """Raise SystemExit when a module that should exist is missing: a leased run must never
+    compile. A module a prebuild tried and could not build is not missing (its candidates
+    are ``build_failed``, see ``excluded_keys``); one no prebuild tried is, and the cases
+    that need it are named."""
     bad = known_failed()
-    miss = [m for m in missing(plan(cases)) if m not in bad]
+    need = plan(cases)
+    miss = [m for m in missing(need) if m not in bad]
     if miss:
+        tried = read_attempted()
+        lines = []
+        for m in miss:
+            why = (
+                f"prebuilt then lost ({tried[m]})"
+                if m in tried
+                else "no prebuild tried it"
+            )
+            cs = [c for c in need[m].get("cases", []) if c != "lease-recorded"]
+            lines.append(f"{m}  [{why}; cases {', '.join(cs[:6]) or 'lease-recorded'}]")
         raise SystemExit(
             f"{len(miss)} JIT modules are not built in {jit_dir()}; a leased run must "
-            "not compile. Run `run --mode prebuild` (CPU, no lease) first, or pass "
-            "--allow-build:\n  " + "\n  ".join(miss)
+            "not compile. Run `run --mode prebuild` (CPU, no lease) for the cases that "
+            "need them, or pass --allow-build:\n  " + "\n  ".join(lines)
         )
 
 
@@ -653,6 +720,9 @@ def run_prebuild(
     if tree:
         tree = use_tree(tree)
     need = plan(cases)
+    for cid, errs in PLAN_ERRORS.items():
+        for e in errs:
+            log(f"prebuild: PLAN ERROR {cid}: {e}")
     bad = {} if retry_failed else known_failed()
     todo = [need[m] for m in missing(need) if m not in bad]
     for m in missing(need):
@@ -726,6 +796,7 @@ def run_prebuild(
     if record != known_failed():
         with open(failed_path(), "w") as f:
             json.dump(record, f, indent=1)
+    record_attempted({m: "built" for m in built} | {m: "failed" for m in genuine})
     transient = sorted(set(failed) - genuine)
     if transient:
         log(
