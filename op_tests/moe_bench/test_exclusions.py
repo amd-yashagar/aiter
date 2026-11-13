@@ -82,7 +82,7 @@ def result(cid, us, outcome="ok", route=None):
 
 def row_of(results, pre=None):
     fh = io.StringIO()
-    S = SimpleNamespace(kind="x")
+    S = SimpleNamespace(kind="x", D=5120, I=1536, E=41, topk=10)
     bar_worker._emit_summary(
         fh, SimpleNamespace(id="c1"), S, "warm", results, {"gpu": "g", "sku": ""}, [], "bar",
         pre_excluded=pre,
@@ -136,3 +136,46 @@ def test_a_pre_excluded_note_reaches_the_row_and_the_column_exists():
     )
     assert row["bar_exclusions"] == "4 candidates not run, MOEBUG-064"
     assert "bar_exclusions" in bar_runner.BAR_COLS
+
+
+UNSAFE = "_ZN5aiter45fmoe_stage1_bf16_pertokenFp8_g1u1_32x256_2tg_pf2E"  # X08/X09 at 5120/1536/E41/top10
+UNSAFE_OTHER_TILE = (
+    "_ZN5aiter45fmoe_stage1_bf16_pertokenFp8_g1u1_32x256_2tg_pf3E"  # X05/X06/X10 passed
+)
+
+
+def test_the_unsafe_table_holds_every_failed_pair_of_the_verification_files():
+    t = exclusions.unsafe_table()
+    assert (5120, 1536, 41, 10, "32x256_2tg_pf2") in t and (
+        5120,
+        1536,
+        40,
+        8,
+        "64x128_2tg_pf3",
+    ) in t
+    assert (5120, 1536, 41, 10, "32x128_3tg_pf2") in t
+    assert (5120, 1536, 41, 10, "32x256_2tg_pf3") not in t  # a PASS row
+    assert (4096, 384, 128, 8, "32x64_4tg_pf3") in t  # meta tuned row R24 (gfx942)
+    assert exclusions.stage1_tile(UNSAFE) == "32x256_2tg_pf2"
+    assert exclusions.stage1_tile("moe_ck2stages_gemm1_x") is None
+
+
+def test_an_unsafe_pair_is_excluded_at_its_shape_only():
+    shape = (5120, 1536, 41, 10)
+    assert "unsafe pair" in exclusions.unsafe_reason(shape, UNSAFE)
+    assert exclusions.unsafe_reason(shape, UNSAFE_OTHER_TILE) == ""
+    assert exclusions.unsafe_reason((5120, 1536, 40, 8), UNSAFE) == ""  # another shape
+    assert exclusions.unsafe_reason(None, UNSAFE) == ""
+    got = exclusions.excluded(
+        [("a", UNSAFE, "ok"), ("b", UNSAFE_OTHER_TILE, "ok")], shape
+    )
+    assert set(got) == {"a"} and got["a"].startswith("MOEBUG-064 unsafe pair")
+    assert "unsafe pair at this shape" in exclusions.note(got)
+    assert exclusions.excluded([("a", UNSAFE, "ok")], None) == {}
+
+
+def test_an_unsafe_pair_never_sets_the_bar_at_its_shape():
+    fast = f"fused_moe|{UNSAFE}|{CK}|bm32|ks0|nt0"
+    slow = f"fused_moe|{UNSAFE_OTHER_TILE}|{CK}|bm32|ks0|nt0"
+    row = row_of({fast: result(fast, 50.0), slow: result(slow, 70.0)})
+    assert row["bar_id"] == slow and "unsafe pair" in row["bar_exclusions"]

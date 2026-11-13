@@ -131,7 +131,8 @@ def derive(bars, cands):
             for c in rows
             if c.get("status") in ("ok", "fail")
         ]
-        skip = exclusions.excluded(entries)
+        shape = tuple(b.get(k) for k in ("model_dim", "inter_dim", "expert", "topk"))
+        skip = exclusions.excluded(entries, shape)
         best0 = min(ok, key=lambda c: float(c["median_us"]))
         keep = [c for c in ok if c["cand_id"] not in skip]
         best1 = min(keep, key=lambda c: float(c["median_us"])) if keep else None

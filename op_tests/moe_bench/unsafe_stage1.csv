@@ -1,0 +1,26 @@
+gfx,model_dim,inter_dim,expert,topk,stage1_tile,source,row_id,evidence
+gfx950,5120,1536,40,8,64x128_2tg_pf3,results/smci355-moebug064-gfx950.csv,X01,M256 uniform 3/6 hot1 6/6 bad reps
+gfx950,5120,1536,41,10,32x128_3tg_pf2,results/smci355-moebug064-gfx950.csv,X07,M8 uniform 0/6 hot1 2/6 bad reps
+gfx950,5120,1536,41,10,32x256_2tg_pf2,results/smci355-moebug064-gfx950.csv,X08,M16 uniform 0/6 hot1 1/6 bad reps
+gfx950,5120,1536,41,10,32x256_2tg_pf2,results/smci355-moebug064-gfx950.csv,X09,M32 uniform 1/6 hot1 1/6 bad reps
+gfx950,4096,192,192,8,128x64_pf2,results/smci355-moebug064-gfx950.csv,H02,M6144 uniform 1/6 hot1 0/6 bad reps
+gfx950,4096,192,192,8,128x64_pf3,results/smci355-moebug064-gfx950.csv,H06,M8192 uniform 1/6 hot1 0/6 bad reps
+gfx950,4096,192,192,8,16x64_5tg_pf3,results/smci355-moebug064-gfx950.csv,H07,M4096 uniform 6/6 hot1 6/6 bad reps
+gfx950,4096,192,192,8,16x64_5tg_pf3,results/smci355-moebug064-gfx950.csv,H08,M6144 uniform 6/6 hot1 6/6 bad reps
+gfx950,4096,192,192,8,16x64_5tg_pf3,results/smci355-moebug064-gfx950.csv,H09,M8192 uniform 6/6 hot1 6/6 bad reps
+gfx950,4096,192,192,8,32x64_4tg_pf2,results/smci355-moebug064-gfx950.csv,H10,M4096 uniform 6/6 hot1 6/6 bad reps
+gfx950,4096,192,192,8,32x64_4tg_pf2,results/smci355-moebug064-gfx950.csv,H11,M6144 uniform 6/6 hot1 6/6 bad reps
+gfx950,4096,192,192,8,32x64_4tg_pf2,results/smci355-moebug064-gfx950.csv,H12,M8192 uniform 6/6 hot1 6/6 bad reps
+gfx950,4096,192,192,8,32x64_4tg_pf3,results/smci355-moebug064-gfx950.csv,H13,M4096 uniform 6/6 hot1 6/6 bad reps
+gfx950,4096,192,192,8,32x64_4tg_pf3,results/smci355-moebug064-gfx950.csv,H14,M6144 uniform 6/6 hot1 6/6 bad reps
+gfx950,4096,192,192,8,32x64_4tg_pf3,results/smci355-moebug064-gfx950.csv,H15,M8192 uniform 6/6 hot1 6/6 bad reps
+gfx950,4096,192,192,8,64x64_2tg_pf3,results/smci355-moebug064-gfx950.csv,H16,M4096 uniform 6/6 hot1 6/6 bad reps
+gfx950,4096,192,192,8,64x64_2tg_pf3,results/smci355-moebug064-gfx950.csv,H17,M6144 uniform 6/6 hot1 6/6 bad reps
+gfx950,4096,192,192,8,64x64_2tg_pf3,results/smci355-moebug064-gfx950.csv,H18,M8192 uniform 6/6 hot1 6/6 bad reps
+gfx950,4096,192,192,8,64x64_3tg_pf2,results/smci355-moebug064-gfx950.csv,H19,M4096 uniform 0/6 hot1 1/6 bad reps
+gfx950,4096,192,192,8,64x64_3tg_pf2,results/smci355-moebug064-gfx950.csv,H20,M6144 uniform 4/6 hot1 4/6 bad reps
+gfx950,4096,192,192,8,64x64_3tg_pf2,results/smci355-moebug064-gfx950.csv,H21,M8192 uniform 6/6 hot1 6/6 bad reps
+gfx942,4096,384,128,8,32x64_4tg_pf3,status/meta-moebug064-tuned-rows.csv,R24,M16 FAIL uniform 6/6 hot1 6/6 bad reps
+gfx942,4096,384,128,8,32x64_4tg_pf3,status/meta-moebug064-tuned-rows.csv,R30,M16 FAIL_INTERMITTENT uniform 5/6 hot1 6/6 bad reps
+gfx942,4096,384,128,8,32x64_4tg_pf3,status/meta-moebug064-tuned-rows.csv,R32,M32 FAIL uniform 6/6 hot1 6/6 bad reps
+gfx942,7168,256,256,8,32x64_4tg_pf3,status/meta-moebug064-tuned-rows.csv,R37,M16 FAIL_INTERMITTENT uniform 1/6 hot1 1/6 bad reps
