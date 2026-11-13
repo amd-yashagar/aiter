@@ -130,7 +130,7 @@ def build_silu_and_mul_fq_module(
         )
         sorted_ids_p = _i32_ptr(sorted_ids)
         num_valid_p = _i32_ptr(num_valid_ids)
-        if enable_bias:
+        if const_expr(enable_bias):
             topk_ids_p = _i32_ptr(topk_ids)
             bias_f32_p = fx.inttoptr(
                 fx.PointerType.get(f32, address_space=_AS_G, alignment=4),
@@ -242,7 +242,7 @@ def build_silu_and_mul_fq_module(
             if col0 < inter_dim:
                 if is_valid:
                     in_row = token_id * topk + slot_id
-                    if enable_bias:
+                    if const_expr(enable_bias):
                         # sorted_ids encodes token+slot, not expert; use topk_ids to
                         # recover the expert-specific bias row for this token slot.
                         expert_id = topk_ids_p[in_row]
@@ -309,7 +309,7 @@ def build_silu_and_mul_fq_module(
                         g = gate_f32[vi]
                         u = up_f32[vi]
 
-                        if enable_bias:
+                        if const_expr(enable_bias):
                             bias_col = col0 + vi
                             g = g + _load_bias_scalar(bias_row + bias_col)
                             u = u + _load_bias_scalar(bias_row + inter_dim + bias_col)
