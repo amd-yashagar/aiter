@@ -277,7 +277,20 @@ def build_slice(case, part, parts, tmpdir, indices=None, cover=True):
                         return
                 out.append((cid, True, ""))
             except Exception as e:  # noqa: BLE001
-                out.append((cid, False, f"{type(e).__name__}: {str(e)[:200]}"))
+                from .bar_worker import aiter_error_detail
+
+                why = aiter_error_detail(e)
+                out.append(
+                    (
+                        cid,
+                        False,
+                        (
+                            f"aiter_error: {why}"
+                            if why
+                            else f"{type(e).__name__}: {str(e)[:200]}"
+                        ),
+                    )
+                )
 
         if part == 0 and indices is None:
             from .candidates.fused_cfg import unforce

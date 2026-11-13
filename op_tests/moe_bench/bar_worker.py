@@ -262,6 +262,24 @@ def drop_aot_uncovered(fh, case_id, source, mode, cands):
     return keep, n
 
 
+def aiter_error_detail(e):
+    """Error text of a NameError / UnboundLocalError raised inside aiter's own sources (not
+    the harness's), else None: a candidate aiter cannot run (e.g. ``topk_ids_p`` undefined in
+    silu_and_mul_fq.py for k_batch > 1 stage 1). It is neither timeable nor a harness error:
+    it gets its own status, ``aiter_error``, and stays out of the bar."""
+    if not isinstance(e, (NameError, UnboundLocalError)):
+        return None
+    tb, last = e.__traceback__, None
+    while tb is not None:
+        last, tb = tb, tb.tb_next
+    if last is None:
+        return None
+    fn = last.tb_frame.f_code.co_filename.replace("\\", "/")
+    if "/aiter/" not in fn or "/moe_bench/" in fn:
+        return None
+    return f"{_err(e)} at {fn.rsplit('/aiter/', 1)[-1]}:{last.tb_lineno}"
+
+
 def not_prebuilt_row(md_name):
     """(status, detail, outcome) of a candidate that reached a module not built beforehand.
 
@@ -589,6 +607,11 @@ class Measurer:
             if md:
                 status, detail, res["outcome"] = not_prebuilt_row(md)
                 self._emit(base, modes, status=status, detail=detail)
+                return res
+            detail = aiter_error_detail(e)
+            if detail:
+                res["outcome"] = "aiter_error"
+                self._emit(base, modes, status="aiter_error", detail=detail)
                 return res
             if "no usable AOT cache" in str(e):
                 # a FlyDSL kernel the host build did not cover: a harness error, never a
