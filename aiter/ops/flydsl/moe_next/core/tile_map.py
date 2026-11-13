@@ -18,10 +18,22 @@ TILE_M = (16, 32, 64, 128)
 ONESHOT_MAX_ROUTES = 3072  # one-shot rounds bound (12 x 256 routes)
 
 
+@functools.cache
+def _arch() -> str:
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime()
+
+
 def oneshot_max_routes(num_experts: int) -> int:
-    """Routes up to which the one-workgroup sort beats the two-launch one
-    (MI300X, both zero-filling: break-even near 3072 routes at E <= 256 and
-    2560 at E = 512)."""
+    """Routes up to which the one-workgroup sort beats the two-launch one, per
+    arch and E (both zero-filling). gfx942 (MI300X, core e8e07a4c6): break-even
+    near 2200 routes at E = 128, 1550 at E = 256, 1100 at E >= 385. Other
+    archs keep 3072 / 2560 until measured (crossover_sweep in the vault)."""
+    if _arch() == "gfx942":
+        if num_experts <= 128:
+            return 2048
+        return 1536 if num_experts <= 256 else 1024
     return ONESHOT_MAX_ROUTES if num_experts <= 256 else 2560
 
 

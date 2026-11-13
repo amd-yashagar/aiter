@@ -191,6 +191,110 @@ def check_loc_ids(tm, ti, expert_mask, num_local_tokens):
     return []
 
 
+def test_path_boundary():
+    """The one-shot and two-launch sorts give bit-identical outputs on the
+    same input (sorted ids and weights with their padding, expert ids, counts,
+    live_tiles, loc_ids, zero-fill, fused quant), at each E's one-shot limit
+    and just past it, so a routed kernel sees the same inputs whichever path
+    the limit picks."""
+    import aiter.ops.flydsl.moe_next.core.tile_map as tmap
+
+    lim = tmap.oneshot_max_routes
+    rows_out = []
+    for E, topk in (
+        (64, 8),
+        (128, 8),
+        (129, 8),
+        (256, 8),
+        (257, 9),
+        (385, 7),
+        (513, 11),
+    ):
+        cap = lim(E)
+        for token in (cap // topk, cap // topk + 1):
+            for case, mask, local in (
+                ("random", False, None),
+                ("dup", False, None),
+                ("mixed", True, token - 3),
+            ):
+                ti, tw, em = routing(token, E, topk, case, mask)
+                nl = None if local is None else torch.tensor([local], dtype=torch.int32)
+                x = _quant_input(token, 1024, token)
+                outs = [
+                    torch.full((token, 512), 3.0, dtype=dtypes.bf16) for _ in range(2)
+                ]
+                maps = []
+                for force, out in zip((1 << 13, 0), outs):
+                    tmap.oneshot_max_routes = lambda e, f=force: f
+                    try:
+                        maps.append(
+                            route_to_tiles(
+                                ti,
+                                tw,
+                                num_experts=E,
+                                tile_m=32,
+                                expert_mask=em,
+                                num_local_tokens=nl,
+                                zero_output=out,
+                                with_loc_ids=True,
+                                quant_input=x,
+                                quant_mode="per_token_fp8",
+                            )
+                        )
+                    finally:
+                        tmap.oneshot_max_routes = lim
+                a, b = maps
+                nv = int(a.num_valid_ids[0])
+                nlive = int(a.num_live_tiles[0])
+                rows = token if local is None else local
+                bad = [
+                    name
+                    for name, x1, x2 in (
+                        ("num_valid_ids", a.num_valid_ids, b.num_valid_ids),
+                        ("num_live_tiles", a.num_live_tiles, b.num_live_tiles),
+                        (
+                            "sorted_token_ids",
+                            a.sorted_token_ids[:nv],
+                            b.sorted_token_ids[:nv],
+                        ),
+                        (
+                            "sorted_weights",
+                            a.sorted_weights[:nv].view(torch.int32),
+                            b.sorted_weights[:nv].view(torch.int32),
+                        ),
+                        (
+                            "sorted_expert_ids",
+                            a.sorted_expert_ids[: nv // 32],
+                            b.sorted_expert_ids[: nv // 32],
+                        ),
+                        ("live_tiles", a.live_tiles[:nlive], b.live_tiles[:nlive]),
+                        ("loc_ids", a.loc_ids[:rows], b.loc_ids[:rows]),
+                        ("zero_fill", outs[0], outs[1]),
+                        (
+                            "a_q",
+                            a.a_q[:rows].view(torch.uint8),
+                            b.a_q[:rows].view(torch.uint8),
+                        ),
+                        (
+                            "a_scale",
+                            a.a_scale[:rows].view(torch.int32),
+                            b.a_scale[:rows].view(torch.int32),
+                        ),
+                    )
+                    if not torch.equal(x1, x2)
+                ]
+                assert (
+                    not bad
+                ), f"one-shot vs two-launch E={E} topk={topk} M={token} {case}: {bad}"
+                rows_out.append(
+                    {
+                        "check": f"paths bit-identical E={E} topk={topk} M={token} {case}",
+                        "exact": True,
+                    }
+                )
+    return rows_out
+
+
 def test_tile_map(token, E, topk, tile_m, case, mask, local, model_dim=4096):
     """route_to_tiles against Opus (via reference_tile_map), output zero-fill included."""
     ti, tw, em = routing(token, E, topk, case, mask)
@@ -689,6 +793,9 @@ def test_dynamic_tensor():
     count plus scatter) and their boundaries, NaN and inf rows,
     all-zero input (scale 0, NaN outputs), huge rows past num_local_tokens,
     and graph replay."""
+    from aiter.ops.flydsl.moe_next.core.tile_map import oneshot_max_routes
+
+    lim64 = oneshot_max_routes(64) // 8
     rows_out = []
     cases = [
         (8, 256, 8, 7168, None, "plain"),
@@ -698,8 +805,8 @@ def test_dynamic_tensor():
         (8, 64, 8, 4096, None, "inf"),
         (8, 64, 8, 4096, None, "zero"),
         (8, 64, 8, 8192, None, "plain"),
-        (384, 64, 8, 7168, None, "plain"),  # last one-shot route count (3072)
-        (385, 64, 8, 7168, None, "plain"),  # first count + scatter
+        (lim64, 64, 8, 7168, None, "plain"),  # last one-shot token count
+        (lim64 + 1, 64, 8, 7168, None, "plain"),  # first count + scatter
         (4, 64, 4, 2048, 2, "plain"),
         (8, 256, 8, 7168, None, "nan"),
         (8, 256, 8, 7168, None, "inf"),
@@ -1659,6 +1766,7 @@ def main():
     )
     checks = test_graph_capture() + test_intermediate() + test_mfma_native()
     checks += test_pad_rows() + test_pad_rows_consumer() + test_repeat_keep_last()
+    checks += test_path_boundary()
     aiter.logger.info("checks:\n%s", pd.DataFrame(checks).to_markdown(index=False))
     if args.tier:
         rows, qrows = [], []
