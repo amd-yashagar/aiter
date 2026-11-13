@@ -36,14 +36,16 @@ def _i32_view(t):
 
 
 @functools.lru_cache(maxsize=64)
-def compile_rows_reduce(*, model_dim, topk, has_mask, has_local):
+def compile_rows_reduce(*, model_dim, topk, has_mask, has_local, chunks=1, threads=THREADS):
     """Launcher(out [M, N] bf16, rows [M * topk, N] bf16, topk_ids [M, topk] int32, expert_mask int32 (or any
-    tensor when has_mask is False), num_local_tokens int32 [1] (or any tensor), M, stream)."""
+    tensor when has_mask is False), num_local_tokens int32 [1] (or any tensor), M, stream). chunks: 8-column groups per
+    thread, strided by the block's width (more independent loads in flight per thread)."""
     N, TOPK = int(model_dim), int(topk)
     assert N % VEC == 0, f"model_dim={N} must be a multiple of {VEC}"
-    GX = -(-N // (THREADS * VEC))
+    CH, TH = int(chunks), int(threads)
+    GX = -(-N // (TH * VEC * CH))
 
-    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    @flyc.kernel(known_block_size=[TH, 1, 1])
     def fp8b_rows_reduce(
         arg_out: fx.Tensor,
         arg_rows: fx.Tensor,
@@ -54,7 +56,8 @@ def compile_rows_reduce(*, model_dim, topk, has_mask, has_local):
     ):
         tid = gpu.thread_idx.x
         t = gpu.block_idx.y
-        col = (gpu.block_idx.x * fx.Int32(THREADS) + tid) * fx.Int32(VEC)
+        col0 = (gpu.block_idx.x * fx.Int32(TH * CH) + tid) * fx.Int32(VEC)
+        cols = [col0 + fx.Int32(c * TH * VEC) for c in range(CH)]
         tokens = i32_tokens
         rows_dw = tokens * fx.Int32(TOPK * N // 2)  # the rows buffer's end, in dwords
         rows_rsrc = _rsrc(arg_rows, fx.Int64(tokens) * fx.Int64(TOPK * N * 2))
@@ -63,19 +66,21 @@ def compile_rows_reduce(*, model_dim, topk, has_mask, has_local):
         live = t < tokens
         if const_expr(has_local):
             live = live & (t < _i32_view(arg_local)[0])
-        acc = [fx.Float32(0.0) for _ in range(VEC)]
+        acc = [[fx.Float32(0.0) for _ in range(VEC)] for _ in range(CH)]
         for k in range_constexpr(TOPK):
             e = ids[t * fx.Int32(TOPK) + fx.Int32(k)]
             ok = live & (e >= fx.Int32(0))
             if const_expr(has_mask):
                 ok = ok & (_i32_view(arg_mask)[(e >= fx.Int32(0)).select(e, fx.Int32(0))] != fx.Int32(0))
-            off = ((t * fx.Int32(TOPK) + fx.Int32(k)) * fx.Int32(N) + col) // fx.Int32(2)
-            raw = buffer_ops.buffer_load(rows_rsrc, ok.select(off, rows_dw), vec_width=VEC // 2, dtype=T.i32)
-            v = Vec(raw).bitcast(fx.BFloat16)
-            acc = [acc[i] + v[i].to(fx.Float32) for i in range(VEC)]
-        packed = Vec.from_elements(acc, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
-        if col < fx.Int32(N):
-            buffer_ops.buffer_store(packed, out_rsrc, (t * fx.Int32(N) + col) // fx.Int32(2))
+            for c in range_constexpr(CH):
+                off = ((t * fx.Int32(TOPK) + fx.Int32(k)) * fx.Int32(N) + cols[c]) // fx.Int32(2)
+                raw = buffer_ops.buffer_load(rows_rsrc, ok.select(off, rows_dw), vec_width=VEC // 2, dtype=T.i32)
+                v = Vec(raw).bitcast(fx.BFloat16)
+                acc[c] = [acc[c][i] + v[i].to(fx.Float32) for i in range(VEC)]
+        for c in range_constexpr(CH):
+            packed = Vec.from_elements(acc[c], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+            if cols[c] < fx.Int32(N):
+                buffer_ops.buffer_store(packed, out_rsrc, (t * fx.Int32(N) + cols[c]) // fx.Int32(2))
 
     @flyc.jit
     def launch_fp8b_rows_reduce(
@@ -88,7 +93,7 @@ def compile_rows_reduce(*, model_dim, topk, has_mask, has_local):
         stream: fx.Stream,
     ):
         fp8b_rows_reduce(arg_out, arg_rows, arg_ids, arg_mask, arg_local, i32_tokens).launch(
-            grid=(GX, fx.Int64(i32_tokens), 1), block=(THREADS, 1, 1), stream=stream
+            grid=(GX, fx.Int64(i32_tokens), 1), block=(TH, 1, 1), stream=stream
         )
 
     return launch_fp8b_rows_reduce
