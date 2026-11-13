@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """The dropped-group audit over existing bar outputs."""
 
+import csv
+
 from op_tests.moe_bench import audit_groups
 
 
@@ -109,3 +111,44 @@ def test_the_replay_settles_the_soft_flag_of_a_group_it_enumerates():
     enum["c3"]["bm16/ks0/nt0"] = {"s1": 1, "pairs": 3}
     audit_groups.settle_soft(flags, enum)
     assert "c3" not in flags
+
+
+def test_a_row_written_under_another_column_set_is_a_hard_flag(tmp_path):
+    from op_tests.moe_bench import bar_runner, schema
+
+    hist = {len(h): h for h in bar_runner._history("bar")}
+    h102, h107 = hist[102], hist[107]
+
+    def row(h, **v):
+        d = {c: "" for c in h}
+        d.update(v)
+        return [d[c] for c in h]
+
+    prov = {"rocm": "7.2.53211", "torch": "2.13.0+rocm7.2", "flydsl": "0.5.0", "gfx": "gfx950",
+            "cu_num": "256", "aiter_sha": "27faf0a57b4e", "aiter_dirty": "0",
+            "harness_sha": "50c0d1b74f94", "date": "2026-11-12T18:00:00Z"}  # fmt: skip
+    ok = row(h102, case_id="c1", mode="warm", status="ok", bar_us="1.5", **prov)
+    cut = row(h107, case_id="c2", mode="warm", status="ok", bar_us="2.5", **prov)[:102]
+    short = row(h102, case_id="c3", mode="warm", status="ok")[:50]
+    bar = tmp_path / "bar-t.csv"
+    with open(bar, "w", newline="") as f:
+        csv.writer(f).writerows([h102, ok, cut, short])
+    cands = tmp_path / "candidates-t.csv"
+    cands.write_text("case_id,mode,cand_id,status\r\nc1,warm,dispatch,ok\r\n")
+    got = audit_groups.unreadable(str(bar))
+    assert [c for c, _ in got] == ["c2", "c3"]
+    assert got[0][1].startswith("implausible values in") and "harness_sha" in got[0][1]
+    assert got[1][1] == "50 fields, header has 102"
+    res = audit_groups.audit(str(bar), str(cands), {})
+    assert res["unreadable"] == 2
+    assert {(r["case_id"], tuple(r["flags"])) for r in res["flagged"]} == {
+        ("c2", ("unreadable_row",)),
+        ("c3", ("unreadable_row",)),
+    }
+    # repaired: reads clean and the cut row's columns are where they belong
+    bar_runner.repair_bar_csv(str(bar))
+    assert audit_groups.unreadable(str(bar)) == []
+    assert {r["case_id"] for r in schema.read_csv(str(bar), strict=True)} == {
+        "c1",
+        "c2",
+    }

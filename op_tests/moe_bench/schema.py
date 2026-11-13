@@ -10,6 +10,7 @@ import csv
 import hashlib
 import io
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -160,14 +161,88 @@ def format_row(cols, row):
     return buf.getvalue()
 
 
+_SHA = re.compile(r"(none|[0-9a-f]{7,40})(\+dirty)?")
+_NUM = re.compile(r"[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?|nan|inf|-inf")
+_VERSION = re.compile(r"\d+\.\d+(\.\d+)?.*")
+COLUMN_CHECKS = {
+    "harness_sha": _SHA,
+    "aiter_sha": _SHA,
+    "aiter_dirty": re.compile(r"[01]"),
+    "routes_disabled": re.compile(r"[01]"),
+    "date": re.compile(r"\d{4}-\d\d-\d\d.*"),
+    "gfx": re.compile(r"gfx\w+"),
+    "cu_num": re.compile(r"\d+"),
+    "rocm": _VERSION,
+    "torch": _VERSION,
+    "flydsl": _VERSION,
+}
+_NUMERIC_SUFFIX = ("_us", "_mean", "_std", "_eff", "_us_mean")
+# a value of this shape can only sit in this column: a header that puts it elsewhere does not
+# fit (a GPU name in the ``aiter_sha`` slot means the row was written under another column set)
+ANCHORS = (
+    (re.compile(r"AMD .*"), "gpu"),
+    (re.compile(r"gfx\d+\w*"), "gfx"),
+    (re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"), "date"),
+)
+
+
+def column_ok(name, value):
+    """Whether ``value`` is plausible for column ``name``: the provenance columns have a
+    shape (a git sha, a version, a date) and the timing and accuracy columns are numbers
+    or empty. Columns without a rule accept anything."""
+    if value is None:
+        return False
+    if name in COLUMN_CHECKS:
+        return value == "" or bool(COLUMN_CHECKS[name].fullmatch(value))
+    if name.endswith(_NUMERIC_SUFFIX):
+        return value == "" or bool(_NUM.fullmatch(value))
+    return True
+
+
+def row_fits(header, row, exact=True):
+    """Whether ``row`` can have been written under ``header``: the width matches (or, with
+    ``exact`` False, is shorter: a row whose tail was cut off) and every ruled column holds
+    a plausible value."""
+    if len(row) != len(header) if exact else len(row) >= len(header):
+        return False
+    for h, v in zip(header, row, strict=False):
+        if not column_ok(h, v):
+            return False
+        for pat, col in ANCHORS:
+            if h != col and pat.fullmatch(v):
+                return False
+    return True
+
+
+def map_row(row, headers):
+    """The one header ``row`` was written under, by its values, or None. Headers of the
+    row's own width whose ruled columns hold plausible values are tried first; where none
+    fits, headers wider than the row (a cut-off tail) are. Two different headers fitting is
+    ambiguous: None, never a guess. Returns (header, truncated)."""
+    uniq = []
+    for h in headers:
+        if list(h) not in uniq:
+            uniq.append(list(h))
+    for exact in (True, False):
+        fit = [h for h in uniq if row_fits(h, row, exact)]
+        if not fit:
+            continue
+        # headers that name the row's fields identically map it identically (a cut-off tail
+        # is the only difference): not an ambiguity
+        if all(h[: len(row)] == fit[0][: len(row)] for h in fit):
+            return fit[0], not exact
+        return None
+    return None
+
+
 def migrate(path, cols, history=()):
-    """Make ``path`` safe to append ``cols`` rows to. Rows are told apart by field count:
-    a row that fits the file's header or the current columns is kept (mapped onto the
-    union header; ``history`` lists the column lists of earlier harness heads, and a row
-    whose width is one of theirs (and no other's) is mapped by that list), any other (a row
-    cut off by a kill, two writers' rows interleaved) goes
-    to ``<path>.rejected`` and out of the file. Rewritten through a temp file and renamed,
-    only when something differs. Returns (header, kept, rejected)."""
+    """Make ``path`` safe to append ``cols`` rows to. Each row is mapped by its values to the
+    header it was written under (the file's, the current ``cols``, or one of ``history``,
+    the column lists of earlier harness heads: see ``map_row``) and rewritten under the union
+    header; a row no header fits unambiguously (cut off by a kill, two writers' rows
+    interleaved, a shifted tail) goes to ``<path>.rejected`` and out of the file. Rewritten
+    through a temp file and renamed, only when something differs. Returns (header, kept,
+    rejected)."""
     csv.field_size_limit(1 << 28)
     with open(path, newline="") as f:
         text = f.read()
@@ -177,25 +252,21 @@ def migrate(path, cols, history=()):
     old = rows[0]
     header = list(cols) + [c for c in old if c not in cols]
     complete = text.endswith(("\n", "\r"))
-    by_width = {}
-    for h in history:
-        by_width.setdefault(len(h), []).append(list(h))
-    kept, rejected = [], []
+    known = [old, list(cols), *history]
+    kept, rejected, truncated = [], [], 0
     for i, r in enumerate(rows[1:]):
-        last_partial = i == len(rows) - 2 and not complete
-        if last_partial:
+        if i == len(rows) - 2 and not complete:
             rejected.append(r)
-        elif len(r) == len(old):
-            kept.append(dict(zip(old, r, strict=True)))
-        elif len(r) == len(cols):
-            kept.append(dict(zip(cols, r, strict=True)))
-        elif len(by_width.get(len(r), ())) == 1:
-            h = by_width[len(r)][0]
-            header += [c for c in h if c not in header]
-            kept.append(dict(zip(h, r, strict=True)))
-        else:
+            continue
+        m = map_row(r, known)
+        if m is None:
             rejected.append(r)
-    if header == old and not rejected and complete:
+            continue
+        h, cut = m
+        truncated += cut
+        header += [c for c in h if c not in header]
+        kept.append(dict(zip(h, r, strict=False)))
+    if header == old and not rejected and not truncated and complete:
         return header, len(kept), 0
     tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w", newline="") as f:
@@ -207,6 +278,31 @@ def migrate(path, cols, history=()):
         with open(path + ".rejected", "a", newline="") as f:
             csv.writer(f).writerows(rejected)
     return header, len(kept), len(rejected)
+
+
+def row_problems(path):
+    """[(record number, first line, why)] of every row of ``path`` that cannot be read under
+    its own header: a wrong field count, or a ruled column (a sha, a version, a timing or
+    accuracy number) holding something else (a row written under another column set). A file
+    repaired by ``migrate`` or ``repair_bar_csv`` reads clean."""
+    csv.field_size_limit(1 << 28)
+    out = []
+    with open(path, newline="") as f:
+        rd = csv.reader(f)
+        header, line = None, 1
+        for n, row in enumerate(rd):
+            if header is None:
+                header = row
+            elif len(row) != len(header):
+                out.append((n, line, f"{len(row)} fields, header has {len(header)}"))
+            else:
+                bad = [
+                    h for h, v in zip(header, row, strict=True) if not column_ok(h, v)
+                ]
+                if bad:
+                    out.append((n, line, f"implausible values in {', '.join(bad[:4])}"))
+            line = rd.line_num + 1
+    return out
 
 
 class Appender:

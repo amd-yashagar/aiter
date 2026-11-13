@@ -32,6 +32,8 @@ import re
 import subprocess
 import sys
 
+from . import schema
+
 GROUP = re.compile(r"\|(bm\d+)\|(ks\d+)\|(nt\d+)$")
 OLD_SCREEN_HEAD = "21b9ca0c3"  # the first harness head with the base-pair logic
 FIXED_HEAD = "946a02adc"
@@ -65,9 +67,31 @@ def discover(roots):
     return out
 
 
+csv.field_size_limit(1 << 28)
+
+
 def _read(path):
     with open(path, newline="") as f:
         return list(csv.DictReader(f))
+
+
+def unreadable(path):
+    """[(case_id, why)] of every row of a bar or candidate CSV that cannot be read under the
+    file's own header: a wrong field count, or a ruled column (sha, version, timing or
+    accuracy number) holding something else, i.e. a row written under another column set.
+    Such a row is invisible to every other check of this audit, so each one is a hard flag.
+    A file repaired by ``bar_runner.repair_bar_csv`` reads clean."""
+    out = []
+    with open(path, newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return out
+    case_col = rows[0].index("case_id") if "case_id" in rows[0] else 0
+    by_record = {n: r for n, r in enumerate(rows[1:], 1)}
+    for n, _line, why in schema.row_problems(path):
+        r = by_record.get(n, [])
+        out.append((r[case_col] if len(r) > case_col else "?", why))
+    return out
 
 
 def group_of(cand_id):
@@ -289,6 +313,9 @@ def audit(
 ):
     bars, cands = _read(bar_path), _read(cand_path)
     flags, by_case = data_flags(bars, cands)
+    bad_rows = unreadable(bar_path) + (unreadable(cand_path) if cand_path else [])
+    for case_id, why in bad_rows:
+        flags[case_id].append(("unreadable_row", "", why))
     if enumerate_ and meta.get("gfx"):
         enum = enumerate_cases(
             [b for b in bars if b.get("mode") == "warm"] or bars,
@@ -326,6 +353,7 @@ def audit(
         "harness": harness,
         "gfx": meta.get("gfx", ""),
         "cases": len({b["case_id"] for b in bars}),
+        "unreadable": len(bad_rows),
         "flagged": res,
     }
 
@@ -358,9 +386,9 @@ def main(argv=None):
         (
             "| bar set | harness | enum | cases | cases with a lost group (bar ok) | groups lost "
             "| stage-1 kernels never tried | groups never tried | first-kernel no-partner cases "
-            "| keyerror cases | routed rows among the lost-group cases |"
+            "| keyerror cases | unreadable rows (hard) | routed rows among the lost-group cases |"
         ),
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for s in sets:
         kind = "base_dropped" if s["enumerated"] else "base_failed?"
@@ -385,7 +413,8 @@ def main(argv=None):
         lines.append(
             f"| {_show(s['bar'], a.rel)} | {s['harness'] or '?'} | {'yes' if en else 'no'} "
             f"| {s['cases']} | {len(drop_ok)} | {groups} | {untried if en else '?'} "
-            f"| {never if en else '?'} | {nopart if en else '?'} | {keyerr} | {n_routed} |"
+            f"| {never if en else '?'} | {nopart if en else '?'} | {keyerr} "
+            f"| {s['unreadable']} | {n_routed} |"
         )
     text = "\n".join(lines)
     print(text)

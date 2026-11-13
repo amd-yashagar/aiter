@@ -12,6 +12,7 @@ import csv
 import json
 import os
 import socket
+import sys
 import tempfile
 import time
 
@@ -70,8 +71,8 @@ BAR_COLS = (
         "skipped_sources",
         "main_failure",
         "bar_incomplete",
-        "gate_fail",
         "bar_exclusions",
+        "gate_fail",
         "gate_fail",
         "cand_accounting",
         "new_us",
@@ -423,27 +424,45 @@ def mark_router_discards(bar_csv, candidates_csv, reason):
 
 
 def repair_bar_csv(path, out=None):
-    """Rewrite a bar CSV whose rows were appended by runs with different BAR_COLS (a
-    column added between a run and its resume): rows are told apart by field count and
-    mapped onto the current columns; the file gets the union header."""
+    """Rewrite a bar CSV whose rows were written under different column sets (a column added
+    between a run and its resume, or a rewrite that cut a wider row to a narrower header).
+
+    A row is mapped by its values to the header it was written under (the file's, the current
+    ``BAR_COLS``, or an earlier head's from ``col_history.json``; ``schema.map_row``): the
+    provenance columns must hold a sha, a version or a date and the timing and accuracy
+    columns numbers. A row that fits no header, or fits two, is never guessed: it goes to
+    ``<out>.rejected``. The file gets the union header and reads clean. Returns the number of
+    rows kept."""
     csv.field_size_limit(1 << 28)
     with open(path, newline="") as f:
         rows = list(csv.reader(f))
     old = rows[0]
-    new = list(BAR_COLS)
-    cols = new + [c for c in old if c not in new]
-    fixed = []
+    known = [old, list(BAR_COLS), *_history("bar")]
+    cols = list(BAR_COLS) + [c for c in old if c not in BAR_COLS]
+    fixed, rejected, truncated = [], [], 0
     for r in rows[1:]:
-        if len(r) == len(new):
-            fixed.append(dict(zip(new, r)))
-        elif len(r) == len(old):
-            fixed.append(dict(zip(old, r)))
-        else:
-            raise ValueError(f"{path}: row of {len(r)} fields fits neither header")
-    with open(out or path, "w", newline="") as f:
+        m = schema.map_row(r, known)
+        if m is None:
+            rejected.append(r)
+            continue
+        h, cut = m
+        truncated += cut
+        cols += [c for c in h if c not in cols]
+        fixed.append(dict(zip(h, r, strict=False)))
+    dest = out or path
+    with open(dest, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
         w.writerows(fixed)
+    if rejected:
+        with open(dest + ".rejected", "w", newline="") as f:
+            csv.writer(f).writerows([old, *rejected])
+    print(
+        f"repair_bar_csv {path}: {len(fixed)} rows kept ({truncated} with a cut-off tail), "
+        f"{len(rejected)} rejected",
+        file=sys.stderr,
+        flush=True,
+    )
     return len(fixed)
 
 
