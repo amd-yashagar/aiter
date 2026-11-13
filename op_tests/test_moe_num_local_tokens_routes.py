@@ -385,7 +385,5 @@ def test_stage2_time_does_not_depend_on_the_pad_count(M, tokens, monkeypatch):
         seen.append((partial, full))
         if partial < 2.0 * full:
             return
-    pytest.fail(
-        "stage 2 (nlt=%d vs nlt=%d) us: %s"
-        % (tokens, M, ", ".join(f"{p:.1f} vs {f:.1f}" for p, f in seen))
-    )
+    detail = ", ".join(f"{p:.1f} vs {f:.1f}" for p, f in seen)
+    pytest.fail(f"stage 2 (nlt={tokens} vs nlt={M}) us: {detail}")
