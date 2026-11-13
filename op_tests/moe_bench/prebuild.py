@@ -21,6 +21,7 @@ stays on the lease; ASM kernels are prebuilt code objects with nothing to build.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -250,6 +251,23 @@ def read_keymods():
 SPECS_KEY = "_specs"
 
 
+def scope():
+    """The tree under test and the chip: the part of a plan that two workers on one node
+    may differ in. Keymods entries are kept per scope."""
+    import aiter
+
+    tree = os.path.dirname(os.path.dirname(os.path.abspath(aiter.__file__)))
+    try:
+        arch, cu = gpu_identity()
+    except SystemExit:
+        arch, cu = "", ""
+    return f"{os.path.realpath(tree)}|{arch}/{cu}"
+
+
+def _kmkey(case_id):
+    return f"{case_id}|{scope()}"
+
+
 _KEYMODS_LOCK = threading.Lock()
 
 
@@ -260,9 +278,9 @@ def record_keymods(case_id, by_key, specs=None):
 
 def _record_keymods(case_id, by_key, specs=None):
     rec = read_keymods()
-    rec[case_id] = by_key
+    rec[_kmkey(case_id)] = by_key
     if specs:
-        rec.setdefault(SPECS_KEY, {}).update(specs)
+        rec.setdefault(f"{SPECS_KEY}|{scope()}", {}).update(specs)
     tmp = keymods_path() + f".{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump(rec, f, indent=1)
@@ -274,7 +292,7 @@ def excluded_keys(case_id):
     a host prebuild: they are marked ``build_failed`` and never reach a lease."""
     failed = known_failed()
     out = {}
-    for key, mods in read_keymods().get(case_id, {}).items():
+    for key, mods in read_keymods().get(_kmkey(case_id), {}).items():
         for md in mods:
             if md in failed:
                 out[key] = (md, failed[md])
@@ -453,7 +471,7 @@ def plan(cases):
     need = {}
     PLAN_ERRORS.clear()
     keymods = read_keymods()
-    specs = keymods.get(SPECS_KEY, {})
+    specs = keymods.get(f"{SPECS_KEY}|{scope()}", {})
     todo = []
     for c in cases:
         if c.kind != "fused" or c.token <= 0:
@@ -498,7 +516,7 @@ def plan(cases):
             step("resolved routes", routed)
             _PLAN_CACHE[key] = mods
         mods = dict(_PLAN_CACHE[key])
-        for key_mods in keymods.get(c.id, {}).values():
+        for key_mods in keymods.get(_kmkey(c.id), {}).values():
             for md in key_mods:
                 if md in specs:
                     mods.setdefault(md, specs[md])
@@ -563,6 +581,7 @@ def record_attempted(results):
 
 
 PLAN_FILE = "prebuild_plan.json"
+STAMP_FIELDS = ("tree", "tree_sha", "arch", "harness")
 
 
 def plan_path():
@@ -590,76 +609,113 @@ def _plan_stamp():
     }
 
 
-def save_plan(cases, need):
-    """Write the host's plan for ``cases`` so a leased run reads it instead of planning.
+def _plan_key(case_id, stamp):
+    return "|".join([case_id, *(stamp[k] for k in STAMP_FIELDS)])
 
-    One entry per planned case: its signature, the stamp it was planned under, and the
-    modules it needs; the build specs are shared. Entries of other cases stay."""
-    from . import runner
 
-    stamp = _plan_stamp()
+@contextlib.contextmanager
+def _plan_lock():
+    """Workers that share a state dir update the manifest one at a time."""
+    import fcntl
+
+    os.makedirs(state_dir(), exist_ok=True)
+    with open(plan_path() + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _read_plan():
     try:
         with open(plan_path()) as f:
             rec = json.load(f)
     except (OSError, ValueError):
         rec = {}
-    entries, specs = rec.setdefault("cases", {}), rec.setdefault("specs", {})
+    if rec.get("version") != 2:
+        rec = {"version": 2, "entries": {}}
+    return rec
+
+
+def save_plan(cases, need):
+    """Write the host's plan for ``cases`` so a leased run reads it instead of planning.
+
+    Entries are keyed by (case id, tree, tree sha, chip, harness sha), each with the case
+    row's signature and the modules, specs included (a spec names paths of its own tree),
+    so workers planning the same case ids on other trees or chips share the file without
+    overwriting each other. An older entry of the same case on the same tree (another sha
+    or harness) is replaced."""
+    from . import runner
+
+    stamp = _plan_stamp()
     by_case = {}
     for md, spec in need.items():
         for cid in spec.get("cases", []):
-            by_case.setdefault(cid, []).append(md)
-        specs[md] = {k: v for k, v in spec.items() if k != "cases"}
-    for c in cases:
-        if c.kind != "fused" or c.token <= 0:
-            continue
-        entries[c.id] = dict(
-            stamp, sig=runner.case_sig(c), modules=sorted(by_case.get(c.id, []))
-        )
-    tmp = plan_path() + f".{os.getpid()}"
-    with open(tmp, "w") as f:
-        json.dump(rec, f, indent=1)
-    os.replace(tmp, plan_path())
+            by_case.setdefault(cid, {})[md] = {
+                k: v for k, v in spec.items() if k != "cases"
+            }
+    with _plan_lock():
+        rec = _read_plan()
+        entries = rec["entries"]
+        for c in cases:
+            if c.kind != "fused" or c.token <= 0:
+                continue
+            for k in [
+                k
+                for k, e in entries.items()
+                if e["case"] == c.id
+                and e["tree"] == stamp["tree"]
+                and e["arch"] == stamp["arch"]
+            ]:
+                del entries[k]
+            entries[_plan_key(c.id, stamp)] = dict(
+                stamp,
+                case=c.id,
+                sig=runner.case_sig(c),
+                modules=by_case.get(c.id, {}),
+            )
+        tmp = plan_path() + f".{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(rec, f, indent=1)
+        os.replace(tmp, plan_path())
 
 
 def leased_plan(cases):
     """The plan of a leased run: read from the host's manifest, never computed (planning
     takes minutes and imports aiter). Raises SystemExit at once, naming the cases, when the
-    manifest lacks a case or holds one planned for another case row, tree, chip or harness.
-    """
+    manifest has no entry for a case under this tree, chip and harness, or one made for
+    another case row."""
     from . import runner
 
-    try:
-        with open(plan_path()) as f:
-            rec = json.load(f)
-    except (OSError, ValueError):
-        rec = {}
-    entries, specs = rec.get("cases", {}), rec.get("specs", {})
+    entries = _read_plan()["entries"]
     stamp = _plan_stamp()
     problems, need = [], {}
     for c in cases:
         if c.kind != "fused" or c.token <= 0:
             continue
-        e = entries.get(c.id)
+        e = entries.get(_plan_key(c.id, stamp))
         if e is None:
-            problems.append((c.id, "no plan"))
+            others = [x for x in entries.values() if x["case"] == c.id]
+            if not others:
+                problems.append((c.id, "no plan"))
+            else:
+                near = max(
+                    others, key=lambda x: sum(x[k] == stamp[k] for k in STAMP_FIELDS)
+                )
+                why = [k for k in STAMP_FIELDS if near[k] != stamp[k]]
+                problems.append((c.id, "planned for another " + ", ".join(why)))
             continue
-        why = [
-            k for k in ("tree", "tree_sha", "arch", "harness") if e.get(k) != stamp[k]
-        ]
         if e.get("sig") != runner.case_sig(c):
-            why.append("case row")
-        if why:
-            problems.append((c.id, "planned for another " + ", ".join(why)))
+            problems.append((c.id, "planned for another case row"))
             continue
-        for md in e["modules"]:
-            need.setdefault(md, dict(specs.get(md, {"md_name": md}), cases=[]))[
-                "cases"
-            ].append(c.id)
+        for md, spec in e["modules"].items():
+            need.setdefault(md, dict(spec, cases=[]))["cases"].append(c.id)
     if problems:
         shown = "; ".join(f"{cid} ({why})" for cid, why in problems[:12])
         raise SystemExit(
             f"{len(problems)} of {len(cases)} cases have no current prebuild plan in "
-            f"{plan_path()} (tree {stamp['tree']}): {shown}"
+            f"{plan_path()} (tree {stamp['tree']}, {stamp['arch']}): {shown}"
             f"{' ...' if len(problems) > 12 else ''}\n"
             "A leased run never plans (minutes of CPU, aiter imports). Run `run --mode "
             "prebuild --aiter <tree>` on the host for these cases first, or pass "

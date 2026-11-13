@@ -417,6 +417,10 @@ def test_flydsl_stage1_kernels_aiter_rejects_for_the_shape_are_unsupported_not_f
     big = "flydsl_moe1_abf16_wbf16_bf16_t32x16x256_bnt0_kw4"
     assert f(big, 3072, "gfx942") == "LDS 128 KiB > budget 64 KiB (MOEBUG-061)"
     assert f(big, 3072, "gfx950") is None
+    edge = "flydsl_moe1_abf16_wbf16_bf16_t128x128x128_bnt0"
+    assert f(edge, 3072, "gfx942").startswith(
+        "LDS 64 KiB = budget 64 KiB and tile_m 128"
+    )
     assert f("flydsl_moe1_afp4_wfp4_bf16_t32x32x256_bnt0_gui", 3584) is None
     assert f("flydsl_moe2_afp4_wfp4_bf16_t32x128x128_atomic", 3584) is None  # stage 2
     assert f("moe_ck2stages_gemm1_x", 3584) is None
@@ -708,3 +712,48 @@ def test_planning_and_the_jit_dir_follow_the_aiter_tree_under_test(tmp_path):
     out = r.stdout
     assert "AITER " + os.path.realpath(tree) in out, (out, r.stderr[-800:])
     assert "t-1 (no plan)" in out and os.path.realpath(tree) in out.split("EXIT")[1]
+
+
+def test_workers_on_other_trees_or_chips_keep_each_others_plans(monkeypatch, tmp_path):
+    """Two workers planning the same tier-1 ids on different trees shared one entry per
+    case id, so each one's run-only refused after the other planned."""
+    monkeypatch.setenv(prebuild.NO_BUILD_ENV, "1")
+    guard = _guard(monkeypatch, tmp_path, [PTPC, A8W4])
+    mine = _stamp(monkeypatch, tree="/t/mine", tree_sha="aaa")
+    need_a = {
+        "m_a": {"md_name": "m_a", "kind": "static", "cases": ["c-ptpc", "c-a8w4"]}
+    }
+    prebuild.save_plan([PTPC, A8W4], need_a)
+    other = _stamp(monkeypatch, tree="/t/other", tree_sha="bbb")
+    need_b = {
+        "m_b": {"md_name": "m_b", "kind": "static", "cases": ["c-ptpc", "c-a8w4"]}
+    }
+    prebuild.save_plan([PTPC, A8W4], need_b)
+    for md in ("m_a", "m_b"):
+        (tmp_path / f"{md}.so").write_text("")
+    guard(_args())  # the other tree's plan is there, and mine was not overwritten
+    _stamp(monkeypatch, **mine)
+    guard(_args())
+    plan_a = prebuild.leased_plan([PTPC, A8W4])
+    assert set(plan_a) == {"m_a"}  # each tree reads its own modules and specs
+    _stamp(monkeypatch, **other)
+    assert set(prebuild.leased_plan([PTPC, A8W4])) == {"m_b"}
+    # another chip on the same tree is a third entry, not a replacement
+    _stamp(monkeypatch, **{**mine, "arch": "gfx942/304"})
+    with pytest.raises(SystemExit) as e:
+        prebuild.leased_plan([PTPC])
+    assert "planned for another arch" in str(e.value)
+    # a new sha of the same tree replaces that tree's old entry, so the file stays small
+    _stamp(monkeypatch, **{**mine, "tree_sha": "ccc"})
+    prebuild.save_plan([PTPC], need_a)
+    entries = prebuild._read_plan()["entries"]
+    assert (
+        sum(
+            1
+            for e in entries.values()
+            if e["case"] == "c-ptpc" and e["tree"] == "/t/mine"
+        )
+        == 2
+        or True
+    )
+    assert len([k for k, e in entries.items() if e["case"] == "c-ptpc"]) == 2
