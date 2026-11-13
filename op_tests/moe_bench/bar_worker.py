@@ -61,6 +61,65 @@ class DispatchCandidate:
         pass
 
 
+class Bf16BoundCandidate(DispatchCandidate):
+    """The least-rounding aiter path where dispatch rounds more than requested: the same
+    ``fused_moe`` call with the activation-dtype switch raised out of reach
+    (``GPTOSS_SWIGLU_MXFP4_BF16_BOUND`` for SEPARATED Swiglu, ``AITER_BF16_FP8_MOE_BOUND``
+    for INTERLEAVE), so aiter keeps the bf16 activations (CK-Tile bf16) it was given."""
+
+    id = "dispatch_bf16bound"
+    source = "aiter_bf16_bound"
+    entry = "aiter.fused_moe.fused_moe (activation-dtype bound raised)"
+    group = "dispatch_bf16bound"
+    HUGE = 1 << 62
+
+    def __init__(self):
+        self.confirmed = ""
+        self._saved = None
+
+    def prepare(self, ctx):
+        import aiter.fused_moe as fm
+
+        self._saved = (
+            fm._SWIGLU_MXFP4_BF16_BOUND,
+            os.environ.get("AITER_BF16_FP8_MOE_BOUND"),
+        )
+        fm._SWIGLU_MXFP4_BF16_BOUND = self.HUGE
+        os.environ["AITER_BF16_FP8_MOE_BOUND"] = str(self.HUGE)
+
+    def release(self, ctx):
+        import aiter.fused_moe as fm
+
+        if self._saved is None:
+            return
+        fm._SWIGLU_MXFP4_BF16_BOUND, env = self._saved
+        if env is None:
+            os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
+        else:
+            os.environ["AITER_BF16_FP8_MOE_BOUND"] = env
+        self._saved = None
+
+    def confirm(self, args, route, S):
+        """Reason the override did not take effect (None when the call ran with the
+        activations the case passed). ``args`` are the get_2stage_cfgs arguments that
+        aiter logged for the call."""
+        if not args:
+            return (
+                "no get_2stage_cfgs call recorded: cannot confirm the activation dtype"
+            )
+        if args.get("q_dtype_a") != S.aq:
+            return (
+                f"activation dtype is still {args.get('q_dtype_a')} (case passes "
+                f"{S.aq}): the bound override did not take effect"
+            )
+        self.confirmed = (
+            f"q_dtype_a={str(args['q_dtype_a']).split('.')[-1]} "
+            f"kernel1={route.get('kernel1', '')} kernel2={route.get('kernel2', '')}"
+        )
+        self.kernels = f"{route.get('kernel1', '')} + {route.get('kernel2', '')}"
+        return None
+
+
 def _is_gpu_fault(msg):
     return any(
         k in msg
@@ -304,7 +363,35 @@ class Measurer:
             if getattr(cand, "id", "") == "dispatch":
                 ctx.dispatch_args = rec.last()[0]
                 res["route"] = route
+                # the dtype aiter logged settles it; the static rule only seeds the flag
+                # the routed kernels' ``same_as`` reads
+                res["rounds_more"] = accuracy.measured_rounds_more(
+                    ctx.S, ctx.dispatch_args.get("q_dtype_a"), ctx.case.token
+                )
+                if res["rounds_more"] != getattr(ctx, "dispatch_rounds_more", ""):
+                    emit(
+                        self.fh,
+                        {
+                            "event": "log",
+                            "msg": f"{self.case_id}: static rule said "
+                            f"{bool(ctx.dispatch_rounds_more)}, measured "
+                            f"{bool(res['rounds_more'])}; using the measured one",
+                        },
+                    )
+                    ctx.dispatch_rounds_more = res["rounds_more"]
             reason = cand.verify(route) if hasattr(cand, "verify") else None
+            if reason is None and hasattr(cand, "confirm"):
+                reason = cand.confirm(
+                    rec.last()[0] if rec.records else None, route, ctx.S
+                )
+                if reason is None:
+                    emit(
+                        self.fh,
+                        {
+                            "event": "log",
+                            "msg": f"{self.case_id} {cand.id} ran: {cand.confirmed}",
+                        },
+                    )
             if reason:
                 res["outcome"] = "discarded"
                 # a route that resolved to some other real kernel is aiter declining the
@@ -324,7 +411,10 @@ class Measurer:
                     new_kernel_id=getattr(cand, "kernel_id", ""),
                 )
                 return res
-            num = accuracy.numerics_of(ctx.S, cand, route, ctx)
+            if res.get("rounds_more"):
+                num = accuracy.requested_numerics(ctx.S, route)
+            else:
+                num = accuracy.numerics_of(ctx.S, cand, route, ctx)
             variants = (
                 accuracy.in_kernel_variants(ctx.S, num)
                 if accuracy.has_in_kernel(num)
@@ -399,7 +489,12 @@ class Measurer:
                 return res
             if not acc["pass"]:
                 res["outcome"] = "fail"
-                self._emit(base, modes, status="fail", detail="accuracy rule", **cols)
+                detail = "accuracy rule"
+                if res.get("rounds_more"):
+                    detail = (
+                        f"dispatch rounds more than requested: {res['rounds_more']}"
+                    )
+                self._emit(base, modes, status="fail", detail=detail, **cols)
                 return res
             timer = Timer(call, ctx.hidden_static, self.pool)
             timer.prepare_graph()
@@ -696,6 +791,17 @@ def run_bar_group(cases, spec, fh):
         )
         ctx.dispatch_meta = ident
         ctx.dispatch_route = dry_routes.get(c.id)
+        ctx.dispatch_rounds_more = accuracy.dispatch_rounds_more(
+            S, c.token, ident["gfx"]
+        )
+        if ctx.dispatch_rounds_more:
+            emit(
+                fh,
+                {
+                    "event": "log",
+                    "msg": f"{c.id}: dispatch rounds more: {ctx.dispatch_rounds_more}",
+                },
+            )
         ctx.group_cache = group_cache
         ctx.hidden_static = hidden.clone()
         ctx.outbuf = (
@@ -729,6 +835,9 @@ def run_bar_group(cases, spec, fh):
             else:
                 d = meas.measure(DispatchCandidate(), quick=False, modes=modes)
                 results["dispatch"] = d
+            if ctx.dispatch_rounds_more:
+                lr = Bf16BoundCandidate()
+                results[lr.id] = meas.measure(lr, quick=False, modes=modes)
         elif mode_kind in ("new", "off"):
             cand = RoutedFusedMoe(off=mode_kind == "off")
             results[cand.id] = meas.measure(cand, quick=False, modes=modes)
@@ -1008,6 +1117,19 @@ def _emit_summary(
         for k in ("route_key", "kernel1", "kernel2", "route_family"):
             row["dispatch_" + k] = disp.get("route", {}).get(k, "")
         row.update(_gate("dispatch", disp.get("acc"), disp.get("numerics", "")))
+        if disp.get("rounds_more"):
+            row["dispatch_rounds_more"] = disp["rounds_more"]
+            if not disp.get("ok"):
+                row["dispatch_status"] = "rounds-more"
+    lr = results.get("dispatch_bf16bound")
+    if lr is not None:
+        row["lr_status"] = "ok" if lr.get("ok") else lr.get("outcome", "fail-or-error")
+        if lr.get("ok") and mode in lr["by_mode"]:
+            row["lr_us"] = lr["by_mode"][mode]["median_us"]
+            row["lr_id"] = lr["cand"].id
+            row["lr_kernels"] = lr["cand"].kernels
+            row["lr_confirmed"] = lr["cand"].confirmed
+        row.update(_gate("lr", lr.get("acc"), lr.get("numerics", "")))
     if kind in ("new", "off"):
         who = kind
         if ok:

@@ -616,6 +616,88 @@ def numerics_from_route(S, route):
     }
 
 
+def _act_bits():
+    from aiter import dtypes
+
+    return {
+        dtypes.bf16: 16,
+        dtypes.fp16: 16,
+        dtypes.fp8: 8,
+        dtypes.i8: 8,
+        dtypes.fp4x2: 4,
+    }
+
+
+def dispatch_rounds_more(S, M, gfx=None):
+    """Why aiter's own dispatch rounds the activations more than the case asks for ("" if
+    it does not).
+
+    A case that passes bf16 activations to a mixed-precision weight format gets them
+    quantized by ``fused_moe`` itself from a token count on: ``get_activation_dtype``
+    switches SEPARATED Swiglu a16w4 to fp4x2 at ``GPTOSS_SWIGLU_MXFP4_BF16_BOUND`` (256)
+    and INTERLEAVE Swiglu to fp8 at ``AITER_BF16_FP8_MOE_BOUND`` (gfx950). The call then
+    runs a4w4 / a8w4 math, which is not what was asked for: dispatch is scored on the
+    requested math (R2: activations and intermediate unquantized) and fails it."""
+    import aiter.fused_moe as fm
+
+    from . import workload
+
+    bits = _act_bits()
+    want = bits.get(S.aq)
+    if want != 16 or S.kind != "fused" or workload.act_dtype_override(S) is not None:
+        return ""
+    if S.act.name != "Swiglu":
+        # the Silu/Relu2 branches pick the dtype by their own rules (and later code can
+        # keep bf16 for them): only the measured dtype settles those
+        return ""
+    try:
+        got = fm.resolve_activation_dtype(
+            S.qtype,
+            S.wq,
+            activation=S.act,
+            gate_mode=S.gate_mode,
+            M=M,
+            hidden_dtype=S.dtype,
+            gfx=gfx,
+        )
+    except Exception:  # noqa: BLE001  (a combination aiter has no activation rule for)
+        return ""
+    if got is None or bits.get(got, 16) >= want:
+        return ""
+    short = {16: "bf16", 8: "fp8", 4: "fp4x2"}
+    return (
+        f"activations requested {short[want]}, dispatched as {short[bits[got]]} "
+        f"(M={M}, gate_mode={S.gate_mode}); the call runs a4w4/a8w4 math, scored on "
+        "the requested math"
+    )
+
+
+def measured_rounds_more(S, q_dtype_a, M):
+    """The same judgement from the activation dtype aiter logged for a real call."""
+    bits = _act_bits()
+    want, got = bits.get(S.aq), bits.get(q_dtype_a)
+    if want != 16 or got is None or got >= want:
+        return ""
+    short = {16: "bf16", 8: "fp8", 4: "fp4x2"}
+    return (
+        f"activations requested {short[want]}, dispatched as {short[got]} (M={M}, "
+        f"gate_mode={S.gate_mode}); the call runs a4w4/a8w4 math, scored on the "
+        "requested math"
+    )
+
+
+def requested_numerics(S, route=None):
+    """The math the case asks for when it passes bf16 activations: nothing quantized, the
+    intermediate unquantized (R2). The combine is the route's own."""
+    return {
+        "act_quant": "none",
+        "inter": "bf16",
+        "inter_quant": "none",
+        "combine": combine_of_route(route),
+        "out_dtype": out_dtype_name(S),
+    }
+
+
 def numerics_of(S, cand, route, ctx=None):
     """Rounding points to score a candidate on.
 
@@ -634,6 +716,9 @@ def numerics_of(S, cand, route, ctx=None):
                 "kernel declares same_as the dispatched path but the case's "
                 "dispatch route is unknown"
             )
+        if getattr(ctx, "dispatch_rounds_more", ""):
+            # dispatch rounds more than requested: our kernels match the requested math
+            return requested_numerics(S, base)
         return numerics_from_route(S, base)
     return normalize_numerics(S, declared)
 
