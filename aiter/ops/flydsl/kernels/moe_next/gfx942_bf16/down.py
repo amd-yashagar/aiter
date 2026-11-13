@@ -54,12 +54,15 @@ def compile_down(
     DOWEIGHT=False,
     W_CACHE=0,
     COALESCE=True,
+    PARTS=1,
 ):
     """N = model_dim, K = inter_dim. Each wave walks NBD channel blocks with W2
     prefetched PWD blocks ahead; the tile's intermediate rows are staged once
     per workgroup in LDS. COALESCE transposes each wave's NBD x 16 output
     channels through LDS so every lane writes (or adds) whole dwords of one row
-    with neighbouring lanes on neighbouring addresses."""
+    with neighbouring lanes on neighbouring addresses. PARTS > 1 splits each
+    tile of the tile map into PARTS row parts of S_MAX * 16 rows, one workgroup
+    each (grid y = tiles * PARTS), for tiles whose rows do not fit LDS at once."""
     assert K % 64 == 0 and N % (16 * NBD * WAVES) == 0
     KSTEPS = K // 64
     NTHR = 64 * WAVES
@@ -89,7 +92,8 @@ def compile_down(
     ):
         tid = gpu.thread_idx.x
         bx = gpu.block_idx.x
-        t = gpu.block_idx.y
+        t = gpu.block_idx.y // PARTS
+        part = gpu.block_idx.y % PARTS
         lane = tid % 64
         wave = tid // 64
         c = lane % 16
@@ -101,8 +105,9 @@ def compile_down(
             o_lds = a_lds
             o_base = wave * TR_WAVE
             e = load_s1(p_live, t * 3)
-            r0 = load_s1(p_live, t * 3 + 1)
-            real = load_s1(p_live, t * 3 + 2)
+            r0 = load_s1(p_live, t * 3 + 1) + part * (S_MAX * 16)
+            real = load_s1(p_live, t * 3 + 2) - part * (S_MAX * 16)
+            real = (real < S_MAX * 16).select(real, fx.Int32(S_MAX * 16))
             n_sub = (real + 15) // 16
             nb0 = (bx * WAVES + wave) * NBD
             w_rs = rsrc(
@@ -277,7 +282,7 @@ def compile_down(
         bf16_down(
             p_inter, p_w, p_out, p_sorted_ids, p_sorted_w, p_live, p_nlive, M
         ).launch(
-            grid=(N // (16 * NBD * WAVES), tiles, 1),
+            grid=(N // (16 * NBD * WAVES), tiles * PARTS, 1),
             block=(NTHR, 1, 1),
             stream=stream,
         )

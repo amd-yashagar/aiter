@@ -42,6 +42,7 @@ def _configs(gpu):
 @dataclass(frozen=True)
 class _Tile:
     tile_m: int
+    down_rows: int
     gu_waves: int
     ch: int
     ks: int
@@ -72,11 +73,16 @@ def _tile(config, gpu, model_dim, inter_dim):
     while nbd > 1 and model_dim % (16 * nbd * waves):
         nbd //= 2
     tile_m = int(cfg.get("tile_m", 32))
-    # Down stages the tile's intermediate rows in LDS.
-    while tile_m > 16 and tile_m * (inter_dim * 2 + 16) > _LDS_BYTES:
-        tile_m //= 2
+    # Gate/Up stages tile_m token rows of CH K steps per K group in LDS.
+    while ch > 1 and ks * tile_m * (ch * 128 + 16) > _LDS_BYTES:
+        ch //= 2
+    # Down stages a part of the tile's intermediate rows in LDS.
+    down_rows = min(tile_m, int(cfg.get("down_rows", tile_m)))
+    while down_rows > 16 and down_rows * (inter_dim * 2 + 16) > _LDS_BYTES:
+        down_rows //= 2
     return _Tile(
         tile_m,
+        down_rows,
         gw,
         ch,
         ks,
@@ -119,7 +125,7 @@ def _gateup(I, K, s_max, waves, ch, ks, pw, pa, w_cache, act, g1u1, doweight):
 
 
 @functools.cache
-def _down(N, K, topk, s_max, nbd, waves, pwd, rows, doweight, w_cache, coalesce):
+def _down(N, K, topk, s_max, nbd, waves, pwd, rows, doweight, w_cache, coalesce, parts):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_bf16.down import compile_down
 
     return compile_down(
@@ -134,6 +140,7 @@ def _down(N, K, topk, s_max, nbd, waves, pwd, rows, doweight, w_cache, coalesce)
         DOWEIGHT=doweight,
         W_CACHE=w_cache,
         COALESCE=coalesce,
+        PARTS=parts,
     )
 
 
@@ -226,7 +233,7 @@ class Gfx942Bf16Mid(MoeKernel):
             D,
             I,
             topk,
-            s_max,
+            t.down_rows // 16,
             t.nbd,
             t.waves,
             t.pwd,
@@ -234,6 +241,7 @@ class Gfx942Bf16Mid(MoeKernel):
             dw,
             t.w_cache,
             t.coalesce,
+            t.tile_m // t.down_rows,
         )
         return gu, dn
 

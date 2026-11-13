@@ -12,6 +12,20 @@
     "down_pw": 2,
     "down_coalesce": true
   },
-  "m16": {"tile_m": 16},
-  "m64": {"tile_m": 64}
+  "m16": {
+    "tile_m": 16
+  },
+  "m64": {
+    "tile_m": 64
+  },
+  "m128": {
+    "tile_m": 128
+  },
+  "p128": {
+    "tile_m": 128,
+    "gateup_waves": 8,
+    "gateup_ch": 1,
+    "down_nbd": 4,
+    "down_rows": 32
+  }
 }
