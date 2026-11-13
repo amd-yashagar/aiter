@@ -329,3 +329,107 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
             out = torch.empty((M, D), dtype=torch.bfloat16, device=x.device)
         _sorted_sum(topk, D)(loc_ids, rows, out, M)
         return out
+
+
+@functools.cache
+def _decode_gateup(N, K, topk, act):
+    from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_block.decode import (
+        compile_decode_gateup,
+    )
+
+    return compile_decode_gateup(N=N, K=K, TOPK=topk, activation=act)
+
+
+@functools.cache
+def _decode_down(N, K, topk):
+    from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_block.decode import (
+        compile_decode_down,
+    )
+
+    return compile_decode_down(N=N, K=K, TOPK=topk)
+
+
+def _i32_ptr(t):
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+
+    return flyc.from_c_void_p(fx.Int32, t.data_ptr())
+
+
+@register_kernel
+class Gfx942Fp8BlockDecode(Gfx942Fp8BlockPrefill):
+    """Direct-routed decode: no sort. Stage 1 runs per (route, column tile) and
+    writes the FP32 activation output; stage 2 runs per (token, column tile),
+    quantizes the token's routes per 128 in LDS and sums them in FP32."""
+
+    id = "gfx942_fp8_block.decode"
+    routing = "direct"
+    epilogue = "reduce"
+    # Every route of a token is summed in FP32 registers and rounded to bf16 once.
+    numerics: ClassVar[dict] = {
+        "act_quant": "per_1x128_fp8",
+        "inter": "fp32_direct",
+        "combine": "fp32_reduce",
+    }
+    MAX_ROUTES = 1024
+
+    def supports(self, spec, m, topk, call=None):
+        why = super().supports(spec, m, topk, call)
+        if why:
+            return why
+        if spec.model_dim % 512:
+            return "model_dim % 512 (stage 1 splits K over 4 waves)"
+        if m * topk > self.MAX_ROUTES:
+            return "direct routing is for decode (M * topk <= 1024)"
+        return None
+
+    def warmup(self, weights, m, topk, config):
+        import flydsl.compiler as flyc
+        import flydsl.expr as fx
+
+        spec = weights.spec
+        D, I = spec.model_dim, spec.inter_dim
+        with compile_only():
+            g = _decode_gateup.__wrapped__(2 * I, D, topk, _ACTS[spec.act])
+            types = (fx.Int32, fx.Int32, fx.Float32, fx.Int32, fx.Float32)
+            g(*[flyc.from_c_void_p(t, 0) for t in types], m, fx.Stream(None))
+            d = _decode_down.__wrapped__(D, I, topk)
+            types = (fx.Float32, fx.Int32, fx.Float32, fx.Int32, fx.Float32, fx.Int32)
+            d(*[flyc.from_c_void_p(t, 0) for t in types], m, fx.Stream(None))
+
+    def __call__(self, call):
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
+        from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+
+        spec = call.spec
+        x = call.hidden_states
+        M, D, I, topk = call.m, spec.model_dim, spec.inter_dim, call.topk
+        ids = call.topk_ids.to(torch.int32).contiguous()
+        tw = call.topk_weight.to(torch.float32).contiguous()
+        inter = torch.empty((M * topk, I), dtype=torch.float32, device=x.device)
+        out = call.output
+        if out is None:
+            out = torch.empty((M, D), dtype=torch.bfloat16, device=x.device)
+        stream = torch.cuda.current_stream()
+        _run_compiled(
+            _decode_gateup(2 * I, D, topk, _ACTS[spec.act]),
+            _i32_ptr(x),
+            _i32_ptr(call.w1),
+            _ptr(call.w1_scale),
+            _ptr(ids),
+            _ptr(inter),
+            M,
+            stream,
+        )
+        _run_compiled(
+            _decode_down(D, I, topk),
+            _ptr(inter),
+            _i32_ptr(call.w2),
+            _ptr(call.w2_scale),
+            _ptr(ids),
+            _ptr(tw),
+            _i32_ptr(out),
+            M,
+            stream,
+        )
+        return out
