@@ -37,6 +37,7 @@ from aiter.fused_moe import (
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
     asm_stage1,
+    asm_stage1_refusal,
     cktile_moe_stage1,
     cktile_moe_stage2,
     fused_moe,
@@ -3182,6 +3183,8 @@ class FmoeTuner(TunerCommon):
                 continue
 
             for el in asm_kernels_1stage.get((tile_m, tile_n, 0), []):
+                if asm_stage1_refusal(el, token, _gfx) is not None:
+                    continue
                 # Only no_sort/emsort consume raw topk. Post-reduce candidates
                 # time the sorted-input producer and its reduction together.
                 flat_flag = int(asm_1stage_flat.get(el, AsmMoeMode.SORTED))
@@ -3421,6 +3424,8 @@ class FmoeTuner(TunerCommon):
             ):
                 for el in asm_kernels.get(blockM, []):
                     if _is_tune_excluded_kernel(el):
+                        continue
+                    if asm_stage1_refusal(el, token, _gfx) is not None:
                         continue
                     tasks.append(
                         (

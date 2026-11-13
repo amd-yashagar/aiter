@@ -4804,6 +4804,15 @@ def get_2stage_cfgs(
                 f"unsupported {unsupported}; using default heuristics"
             )
 
+    if cfg is not None:
+        refusal = asm_stage1_refusal(cfg.get("kernelName1", ""), token, gfx)
+        if refusal is not None:
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding tuned ASM config for {keys}: {refusal}; "
+                "using default heuristics"
+            )
+
     use_non_temporal_load = False
     if cfg is None or bypass_tuned_config:
         ksplit = 0
@@ -6161,6 +6170,63 @@ def torch_moe_act(act_input, torch_act, inter_dim, activation=None):
         return torch_act(gate) * up
 
 
+# MOEBUG-064: several ASM per-token fp8 MoE kernels return wrong or non-finite results, intermittently or on
+# every launch (identical inputs give different wrong blocks on each replay). Zeroing or poisoning the output,
+# the sort padding, num_valid_ids or moe_buf does not change it, so the kernels themselves are faulty and are
+# refused at the token counts where a failure was seen (below those, the shipped rows that verified clean keep
+# running). Keys are kernel names without the ``_ZN5aiter<n>`` prefix and the ``E`` suffix, stage-1 kernels as
+# ``<tile_m>x<tile_n>[_<n>tg]_pf<k>`` and the 1-stage kernel as ``1stage:<name>``; values are the smallest token
+# count with a failure on that arch (MI300X/MI325X for gfx942, MI355X for gfx950).
+_ASM_KERNEL_RE = re.compile(
+    r"(?:fmoe_stage1_bf16_pertokenFp8_g1u1_(?P<s1>\d+x\d+(?:_\d+tg)?_pf\d)"
+    r"|fmoe_bf16_pertokenFp8_g1u1_(?P<s0>tkw1_silu_1tg_32x64))E$"
+)
+_ASM_BAD_MIN_TOKEN = {
+    "gfx942": {
+        "16x64_5tg_pf3": 32,
+        "32x64_4tg_pf2": 512,
+        "32x64_4tg_pf3": 16,
+        "64x64_2tg_pf3": 32,
+        "64x64_3tg_pf2": 4096,
+        "128x64_pf2": 4096,  # MI325X only (not reproduced on MI300X)
+        "128x64_pf3": 4096,  # MI325X only (not reproduced on MI300X)
+        "32x128_3tg_pf2": 8,
+        "32x256_2tg_pf2": 16,
+    },
+    "gfx950": {
+        "16x64_5tg_pf3": 4096,
+        "32x64_4tg_pf2": 4096,
+        "32x64_4tg_pf3": 4096,
+        "64x64_2tg_pf3": 4096,
+        "64x64_3tg_pf2": 4096,
+        "128x64_pf2": 4096,
+        "128x64_pf3": 4096,
+        "64x128_2tg_pf3": 256,
+        "32x128_3tg_pf2": 8,
+        "32x256_2tg_pf2": 16,
+        "1stage:tkw1_silu_1tg_32x64": 1,
+    },
+}
+
+
+def asm_stage1_refusal(kernel_name, token, gfx=None):
+    """Why this ASM kernel must not run at ``token`` rows on ``gfx``, or None when it may."""
+    if not isinstance(kernel_name, str):
+        return None
+    m = _ASM_KERNEL_RE.search(kernel_name)
+    if m is None:
+        return None
+    key = m.group("s1") or f"1stage:{m.group('s0')}"
+    gfx = get_gfx_runtime() if gfx is None else gfx
+    min_token = _ASM_BAD_MIN_TOKEN.get(gfx, {}).get(key)
+    if min_token is None or token < min_token:
+        return None
+    return (
+        f"ASM MoE kernel {key} returns wrong or non-finite results on {gfx} "
+        f"at token >= {min_token} (MOEBUG-064), got token={token}"
+    )
+
+
 def asm_stage1(
     input,
     w1,
@@ -6192,6 +6258,9 @@ def asm_stage1(
         out = out.view(dtype)
     device = out.device
     token_num, _, _ = out.shape
+    refusal = asm_stage1_refusal(kernelName, token_num)
+    if refusal is not None:
+        raise NotImplementedError(refusal)
     E, _model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
     if quant_type == QuantType.per_Tensor:
