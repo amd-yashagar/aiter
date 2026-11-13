@@ -5946,6 +5946,22 @@ def get_2stage_cfgs(
                 )
 
         _require_gated_2stage(use_g1u1, keys)
+        if (
+            not kernelName1
+            and gfx == "gfx942"
+            and q_dtype_w == dtypes.fp8
+            and q_type in (QuantType.per_Tensor, QuantType.per_Token)
+        ):
+            # The default A8W8 instances tile N and K by 64 (stage 2) and K by 256 for
+            # block_m 16 or 128 otherwise (stage 1); CK refuses any other size with
+            # "device_gemm ... does not support this GEMM problem".
+            _k1 = 256 if block_m == 16 else 128
+            if inter_dim % 64 != 0 or model_dim % _k1 != 0:
+                raise NotImplementedError(
+                    f"CK fp8 {q_type.name} 2-stage on gfx942 needs inter_dim % 64 == 0 "
+                    f"and model_dim % {_k1} == 0 at block_m {block_m} "
+                    f"(got inter_dim={inter_dim}, model_dim={model_dim})"
+                )
         if kernelName2 and kernelName2.startswith("flydsl_"):
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
