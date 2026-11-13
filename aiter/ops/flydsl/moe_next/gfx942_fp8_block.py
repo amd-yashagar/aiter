@@ -76,13 +76,19 @@ def _gateup(N, K, topk, block_m, block_n, act, out_fp8, a_bf16):
 
 
 @functools.cache
-def _down(N, K, topk, block_m, n_split, down_m):
+def _down(N, K, topk, block_m, n_split, down_m, rows_nt=False):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_block.down import compile_down
 
     while n_split > 1 and (N // 64) % (2 * n_split):
         n_split //= 2
     return compile_down(
-        N=N, K=K, TOPK=topk, BLOCK_M=down_m, N_SPLIT=n_split, SORT_BLOCK_M=block_m
+        N=N,
+        K=K,
+        TOPK=topk,
+        BLOCK_M=down_m,
+        N_SPLIT=n_split,
+        SORT_BLOCK_M=block_m,
+        ROWS_NT=rows_nt,
     )
 
 
@@ -193,7 +199,8 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
                 fx.Float32,
             )
             gu(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
-            dn = _down.__wrapped__(D, I, topk, block_m, n_split, down_m)
+            rows_nt = self._cfg_flag(weights, config, "rows_nt")
+            dn = _down.__wrapped__(D, I, topk, block_m, n_split, down_m, rows_nt)
             types = (
                 fx.Uint8,
                 fx.Uint8,
@@ -208,8 +215,14 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
             dn(*[flyc.from_c_void_p(t, 0) for t in types], m, 1, fx.Stream(None))
 
     def _inline_a_quant(self, weights, config):
+        return self._cfg_flag(weights, config, "inline_a_quant")
+
+    def _cfg_flag(self, weights, config, key):
+        return bool(self._cfg_value(weights, config, key) or False)
+
+    def _cfg_value(self, weights, config, key):
         cfg = _configs(self._gpu(weights)).get(config or "default", {})
-        return bool(cfg.get("inline_a_quant", False))
+        return cfg.get(key)
 
     def __call__(self, call):
         from aiter.fused_moe import AUX_SORT_OPUS, moe_sorting
@@ -228,25 +241,49 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
         act = _ACTS[spec.act]
         topk_ids = call.topk_ids.to(torch.int32)
         topk_weight = call.topk_weight.to(torch.float32)
-        sorted_ids, sorted_w, sorted_eids, num_valid, _, _, loc_ids = moe_sorting(
-            topk_ids,
-            topk_weight,
-            E,
-            D,
-            x.dtype,
-            block_m,
-            None,
-            None,
-            0,
-            accumulate=False,
-            output_aux=AUX_SORT_OPUS,
-        )
-        quant = aiter.get_hip_quant(QuantType.per_1x128)
         a_bf16 = self._inline_a_quant(w, call.config)
-        if a_bf16:
-            xq, xs = x, torch.empty(1, dtype=torch.float32, device=x.device)
+        if self._cfg_value(w, call.config, "sort") == "core":
+            from aiter.ops.flydsl.moe_next.core.tile_map import route_to_tiles
+
+            # One launch sorts the routes and applies the per_1x128 activation quant.
+            tm = route_to_tiles(
+                topk_ids,
+                topk_weight,
+                num_experts=E,
+                tile_m=block_m,
+                with_loc_ids=True,
+                quant_input=None if a_bf16 else x,
+                quant_mode=None if a_bf16 else "per_1x128_fp8",
+            )
+            sorted_ids, sorted_w = tm.sorted_token_ids, tm.sorted_weights
+            sorted_eids, num_valid, loc_ids = (
+                tm.sorted_expert_ids,
+                tm.num_valid_ids,
+                tm.loc_ids,
+            )
+            if a_bf16:
+                xq, xs = x, torch.empty(1, dtype=torch.float32, device=x.device)
+            else:
+                xq, xs = tm.a_q, tm.a_scale
         else:
-            xq, xs = quant(x, quant_dtype=dtypes.fp8)
+            sorted_ids, sorted_w, sorted_eids, num_valid, _, _, loc_ids = moe_sorting(
+                topk_ids,
+                topk_weight,
+                E,
+                D,
+                x.dtype,
+                block_m,
+                None,
+                None,
+                0,
+                accumulate=False,
+                output_aux=AUX_SORT_OPUS,
+            )
+            quant = aiter.get_hip_quant(QuantType.per_1x128)
+            if a_bf16:
+                xq, xs = x, torch.empty(1, dtype=torch.float32, device=x.device)
+            else:
+                xq, xs = quant(x, quant_dtype=dtypes.fp8)
         tasks = int(sorted_eids.shape[0])
         aq = torch.empty((M * topk, I), dtype=dtypes.fp8, device=x.device)
         as_ = torch.empty((M * topk, I // 128), dtype=torch.float32, device=x.device)
@@ -266,7 +303,15 @@ class Gfx942Fp8BlockPrefill(MoeKernel):
         )
         rows = torch.empty((tasks * block_m, D), dtype=torch.bfloat16, device=x.device)
         _launch(
-            _down(D, I, topk, block_m, n_split, down_m),
+            _down(
+                D,
+                I,
+                topk,
+                block_m,
+                n_split,
+                down_m,
+                self._cfg_flag(w, call.config, "rows_nt"),
+            ),
             aq,
             call.w2,
             rows,

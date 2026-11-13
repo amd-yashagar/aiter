@@ -29,5 +29,27 @@
   "down_n_split": 2,
   "down_block_m": 64,
   "inline_a_quant": true
+ },
+ "prefill-rows-nt": {
+  "block_m": 128,
+  "block_n": 256,
+  "down_n_split": 2,
+  "down_block_m": 64,
+  "rows_nt": true
+ },
+ "prefill-core-sort": {
+  "block_m": 128,
+  "block_n": 256,
+  "down_n_split": 2,
+  "down_block_m": 64,
+  "sort": "core"
+ },
+ "prefill-core-sort-rows-nt": {
+  "block_m": 128,
+  "block_n": 256,
+  "down_n_split": 2,
+  "down_block_m": 64,
+  "sort": "core",
+  "rows_nt": true
  }
 }

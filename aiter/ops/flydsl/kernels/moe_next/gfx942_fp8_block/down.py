@@ -26,7 +26,7 @@ from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _f32_to_bf1
 SCALE_BLOCK = 128
 
 
-def compile_down(*, N, K, TOPK, BLOCK_M, N_SPLIT=1, SORT_BLOCK_M=None):
+def compile_down(*, N, K, TOPK, BLOCK_M, N_SPLIT=1, SORT_BLOCK_M=None, ROWS_NT=False):
     """N = model_dim, K = inter_dim. A workgroup takes BLOCK_M rows of a sorted tile
     of SORT_BLOCK_M rows (sub-blocking) and 1 / N_SPLIT of its N tiles."""
     SORT_BLOCK_M = SORT_BLOCK_M or BLOCK_M
@@ -268,7 +268,11 @@ def compile_down(*, N, K, TOPK, BLOCK_M, N_SPLIT=1, SORT_BLOCK_M=None):
                 fx.copy(copy_atom_, fragC_bf16r, thrv_ldsCt[None, None, None, ldsc_idx])
 
             arg_p_output = fx.flat_divide(arg_p_output, (BLOCK_M, BLOCK_N))
-            cp_atom_out_128b = flyobj.get_buffer_copy_atom(fx.BFloat16, 128)
+            # The rows are read once, by the combine: ROWS_NT stores them non-temporal
+            # so they do not evict W2 from L2 and MALL.
+            cp_atom_out_128b = fx.make_copy_atom(
+                fx.rocdl.BufferCopy128b(2 if ROWS_NT else 0), fx.BFloat16
+            )
             thrv_out = tcopyLDS.partition_D(arg_p_output)
             fragOut = fx.make_fragment_like(thrv_ldsC[None, None, None, 0])
 
