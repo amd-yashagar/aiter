@@ -17,6 +17,7 @@ import sys
 import traceback
 from pathlib import Path
 
+from .candidates import HarnessError
 from .worker import _err, _num_local, emit
 
 SKIP_STATUS = ("unsupported", "invalid", "oom")
@@ -420,6 +421,7 @@ class Measurer:
             case_id=self.case_id,
             cand_id=cand.id,
             phase=phase,
+            tag=getattr(cand, "tag", ""),
         )
         res = {"ok": False, "us": None, "cand": cand}
         try:
@@ -584,6 +586,8 @@ class Measurer:
                 res["host_us"] = _host_us(call)
             for m in modes:
                 st = timer.time(cold=(m == "cold"), quick=quick)
+                if hasattr(cand, "adjust_timing"):
+                    st = cand.adjust_timing(st, m == "cold", quick)
                 res.setdefault("by_mode", {})[m] = st
                 self._emit(
                     base,
@@ -606,6 +610,12 @@ class Measurer:
         except accuracy.UnknownNumericsKey as e:
             emit(self.fh, {"event": "harness_stale", "msg": str(e)})
             os._exit(75)
+        except HarnessError as e:
+            # the harness could not run or check this candidate (not a kernel verdict):
+            # never a quiet drop, and the case's bar says it is incomplete
+            res["outcome"] = "harness_error"
+            self._emit(base, modes, status="harness-error", detail=_err(e))
+            return res
         except Exception as e:  # noqa: BLE001
             from . import prebuild
 
@@ -701,6 +711,8 @@ class Measurer:
             cand.probe_route("capture")
         res["timing_mode"] = timer.mode
         st = timer.time(cold=False, quick=True)
+        if hasattr(cand, "adjust_timing"):
+            st = cand.adjust_timing(st, False, True)
         res["by_mode"] = {"warm": st}
         self._emit(
             base,
@@ -889,6 +901,7 @@ def run_bar_group(cases, spec, fh):
         ctx = candidates.Ctx(
             c, S, aw, bias, mask, hidden, tw, ti, nlt, n_valid, kw, tmpdir
         )
+        ctx.ref_weights = rw
         ctx.dispatch_meta = ident
         ctx.dispatch_route = dry_routes.get(c.id)
         ctx.dispatch_rounds_more = accuracy.dispatch_rounds_more(
@@ -1182,6 +1195,11 @@ def _accounting(enum_counts, stats, enum_errors, kind):
                 f"{k}: {t['unnamed']} candidates resolved to an unnamed impl "
                 "('<lambda>'), the router check cannot tell what ran"
             )
+        if t.get("harness_error", 0) > 0:
+            reasons.append(
+                f"{k}: {t['harness_error']} candidates could not be run or checked by the "
+                "harness (harness-error rows): a harness error, the bar misses them"
+            )
         if t.get("aotmiss", 0) > 0:
             reasons.append(
                 f"{k}: {t['aotmiss']} candidates hit no usable AOT cache (FlyDSL not "
@@ -1303,6 +1321,9 @@ def _emit_summary(
             bar_entry=d["entry"],
             bar_kernels=d["kernels"],
             bar_timing_mode=best.get("timing_mode", ""),
+            bar_tag=getattr(best["cand"], "tag", ""),
+            bar_raw_us=best["by_mode"][mode].get("raw_us", ""),
+            bar_topk_us=best["by_mode"][mode].get("topk_us", ""),
         )
         row.update(_gate("bar", best.get("acc"), best.get("numerics", "")))
         _add_review(row, ok, results, mode)
@@ -1329,6 +1350,7 @@ def main(argv=None):
 
     gpu_claim.watch_claim()
     prebuild.forbid_builds()
+    prebuild.use_triton_cache()
     ap = argparse.ArgumentParser()
     ap.add_argument("--group", required=True)
     ap.add_argument("--out", required=True)

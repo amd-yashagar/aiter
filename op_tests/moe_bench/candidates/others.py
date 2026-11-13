@@ -22,9 +22,9 @@ class _Skipped(Source):
 class TritonMoe(_Skipped):
     name = "triton_moe"
     reason = (
-        "not implemented: aiter/ops/triton/moe/* are grouped GEMMs (a16w4, a4w4, a8w4, "
-        "a8w8 fnuz/MX, a8w8_blockscale, int8_smoothquant); an end-to-end wrapper "
-        "(routing from topk ids, gemm1+swiglu, gemm2, reduce) is still to be written"
+        "not implemented except the a16w4 gluon side API (source triton_gluon): "
+        "aiter/ops/triton/moe/* a4w4, a8w4, a8w8 fnuz/MX, a8w8_blockscale and "
+        "int8_smoothquant are grouped GEMMs without an end-to-end wrapper here"
     )
 
 

@@ -18,6 +18,12 @@ import importlib
 REGISTRY = {}
 
 
+class HarnessError(RuntimeError):
+    """A candidate could not be run or checked for a reason that is the harness's, not the
+    kernel's: its row is a ``harness-error`` and the case's bar says it is incomplete.
+    """
+
+
 class Ctx:
     """Everything a candidate needs for one case; built by the bar worker."""
 
@@ -96,7 +102,7 @@ def register(cls):
 
 
 def load_sources(names, modules=()):
-    from . import fused_cfg, others  # noqa: F401  (register built-ins)
+    from . import fused_cfg, gluon_a16w4, others  # noqa: F401  (register built-ins)
 
     for m in modules:
         importlib.import_module(m)

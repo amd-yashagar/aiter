@@ -32,6 +32,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from .candidates import HarnessError
+
 STATIC = ("module_aiter_core", "module_moe_asm", "module_moe_fmoe_asm", "module_quant")
 NO_BUILD_ENV = "MOE_BENCH_NO_BUILD"
 COMPILE_FAILED = "failed !!!!!!"  # aiter.jit.core.raise_build_error
@@ -804,6 +806,91 @@ def forbid_builds():
         raise NotPrebuilt(md_name)
 
     core.build_module = refuse
+
+
+TRITON_COMPILE_ENV = "MOE_BENCH_TRITON_COMPILE"
+
+
+def triton_cache_dir():
+    """The persistent Triton cache every bar worker and the warm lease share:
+    ``TRITON_CACHE_DIR`` when set, else ``triton-cache`` next to the prebuild state."""
+    return os.environ.get("TRITON_CACHE_DIR") or os.path.join(
+        state_dir(), "triton-cache"
+    )
+
+
+def use_triton_cache():
+    d = triton_cache_dir()
+    os.makedirs(d, exist_ok=True)
+    os.environ["TRITON_CACHE_DIR"] = d
+    return d
+
+
+def triton_run_only():
+    """A leased (run-only) run that was not told to compile Triton kernels."""
+    run_only = (
+        os.environ.get(NO_BUILD_ENV) == "1"
+        or os.environ.get("FLYDSL_RUNTIME_RUN_ONLY") == "1"
+    )
+    return run_only and os.environ.get(TRITON_COMPILE_ENV) != "1"
+
+
+class TritonNotCached(HarnessError):
+    """A leased run reached a Triton kernel that is not in the persistent cache."""
+
+    def __init__(self, kernel):
+        super().__init__(
+            f"Triton kernel {kernel} is not in the cache {triton_cache_dir()} and a leased "
+            f"run must not compile: run `python -m op_tests.moe_bench.triton_warm` first "
+            f"(one short lease under timeout)"
+        )
+        self.kernel = kernel
+
+
+_TRITON_GUARD = {"saved": None}
+
+
+def forbid_triton_compiles():
+    """Make a Triton cache miss raise ``TritonNotCached`` instead of compiling. Triton
+    compiles through ``ASTSource.make_ir`` only after its cache lookup missed, so refusing
+    there leaves every cached kernel untouched. Returns False when this Triton has no such
+    hook (the caller must not run unguarded). Undo with ``restore_triton_compiles``."""
+    if _TRITON_GUARD["saved"] is not None:
+        return True
+    try:
+        from triton.compiler import compiler as tc
+    except ImportError:
+        return False
+    classes = [tc.ASTSource]
+    try:
+        from triton.experimental.gluon._runtime import GluonASTSource
+
+        classes.append(GluonASTSource)
+    except ImportError:
+        pass
+    if not all(callable(getattr(c, "make_ir", None)) for c in classes):
+        return False
+    saved = [(c, c.__dict__.get("make_ir")) for c in classes]
+
+    def refuse(self, *a, **k):
+        raise TritonNotCached(getattr(self, "name", "?"))
+
+    for c in classes:
+        c.make_ir = refuse
+    _TRITON_GUARD["saved"] = saved
+    return True
+
+
+def restore_triton_compiles():
+    saved = _TRITON_GUARD["saved"]
+    if saved is None:
+        return
+    for c, orig in saved:
+        if orig is None:
+            del c.make_ir
+        else:
+            c.make_ir = orig
+    _TRITON_GUARD["saved"] = None
 
 
 def free_gb(path):
