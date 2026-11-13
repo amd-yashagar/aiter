@@ -5074,7 +5074,12 @@ def get_2stage_cfgs(
     # The "layout" opus stage 2 reads the quantized intermediate and scales that its
     # paired opus or FlyDSL stage 1 writes; the plain one takes any bf16 stage 1.
     is_opus2_layout = is_opus2 and "layout" in kernelName2
-    if is_opus1 or is_flydsl1 or is_flydsl2 or (is_cktile1 and is_opus2):
+    if (
+        is_opus1
+        or is_flydsl1
+        or is_flydsl2
+        or (is_cktile1 and kernelName2 and not is_cktile2)
+    ):
         if not (is_opus1 or is_flydsl1) and (is_flydsl2_layout or is_opus2_layout):
             raise NotImplementedError(
                 f"Stage 1 {kernelName1!r} cannot feed the layout stage 2 "
@@ -5082,6 +5087,14 @@ def get_2stage_cfgs(
                 "intermediate and scales that their paired FlyDSL or opus stage 1 "
                 f"writes (token={token}, model_dim={model_dim}, inter_dim={inter_dim}, "
                 f"expert={expert}, topk={topk})."
+            )
+        if is_cktile1 and kernelName2 and not (is_flydsl2 or is_cktile2 or is_opus2):
+            raise NotImplementedError(
+                f"CK-Tile stage 1 {kernelName1!r} has no verified pairing with the "
+                f"CK stage 2 {kernelName2!r}: it ran but returned a wrong result "
+                f"(logits_diff 1.0 on gfx950 a8w4), and the CK a8w4 Swiglu module "
+                f"cannot be built (token={token}, model_dim={model_dim}, "
+                f"inter_dim={inter_dim}, expert={expert}, topk={topk})."
             )
         if is_asm1:
             raise NotImplementedError(

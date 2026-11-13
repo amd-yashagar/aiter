@@ -37,6 +37,10 @@ ASM_STAGE1 = "_ZN5aiter56fmoe_stage1_bf16_pertokenFp8_doweight_g1u1_32x64_4tg_pf
 FLY_S1 = "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w4_gui_fp8"
 FLY_S2 = "flydsl_moe2_afp8_wfp4_bf16_t32x128x128_atomic_bnt2"
 FLY_S2_LAYOUT = "flydsl_moe2_layout_afp8_wfp4_bf16_t32x128x128_atomic_nt_sbm32"
+CK_A8W4_S2 = (
+    "moe_ck2stages_gemm2_256x32x128x128_1x4_MulABScaleExpertWeightShuffled_v3_"
+    "Nswizzle0_Quant3_MulRoutedWeight1_FP4X2_FP4X2_B16"
+)
 OPUS_PLAIN = "opus_moe2_afp8_wfp4_fp8_t32x256x256_sbm32_occ4_rbn2240"
 OPUS_LAYOUT = "opus_moe2_layout_afp8_wfp4_fp8_t32x256x256_sbm32_occ4_rbn2240"
 CK_S1 = (
@@ -138,6 +142,7 @@ def test_cktile_stage1_with_plain_opus_stage2_runs_the_opus_stage2(
     [
         (CKTILE, FLY_S2_LAYOUT),
         (CKTILE, OPUS_LAYOUT),
+        (CKTILE, CK_A8W4_S2),
         (ASM_STAGE1, FLY_S2),
         (ASM_STAGE1, FLY_S2_LAYOUT),
         (CK_S1, FLY_S2_LAYOUT),
