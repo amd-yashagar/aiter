@@ -177,5 +177,60 @@
     "down_nbd": 2,
     "gateup_waves": 2,
     "sort_pad_rows": false
+  },
+  "m32nbd2kc": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "down_kc": true
+  },
+  "m32gw2kc": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_waves": 2,
+    "down_kc": true
+  },
+  "m32gw8kc": {
+    "tile_m": 32,
+    "down_nbd": 2,
+    "gateup_waves": 8,
+    "down_kc": true
+  },
+  "m64nbd2kc": {
+    "tile_m": 64,
+    "down_nbd": 2,
+    "down_kc": true
+  },
+  "m64gw8kc": {
+    "tile_m": 64,
+    "down_nbd": 2,
+    "gateup_waves": 8,
+    "down_kc": true
+  },
+  "m128nbd2kc": {
+    "tile_m": 128,
+    "down_nbd": 2,
+    "down_kc": true
+  },
+  "m128gw8kc": {
+    "tile_m": 128,
+    "down_nbd": 2,
+    "gateup_waves": 8,
+    "down_kc": true
+  },
+  "m64nbd4kc": {
+    "tile_m": 64,
+    "down_nbd": 4,
+    "down_kc": true
+  },
+  "m128nbd1kc": {
+    "tile_m": 128,
+    "down_nbd": 1,
+    "down_kc": true
+  },
+  "m128gw8nbd1kc": {
+    "tile_m": 128,
+    "down_nbd": 1,
+    "gateup_waves": 8,
+    "down_kc": true
   }
 }

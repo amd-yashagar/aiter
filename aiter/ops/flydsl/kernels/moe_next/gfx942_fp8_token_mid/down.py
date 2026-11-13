@@ -53,13 +53,19 @@ def compile_down(
     W_CACHE=0,
     COALESCE=True,
     PER_TENSOR=False,
+    KC=False,
 ):
     """N = model_dim, K = inter_dim; PER_TENSOR takes one W2 scale per expert. Each
     wave walks NBD channel blocks with W2
     prefetched PWD blocks ahead; the tile's intermediate rows are staged once
     per workgroup in LDS. COALESCE transposes each wave's NBD x 16 output
     channels through LDS so every lane writes (or adds) 16 contiguous bytes of
-    one row."""
+    one row.
+
+    KC walks K in 64-wide steps through a double-buffered LDS chunk of the tile's
+    rows (16-byte segments swizzled by row % 8), every block of the wave advancing
+    per step, so only one step of the tile is live and 128-row tiles fit; each
+    output's MFMA order is unchanged, so the result is bit-identical."""
     assert K % 64 == 0 and N % (16 * NBD * WAVES) == 0
     KSTEPS = K // 64
     NTHR = 64 * WAVES
@@ -71,6 +77,14 @@ def compile_down(
     TR_WAVE = S_MAX * 16 * TR_DW
     # The transpose reuses the intermediate tile's LDS once every wave is done.
     LDS_DW = max(LDS_DW, WAVES * TR_WAVE) if COALESCE else LDS_DW
+    CH_DW = 32  # one KC chunk row: 64 bf16
+    BUF_DW = S_MAX * 16 * CH_DW
+    TRG = S_MAX  # subtiles per transpose group
+    if KC:
+        # Transpose groups of TRG subtiles so the transpose fits the chunk buffers.
+        TRG = max(1, min(S_MAX, 2 * BUF_DW // (WAVES * 16 * TR_DW)))
+        TR_WAVE = TRG * 16 * TR_DW
+        LDS_DW = max(2 * BUF_DW, WAVES * TR_WAVE) if COALESCE else 2 * BUF_DW
 
     @fx.struct
     class SharedStorage:
@@ -123,11 +137,116 @@ def compile_down(
                     for st in range_constexpr(KSTEPS)
                 ]
 
+            def store_direct(s, ch, y, toks, slots, oks):
+                if oks[s]:
+                    if const_expr(ROWS):
+                        buffer_ops.buffer_store(
+                            bf16x4_words(y),
+                            o_rs,
+                            ((toks[s] * TOPK + slots[s]) * N + ch) * 2,
+                            offset_is_bytes=True,
+                        )
+                    else:
+                        yb = fxh._f32_to_bf16(Vec.from_elements(y, fx.Float32))
+                        fxh.atomic_add_bf16(out_bf16 + (fx.Int64(toks[s]) * N + ch), yb)
+
+            def kc_body(SV, flush, toks, slots, facs, oks, scs):
+                n_seg = SV * 16 * 8
+                RND = -(-n_seg // NTHR)
+                g_off, l_off = [], []
+                for i in range_constexpr(RND):
+                    idx = tid + i * NTHR
+                    row = (idx < n_seg).select(idx // 8, fx.Int32(0))
+                    seg = idx % 8
+                    g_off.append(((r0 + row) * K) * 2 + seg * 16)
+                    l_off.append(row * CH_DW + (seg ^ (row % 8)) * 4)
+
+                def a_load(st):
+                    return [
+                        load_x4(a_rs, g_off[i] + st * 128) for i in range_constexpr(RND)
+                    ]
+
+                def a_store(buf, regs):
+                    for i in range_constexpr(RND):
+                        if const_expr((i + 1) * NTHR <= n_seg):
+                            lds_store_x4(a_lds, buf * BUF_DW + l_off[i], regs[i])
+                        else:
+                            if tid + i * NTHR < n_seg:
+                                lds_store_x4(a_lds, buf * BUF_DW + l_off[i], regs[i])
+
+                def w_step(st):
+                    return [
+                        load_x4(
+                            w_rs, (nb0 + b) * (16 * K) + w_lane + st * 1024, W_CACHE
+                        )
+                        for b in range_constexpr(NBD)
+                    ]
+
+                a_store(0, a_load(0))
+                wq = [w_step(p) for p in range_constexpr(min(PWD, KSTEPS))]
+                gpu.barrier()
+                acc = [
+                    [Vec.filled(4, 0.0, fx.Float32) for _ in range_constexpr(SV)]
+                    for _ in range_constexpr(NBD)
+                ]
+                sw = c % 8
+                for st in range_constexpr(KSTEPS):
+                    if const_expr(st + 1 < KSTEPS):
+                        nxt = a_load(st + 1)
+                    if const_expr(st + PWD < KSTEPS):
+                        wq.append(w_step(st + PWD))
+                    wb = [
+                        [fp8_dword_to_bf16x4(wq[st][b][j]) for j in range_constexpr(4)]
+                        for b in range_constexpr(NBD)
+                    ]
+                    base = (st % 2) * BUF_DW
+                    for s in range_constexpr(SV):
+                        rr = (s * 16 + c) * CH_DW + base
+                        lo = lds_load_x4(a_lds, rr + ((2 * q) ^ sw) * 4)
+                        hi = lds_load_x4(a_lds, rr + ((2 * q + 1) ^ sw) * 4)
+                        bw = [lo[d] for d in range_constexpr(4)] + [
+                            hi[d] for d in range_constexpr(4)
+                        ]
+                        for j in range_constexpr(4):
+                            for b in range_constexpr(NBD):
+                                acc[b][s] = mfma(wb[b][j], bf16_pair(bw, j), acc[b][s])
+                    if const_expr(st + 1 < KSTEPS):
+                        a_store((st + 1) % 2, nxt)
+                    gpu.barrier()
+                words = [[None] * SV for _ in range_constexpr(NBD)]
+                for b in range_constexpr(NBD):
+                    ch = (nb0 + b) * 16 + q * 4
+                    for s in range_constexpr(SV):
+                        y = [
+                            acc[b][s][i] * scs[b][i] * facs[s]
+                            for i in range_constexpr(4)
+                        ]
+                        if const_expr(COALESCE):
+                            words[b][s] = bf16x4_words(y)
+                        else:
+                            store_direct(s, ch, y, toks, slots, oks)
+                if const_expr(COALESCE):
+                    for g0 in range_constexpr(0, SV, TRG):
+                        gn = min(TRG, SV - g0)
+                        if const_expr(g0 > 0):
+                            gpu.barrier()
+                        for b in range_constexpr(NBD):
+                            for s in range_constexpr(g0, g0 + gn):
+                                lds_store_x2(
+                                    o_lds,
+                                    o_base
+                                    + ((s - g0) * 16 + c) * TR_DW
+                                    + b * 8
+                                    + q * 2,
+                                    words[b][s],
+                                )
+                        flush(gn, g0 * 16)
+
             for SV in range_constexpr(1, S_MAX + 1):
                 if n_sub == SV:
                     # The tile's rows are contiguous in the intermediate.
                     n_seg = SV * 16 * SEGS
-                    for i in range_constexpr(-(-n_seg // NTHR)):
+                    for i in range_constexpr(0 if KC else -(-n_seg // NTHR)):
                         idx = tid + i * NTHR
                         row = idx // SEGS
                         seg = idx % SEGS
@@ -158,9 +277,10 @@ def compile_down(
                             for b in range_constexpr(NBD)
                         ]
                     w_sets = []
-                    for p in range_constexpr(PWD):
+                    for p in range_constexpr(0 if KC else PWD):
                         w_sets += load_w(fx.Int32(p))
-                    gpu.barrier()
+                    if const_expr(not KC):
+                        gpu.barrier()
 
                     def block(
                         b,
@@ -214,7 +334,7 @@ def compile_down(
                                         )
                         return outs
 
-                    def flush(SV=SV):
+                    def flush(SV=SV, row0=0):
                         if const_expr(ROWS):
                             segs = 2 * NBD  # 16-byte segments per row
                         else:
@@ -225,10 +345,10 @@ def compile_down(
                             row = idx // segs
                             seg = idx % segs
                             row_c = (idx < total).select(row, fx.Int32(0))
-                            sid = fx.Int32(ids[r0 + row_c]).bitcast(fx.Uint32)
+                            sid = fx.Int32(ids[r0 + row0 + row_c]).bitcast(fx.Uint32)
                             tok = fx.Int32(sid & 0xFFFFFF)
                             slot = fx.Int32(sid >> 24)
-                            ok = (idx < total) & (row_c < real)
+                            ok = (idx < total) & (row0 + row_c < real)
                             if const_expr(ROWS):
                                 v = lds_load_x4(o_lds, o_base + row_c * TR_DW + seg * 4)
                                 ch0 = nb0 * 16 + seg * 8
@@ -252,14 +372,16 @@ def compile_down(
                                         ),
                                     )
 
+                    if const_expr(KC):
+                        kc_body(SV, flush, toks, slots, facs, oks, scs)
                     tiles_out = []
-                    for b in range_constexpr(NBD):
+                    for b in range_constexpr(0 if KC else NBD):
                         if const_expr(b + PWD < NBD):
                             w_sets += load_w(fx.Int32(b + PWD))
                         tiles_out.append(
                             block(b, w_sets[b * KSTEPS : (b + 1) * KSTEPS])
                         )
-                    if const_expr(COALESCE):
+                    if const_expr(COALESCE and not KC):
                         gpu.barrier()
                         for b in range_constexpr(NBD):
                             for s in range_constexpr(SV):

@@ -58,6 +58,7 @@ class _Tile:
     pwd: int
     coalesce: bool
     pad_rows: bool
+    kc: bool
 
 
 def _tile(config, gpu, model_dim, inter_dim):
@@ -82,6 +83,7 @@ def _tile(config, gpu, model_dim, inter_dim):
     pwd = int(cfg.get("down_pw", 2))
     coalesce = bool(cfg.get("down_coalesce", True))
     pad_rows = bool(cfg.get("sort_pad_rows", True))
+    kc = bool(cfg.get("down_kc", False))
     return _Tile(
         int(cfg.get("tile_m", 64)),
         gw,
@@ -95,6 +97,7 @@ def _tile(config, gpu, model_dim, inter_dim):
         pwd,
         coalesce,
         pad_rows,
+        kc,
     )
 
 
@@ -121,7 +124,7 @@ def _gateup(N, K, s_max, waves, ch, ks, pw, pa, w_cache, act, swiglu_limit, pt):
 
 
 @functools.cache
-def _down(N, K, topk, s_max, nbd, waves, pwd, rows, w_cache, coalesce, pt):
+def _down(N, K, topk, s_max, nbd, waves, pwd, rows, w_cache, coalesce, pt, kc):
     from aiter.ops.flydsl.kernels.moe_next.gfx942_fp8_token_mid.down import (
         compile_down,
     )
@@ -138,6 +141,7 @@ def _down(N, K, topk, s_max, nbd, waves, pwd, rows, w_cache, coalesce, pt):
         W_CACHE=w_cache,
         COALESCE=coalesce,
         PER_TENSOR=pt,
+        KC=kc,
     )
 
 
@@ -266,6 +270,7 @@ class Gfx942Fp8TokenMid(MoeKernel):
                 t.w_cache,
                 t.coalesce,
                 self.quant == QuantType.per_Tensor,
+                t.kc,
             )
             types = (fx.BFloat16, fx.Uint8, fx.BFloat16, fx.Int32, fx.Float32)
             types += (fx.Int32, fx.Int32, fx.Float32)
@@ -344,6 +349,7 @@ class Gfx942Fp8TokenMid(MoeKernel):
                 t.w_cache,
                 t.coalesce,
                 self.quant == QuantType.per_Tensor,
+                t.kc,
             ),
             inter,
             call.w2,
