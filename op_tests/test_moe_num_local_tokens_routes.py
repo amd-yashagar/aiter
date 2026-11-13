@@ -356,7 +356,6 @@ def _stage2_time_us(M, D, I, E, topk, tokens, monkeypatch):
         quant_type=QuantType.No,
         activation=ActivationType.Silu,
         num_local_tokens=nlt,
-        output=output,
     )
     torch.cuda.synchronize()
     monkeypatch.undo()
