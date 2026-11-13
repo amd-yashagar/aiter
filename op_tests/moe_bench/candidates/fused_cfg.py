@@ -212,6 +212,36 @@ class ForcedConfig(Candidate):
         return None
 
 
+def flydsl_stage1_unsupported(name, model_dim):
+    """Why aiter's own validity check rejects this FlyDSL stage-1 kernel at ``model_dim``
+    (None when it accepts it): the K a block reduces over (after the split-K batches and
+    the intra-block K waves) must be a whole number of ``tile_k`` tiles. The kernel
+    raises at build time, so such a kernel is inapplicable to the shape, not broken."""
+    if not str(name).startswith("flydsl_moe1_"):
+        return None
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    p = get_flydsl_kernel_params(name)
+    if not p:
+        return None
+    tile_k = int(p.get("tile_k") or 0)
+    batches = int(p.get("k_batch") or 1)
+    waves = int(p.get("k_wave") or 1)
+    if not tile_k:
+        return None
+    k = int(model_dim)
+    if batches > 1:
+        if k % batches or (k // batches) % tile_k:
+            return f"K_per_batch={k // batches} not divisible by tile_k={tile_k}"
+        k //= batches
+    if waves > 1:
+        if k % waves:
+            return f"model_dim={k} not divisible by k_wave={waves}"
+        if (k // waves) % tile_k:
+            return f"K per group={k // waves} not divisible by tile_k={tile_k}"
+    return None
+
+
 @register
 class FusedCfgSource(Source):
     name = "fused_moe"
@@ -279,6 +309,8 @@ class FusedCfgSource(Source):
         except Exception as e:  # noqa: BLE001
             errors.append(f"gen_1stage_asm_task: {type(e).__name__}: {str(e)[:100]}")
         cands = []
+        unsupported = []
+        ctx.unsupported = unsupported
         for key, lst1 in sorted(s1.items()):
             lst2 = s2.get(key)
             if not lst2:
@@ -287,6 +319,10 @@ class FusedCfgSource(Source):
                 m = re.search(r"_sk(\d+)$", k1)
                 ks = int(m.group(1)) if m else 0
                 name1 = re.sub(r"_sk\d+$", "", k1)
+                why = flydsl_stage1_unsupported(name1, a["model_dim"])
+                if why:
+                    unsupported.append((name1, bm, len(lst2), why))
+                    continue
                 for k2, *_ in lst2:
                     row = {
                         "block_m": bm,

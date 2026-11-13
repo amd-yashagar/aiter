@@ -72,7 +72,12 @@ def test_ck_variants_follow_the_case():
 def test_cktile_for_a8w4_and_nothing_ck_for_mx_swiglu():
     need = prebuild.plan([A8W4])
     assert "module_moe_cktile2stages" in need
-    assert not [m for m in need if m.startswith("module_moe_ck2stages")]
+    # the only CK module is the one aiter's resolver loads for a CK-Tile stage 1 next to a
+    # FlyDSL stage 2 (ck_moe_stage1 wraps the name); it cannot build, so the host prebuild
+    # records the failure and those candidates are excluded
+    assert [m for m in need if m.startswith("module_moe_ck2stages")] == [
+        "module_moe_ck2stages_abi2_f8_fp4x2_preshuffle_on_b16_swiglu_per_1x32_mulWeightStage2"
+    ]
     # CK 2-stage codegen has no SwiGLU for MX: the tuner offers no CK task, so no module
     need = prebuild.plan([A4W4_SWIGLU])
     assert not [m for m in need if m.startswith("module_moe_ck2stages")]
@@ -278,3 +283,129 @@ def PTPC_S():
     from op_tests.moe_bench import workload
 
     return workload.resolve(PTPC)
+
+
+def test_modules_are_read_off_the_resolved_stage_functions_not_the_names():
+    """A CK-Tile stage 1 next to a FlyDSL stage 2 is wrapped by aiter's resolver in
+    ck_moe_stage1 (the flydsl/opus branch treats every other stage-1 name as CK), so the
+    CK swiglu module, which cannot build, is what a call loads."""
+    import functools
+    import types
+
+    import aiter
+    import aiter.fused_moe as fm
+
+    S = workload.resolve(A8W4)
+    md = types.SimpleNamespace(
+        stage1=functools.partial(
+            fm.ck_moe_stage1, kernelName="cktile_a8w4_bm32", splitk=0
+        ),
+        stage2=functools.partial(functools.partial(fm._flydsl_stage2_wrapper)),
+    )
+    mods = prebuild.modules_from_metadata(S, md)
+    assert list(mods) == [
+        "module_moe_ck2stages_abi2_f8_fp4x2_preshuffle_on_b16_swiglu_per_1x32_mulWeightStage2"
+    ]
+    # the same pair resolved honestly (both CK-Tile) loads the CK-Tile module only
+    md = types.SimpleNamespace(
+        stage1=functools.partial(fm.cktile_moe_stage1),
+        stage2=functools.partial(fm.cktile_moe_stage2),
+    )
+    assert list(prebuild.modules_from_metadata(S, md)) == ["module_moe_cktile2stages"]
+    # a CK stage 2 loads its own module; split-k only follows the name
+    md = types.SimpleNamespace(
+        stage1=functools.partial(fm.ck_moe_stage1, kernelName="x_Splitk_y"),
+        stage2=functools.partial(aiter.ck_moe_stage2_fwd, kernelName="y"),
+    )
+    got = prebuild.modules_from_metadata(workload.resolve(FP8BLOCK), md)
+    assert any(m.endswith("_splitk") for m in got) and len(got) == 2
+
+
+def test_every_build_goes_through_one_hook_that_records_module_spec_and_candidate(
+    monkeypatch, tmp_path
+):
+    from aiter.jit import core
+
+    monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    monkeypatch.setenv(prebuild.NO_BUILD_ENV, "1")
+    real = core.build_module
+    try:
+        prebuild.forbid_builds()
+        prebuild.CURRENT["candidate"] = "c1|fused_moe|cktile_a8w4_bm32|flydsl_x"
+        with pytest.raises(prebuild.NotPrebuilt):
+            core.build_module(
+                "module_moe_ck2stages_abi2_f8_fp4x2_x", ["s.cpp"], [], [], ["gen -w {}"]
+            )
+        with pytest.raises(prebuild.NotPrebuilt):  # a build entry that is not a CK one
+            core.build_module("module_odd", ["s.cpp"], [], [], [])
+    finally:
+        core.build_module = real
+        prebuild.CURRENT["candidate"] = ""
+    rec = prebuild.read_missing_record()
+    ck = rec["module_moe_ck2stages_abi2_f8_fp4x2_x"]
+    assert ck["blob_gen_cmd"] == ["gen -w {}"] and ck["kind"] == "ck2stages"
+    assert ck["candidates"] == ["c1|fused_moe|cktile_a8w4_bm32|flydsl_x"]
+    assert rec["module_odd"]["kind"] == "static"
+    # the next prebuild builds what a lease asked for, named by the plan or not
+    assert "module_odd" in prebuild.plan([])
+    assert prebuild.plan([])["module_moe_ck2stages_abi2_f8_fp4x2_x"]["blob_gen_cmd"]
+
+
+def test_candidates_whose_module_failed_on_the_host_are_build_failed_before_any_lease(
+    monkeypatch, tmp_path
+):
+    import io
+    import json
+    import types
+
+    from op_tests.moe_bench import bar_worker
+
+    monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    bad_md = "module_moe_ck2stages_abi2_f8_fp4x2_swiglu"
+    mk = lambda i, s1, s2: types.SimpleNamespace(
+        id=i, kernels=f"{s1} + {s2}", group="pair-bm32-0-0-0", meta={"s1": s1, "s2": s2}
+    )
+    cands = [
+        mk("a", "cktile_a8w4_bm32", "flydsl_moe2_x"),
+        mk("b", "cktile_a8w4_bm32", "flydsl_moe2_y"),
+        mk("c", "flydsl_moe1_x", "flydsl_moe2_x"),
+        mk("d", "cktile_a8w4_bm32", "cktile_a8w4_bm32"),
+    ]
+    keymods = {}
+    for c in cands:
+        keymods[prebuild.cand_key(c)] = (
+            [bad_md] if c.id in ("a", "b") else ["module_moe_cktile2stages"]
+        )
+    prebuild.record_keymods("case1", keymods)
+    assert prebuild.cand_key(cands[0]) == prebuild.cand_key(cands[1])
+    assert prebuild.excluded_keys("case1") == {}  # nothing failed yet
+    (tmp_path / "prebuild_failed.json").write_text(
+        json.dumps({bad_md: "static assertion: swiglu is act 3"})
+    )
+    fh = io.StringIO()
+    keep = bar_worker.drop_build_failed(fh, "case1", "fused_moe", "warm", cands)
+    assert [c.id for c in keep] == ["c", "d"]
+    ev = [json.loads(line) for line in fh.getvalue().splitlines()]
+    rows = [e for e in ev if e["event"] == "cand"]
+    assert {e["cand_id"] for e in rows} == {"a", "b"}
+    assert all(
+        e["status"] == "build_failed" and "static assertion" in e["detail"]
+        for e in rows
+    )
+    # another case, or another source, is untouched
+    assert (
+        bar_worker.drop_build_failed(fh, "case2", "fused_moe", "warm", cands) == cands
+    )
+
+
+def test_flydsl_stage1_kernels_aiter_rejects_for_the_shape_are_unsupported_not_failures():
+    from op_tests.moe_bench.candidates.fused_cfg import flydsl_stage1_unsupported as f
+
+    kw4 = "flydsl_moe1_afp4_wfp4_bf16_t32x32x256_w2_kw4_fp4"
+    assert f(kw4, 3584) == "K per group=896 not divisible by tile_k=256"
+    assert f(kw4, 2560) == "K per group=640 not divisible by tile_k=256"
+    assert f(kw4, 4096) is None  # 1024 is whole tiles
+    assert f(kw4, 3586) == "model_dim=3586 not divisible by k_wave=4"
+    assert f("flydsl_moe1_afp4_wfp4_bf16_t32x32x256_bnt0_gui", 3584) is None
+    assert f("flydsl_moe2_afp4_wfp4_bf16_t32x128x128_atomic", 3584) is None  # stage 2
+    assert f("moe_ck2stages_gemm1_x", 3584) is None

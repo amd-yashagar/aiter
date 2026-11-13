@@ -393,8 +393,10 @@ def _stub_full_impl(md):
     return dataclasses.replace(md, full_impl=stub)
 
 
-def dry_route(case, S=None):
-    """Route for one fused case: returns a dict of ROUTE_COLS (never raises)."""
+def dry_route(case, S=None, capture=None):
+    """Route for one fused case: returns a dict of ROUTE_COLS (never raises). ``capture``,
+    a list, receives the resolved MOEMetadata (its stage functions are what a call runs).
+    """
     import aiter.fused_moe as fm
 
     from . import workload
@@ -410,6 +412,8 @@ def dry_route(case, S=None):
 
     def transform(md):
         full_descs.append(md)
+        if capture is not None:
+            capture.append(md)
         return _stub_full_impl(md)
 
     # get_2stage_cfgs is lru-cached and 1-stage metadata binds fused_moe_1stage at

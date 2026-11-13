@@ -77,6 +77,75 @@ def modules_from_names(S, k1, k2):
     return mods
 
 
+def _ck_or_none(S, stage, splitk):
+    try:
+        return _ck(S, stage, splitk=splitk)
+    except (ValueError, KeyError):  # no CK module exists for this combination
+        return None
+
+
+def _unwrap(fn):
+    """(function, merged keyword arguments) of a possibly nested functools.partial."""
+    import functools
+
+    kw = {}
+    while isinstance(fn, functools.partial):
+        kw = {**fn.keywords, **kw}
+        fn = fn.func
+    return fn, kw
+
+
+def modules_from_metadata(S, md):
+    """Modules a resolved ``MOEMetadata`` loads when it runs: read off its stage functions,
+    not off the kernel names. A name aiter's resolver does not understand (a CK-Tile stage
+    1 next to a FlyDSL stage 2 falls into the branch that wraps every other stage-1 name
+    in ``ck_moe_stage1``) loads whatever function it was wrapped in."""
+    import aiter
+    import aiter.fused_moe as fm
+
+    mods = {}
+    for stage, fn in ((1, md.stage1), (2, md.stage2)):
+        if fn is None:
+            continue
+        base, kw = _unwrap(fn)
+        if base is fm.ck_moe_stage1 or base is aiter.ck_moe_stage2_fwd:
+            kn = kw.get("kernelName") or ""
+            splitk = stage == 1 and (
+                "Splitk" in kn
+                or (
+                    not kn
+                    and S.qtype.name == "per_1x128"
+                    and int(kw.get("splitk") or 0) > 1
+                )
+            )
+            spec = _ck_or_none(S, stage, splitk)
+            if spec:
+                mods[spec["md_name"]] = spec
+        elif base in (fm.cktile_moe_stage1, fm.cktile_moe_stage2):
+            mods["module_moe_cktile2stages"] = {
+                "md_name": "module_moe_cktile2stages",
+                "kind": "cktile",
+            }
+    return mods
+
+
+def cand_key(c):
+    """What decides a candidate's modules: its block_m group and the families of its two
+    stages (the split-k stage 1 is its own module)."""
+    import re
+
+    m = getattr(c, "meta", None) or {}
+    s1, s2 = m.get("s1") or c.kernels or "", m.get("s2") or ""
+    return "|".join(
+        [
+            str(getattr(c, "group", "")),
+            re.split(r"[_ ]", s1)[0],
+            re.split(r"[_ ]", s2)[0],
+            "splitk" if "splitk" in s1.lower() else "",
+        ]
+    )
+
+
 def fallback_modules(S, case):
     """Modules of aiter's own default route for the case.
 
@@ -122,46 +191,73 @@ def candidate_modules(S, cands):
 def routed_modules(S, case, cands, ctx):
     """Modules aiter loads for each kind of enumerated candidate, after its own decision.
 
-    The kernel names of a candidate say which module it means to load, not which one aiter
-    loads when it declines the forced row and falls back to its default route. So one
-    representative per (block group, stage-1 family, stage-2 family) is forced and resolved
-    on meta tensors (``routes.dry_route``: the route aiter ends up with, nothing launched),
-    and the modules of that route are collected. Returns (modules, representatives, routes
-    seen as (candidate, kernel1, kernel2))."""
-    import re
-
+    One representative per ``cand_key`` is forced and resolved on meta tensors
+    (``routes.dry_route``: the metadata aiter ends up with, nothing launched), and the
+    modules are read off the resolved stage functions (``modules_from_metadata``). That is
+    the resolution the runtime does, including the fallbacks when aiter declines the
+    forced row. Returns (modules, per-key modules {key: [md_name]}, representatives)."""
     from . import routes
     from .candidates import fused_cfg
 
-    reps, seen = [], set()
+    reps = {}
     for c in cands:
-        m = getattr(c, "meta", None) or {}
-        key = (
-            c.group,
-            re.split(r"[_ ]", m.get("s1") or c.kernels or "")[0],
-            re.split(r"[_ ]", m.get("s2") or "")[0],
-        )
-        if key not in seen and getattr(c, "row", None):
-            seen.add(key)
-            reps.append(c)
-    mods, resolved = {}, []
+        if getattr(c, "row", None):
+            reps.setdefault(cand_key(c), c)
+    mods, by_key = {}, {}
     # aiter's own dispatch (the bar's "dispatch" candidate): shipped tuned rows included
     fused_cfg.reset_router()
-    r = routes.dry_route(case, S)
-    resolved.append(("dispatch", r.get("kernel1", ""), r.get("kernel2", "")))
-    mods.update(modules_from_names(S, r.get("kernel1", ""), r.get("kernel2", "")))
+    got = []
+    routes.dry_route(case, S, capture=got)
+    for md in got[-1:]:
+        mods.update(modules_from_metadata(S, md))
     try:
-        for c in reps:
+        for key, c in reps.items():
             c.prepare(ctx)
-            r = routes.dry_route(case, S)
-            resolved.append((c.id, r.get("kernel1", ""), r.get("kernel2", "")))
-            mods.update(
-                modules_from_names(S, r.get("kernel1", ""), r.get("kernel2", ""))
-            )
+            got = []
+            routes.dry_route(case, S, capture=got)
+            found = modules_from_metadata(S, got[-1]) if got else {}
+            by_key[key] = sorted(found)
+            mods.update(found)
     finally:
         os.environ.pop("AITER_CONFIG_FMOE", None)
         fused_cfg.reset_router()
-    return mods, len(reps), resolved
+    return mods, by_key, len(reps)
+
+
+def keymods_path():
+    return os.path.join(jit_dir(), "prebuild_keymods.json")
+
+
+def read_keymods():
+    """{case_id: {cand_key: [md_name]}} written by the plan: which modules each kind of
+    candidate loads."""
+    try:
+        with open(keymods_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def record_keymods(case_id, by_key):
+    rec = read_keymods()
+    rec[case_id] = by_key
+    tmp = keymods_path() + f".{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(rec, f, indent=1)
+    os.replace(tmp, keymods_path())
+
+
+def excluded_keys(case_id):
+    """{cand_key: (module, error)} of the candidate kinds whose module failed to build on
+    a host prebuild: they are marked ``build_failed`` and never reach a lease."""
+    failed = known_failed()
+    out = {}
+    for key, mods in read_keymods().get(case_id, {}).items():
+        for md in mods:
+            if md in failed:
+                out[key] = (md, failed[md])
+                break
+    return out
 
 
 def routed_modules_in_child(case):
@@ -193,7 +289,9 @@ def routed_modules_in_child(case):
     )
     for line in r.stdout.splitlines():
         if line.startswith("ROUTED "):
-            return json.loads(line[len("ROUTED ") :])
+            got = json.loads(line[len("ROUTED ") :])
+            record_keymods(case.id, got["by_key"])
+            return got["modules"]
     raise RuntimeError(f"routed-modules child failed: {(r.stderr or r.stdout)[-400:]}")
 
 
@@ -281,11 +379,25 @@ def read_missing_record():
         return {}
 
 
-def record_missing(md_name, spec=None):
+CURRENT = {"candidate": ""}  # "<case>|<candidate id>" the worker is measuring
+
+
+def record_missing(md_name, spec=None, candidate=None):
+    """Note a module a leased run asked for: its build spec (so the next prebuild builds it
+    whether or not the plan names it) and the candidates that reached it."""
     rec = read_missing_record()
-    rec.setdefault(md_name, spec or {"md_name": md_name, "kind": "unknown"})
-    with open(missing_record_path(), "w") as f:
+    ent = rec.setdefault(md_name, spec or {"md_name": md_name, "kind": "unknown"})
+    if spec and "blob_gen_cmd" in spec and "blob_gen_cmd" not in ent:
+        ent.update(spec)
+    cand = candidate or CURRENT["candidate"]
+    if cand:
+        seen = ent.setdefault("candidates", [])
+        if cand not in seen and len(seen) < 200:
+            seen.append(cand)
+    tmp = missing_record_path() + f".{os.getpid()}"
+    with open(tmp, "w") as f:
         json.dump(rec, f, indent=1)
+    os.replace(tmp, missing_record_path())
 
 
 def plan(cases):
@@ -389,7 +501,21 @@ def forbid_builds():
         return
     from aiter.jit import core
 
-    def refuse(md_name, *a, **k):
+    def refuse(
+        md_name, srcs=None, flags_cc=None, flags_hip=None, blob_gen_cmd=None, *a, **k
+    ):
+        # the one place every JIT build goes through (compile_ops, ctypes modules): record
+        # the module with what it takes to build it and the candidate that asked
+        spec = {
+            "md_name": md_name,
+            "kind": (
+                "ck2stages" if md_name.startswith("module_moe_ck2stages") else "static"
+            ),
+        }
+        if spec["kind"] == "ck2stages":
+            spec["blob_gen_cmd"] = blob_gen_cmd
+        if md_name not in known_failed():
+            record_missing(md_name, spec)
         raise NotPrebuilt(md_name)
 
     core.build_module = refuse
@@ -840,8 +966,8 @@ def main(argv=None):
         case = schema.Case(json.loads(a.routed_modules), {})
         S = workload.resolve(case)
         ctx, cands = _enumerate_all(S, case)
-        mods, _, _ = routed_modules(S, case, cands, ctx)
-        print("ROUTED " + json.dumps(mods))
+        mods, by_key, _ = routed_modules(S, case, cands, ctx)
+        print("ROUTED " + json.dumps({"modules": mods, "by_key": by_key}))
         return 0
     if a.build:
         spec = json.loads(a.build)

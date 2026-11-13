@@ -108,6 +108,46 @@ def assert_no_route():
         )
 
 
+def drop_build_failed(fh, case_id, source, mode, cands):
+    """Candidates whose module failed to build on a host prebuild never reach the lease:
+    each is reported ``build_failed`` with the module's recorded error, not timed."""
+    from . import prebuild
+
+    excluded = prebuild.excluded_keys(case_id) if source == "fused_moe" else {}
+    if not excluded:
+        return cands
+    keep = []
+    for x in cands:
+        hit = excluded.get(prebuild.cand_key(x))
+        if hit is None:
+            keep.append(x)
+            continue
+        md, err = hit
+        emit(
+            fh,
+            {
+                "event": "cand",
+                "case_id": case_id,
+                "cand_id": x.id,
+                "source": source,
+                "kernels": x.kernels or "",
+                "phase": "enumerate",
+                "mode": mode,
+                "status": "build_failed",
+                "detail": f"build_failed: {md}: {err[-200:]}",
+            },
+        )
+    emit(
+        fh,
+        {
+            "event": "log",
+            "msg": f"{case_id} {source}: {len(cands) - len(keep)} candidates "
+            "excluded (their module failed to build on the host prebuild)",
+        },
+    )
+    return keep
+
+
 def not_prebuilt_row(md_name):
     """(status, detail, outcome) of a candidate that reached a module not built beforehand.
 
@@ -228,9 +268,11 @@ class Measurer:
         from aiter import dtypes
 
         from . import accuracy, routes
+        from . import prebuild as prebuild_mod
         from .timing import Timer
 
         ctx = self.ctx
+        prebuild_mod.CURRENT["candidate"] = f"{self.case_id}|{cand.id}"
         phase = "screen" if quick else "confirm"
         emit(
             self.fh,
@@ -729,6 +771,26 @@ def run_bar_group(cases, spec, fh):
                     },
                 )
                 continue
+            cands = drop_build_failed(fh, c.id, src.name, modes[0], cands)
+            for name1, bm, npairs, why in (
+                getattr(ctx, "unsupported", None) or ()
+                if src.name == "fused_moe"
+                else ()
+            ):
+                emit(
+                    fh,
+                    {
+                        "event": "cand",
+                        "case_id": c.id,
+                        "cand_id": f"{src.name}|{name1}|bm{bm}",
+                        "source": src.name,
+                        "kernels": name1,
+                        "phase": "enumerate",
+                        "mode": modes[0],
+                        "status": "unsupported",
+                        "detail": f"{why} (aiter's validity check; {npairs} pairs not built or timed)",
+                    },
+                )
             for msg in getattr(ctx, "enum_errors", []):
                 emit(
                     fh,

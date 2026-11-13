@@ -97,7 +97,11 @@ def _guard_builds(a, runner):
     cases = runner.select_cases(a.cases.split(","), a.filter)
     bad = prebuild.known_failed()
     miss = [m for m in prebuild.missing(prebuild.plan(cases)) if m not in bad]
-    if (a.launcher == "gpuq" or a.no_build) and not a.allow_build:
+    run_only_env = (
+        os.environ.get(prebuild.NO_BUILD_ENV) == "1"
+        or os.environ.get("FLYDSL_RUNTIME_RUN_ONLY") == "1"
+    )
+    if (a.launcher == "gpuq" or a.no_build or run_only_env) and not a.allow_build:
         prebuild.require_prebuilt(cases)
         fly = prebuild.flydsl_cases_missing(cases)
         if fly:
