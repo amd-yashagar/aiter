@@ -4109,6 +4109,11 @@ def _can_reroute_bf16_to_a16wmix(
     return _swiglu_limit_is_active(swiglu_limit)
 
 
+# Estimated tokens per expert from which the gfx942 fp8 blockscale 1-stage asm path uses
+# its 64-row tile (measured crossover: between 22 and 36 tokens per expert).
+_GFX942_BLOCKSCALE_BM64_MIN_M_PER_EXPERT = 32
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -4846,8 +4851,25 @@ def get_2stage_cfgs(
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
 
+        block_m_1stage = BLOCK_SIZE_M
+        if (
+            run_1stage
+            and q_type == QuantType.per_1x128
+            and gfx == "gfx942"
+            and not run_1stage_xbf16
+            and token * topk // expert >= _GFX942_BLOCKSCALE_BM64_MIN_M_PER_EXPERT
+            and aiter.fmoe_fp8_blockscale_g1u1_has_kernel(
+                activation.value, False, 64, inter_dim, model_dim
+            )
+            == 1
+        ):
+            # Once an expert sees about 32 tokens the 64-row asm tile (64x256) beats the
+            # 32-row one: 1.2x to 1.8x on MI300X (DeepSeek-V3 and Qwen3.5, M 1024 to
+            # 8192, warm and cold, same accuracy); below that the 32-row tile is faster.
+            block_m_1stage = 64
+
         block_m = (
-            BLOCK_SIZE_M
+            block_m_1stage
             if run_1stage
             else (
                 # block_m=16 CK stage1 uses KPerBlock=256 (K=model_dim)
