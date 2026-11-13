@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -38,6 +39,14 @@ def jit_dir():
     from aiter.jit.core import get_user_jit_dir
 
     return get_user_jit_dir()
+
+
+def state_dir():
+    """Where the prebuild's bookkeeping files live (``prebuild_failed.json``,
+    ``prebuild_missing.json``, ``prebuild_keymods.json``, ``prebuild_attempted.json``): the
+    JIT dir, unless ``MOE_BENCH_STATE_DIR`` names another (the tests do, so they never
+    write into a shared JIT dir)."""
+    return os.environ.get("MOE_BENCH_STATE_DIR") or jit_dir()
 
 
 def module_path(md_name):
@@ -225,7 +234,7 @@ def routed_modules(S, case, cands, ctx):
 
 
 def keymods_path():
-    return os.path.join(jit_dir(), "prebuild_keymods.json")
+    return os.path.join(state_dir(), "prebuild_keymods.json")
 
 
 def read_keymods():
@@ -241,7 +250,15 @@ def read_keymods():
 SPECS_KEY = "_specs"
 
 
+_KEYMODS_LOCK = threading.Lock()
+
+
 def record_keymods(case_id, by_key, specs=None):
+    with _KEYMODS_LOCK:
+        _record_keymods(case_id, by_key, specs)
+
+
+def _record_keymods(case_id, by_key, specs=None):
     rec = read_keymods()
     rec[case_id] = by_key
     if specs:
@@ -296,6 +313,8 @@ def routed_modules_in_child(case):
         if line.startswith("ROUTED "):
             got = json.loads(line[len("ROUTED ") :])
             record_keymods(case.id, got["by_key"], got["modules"])
+            for e in got.get("errors", []):
+                PLAN_ERRORS.setdefault(case.id, []).append(e)
             return got["modules"]
     raise RuntimeError(f"routed-modules child failed: {(r.stderr or r.stdout)[-400:]}")
 
@@ -371,7 +390,7 @@ def modules_for_case(S):
 
 
 def missing_record_path():
-    return os.path.join(jit_dir(), "prebuild_missing.json")
+    return os.path.join(state_dir(), "prebuild_missing.json")
 
 
 def read_missing_record():
@@ -408,45 +427,78 @@ def record_missing(md_name, spec=None, candidate=None):
 PLAN_ERRORS = {}  # case id -> [what failed while planning it]; run_prebuild logs them
 
 
+_PLAN_CACHE = (
+    {}
+)  # (case id, row) -> {md_name: spec} resolved for the case in this process
+
+
+def _case_key(c):
+    return (c.id, json.dumps(c.row, sort_keys=True, default=str))
+
+
 def plan(cases):
     """Deduplicated {md_name: spec} over every runnable fused case, with the case ids that
     need each module.
 
-    Every step is its own try: a failing step is recorded in ``PLAN_ERRORS`` (and logged
-    by the prebuild) but never hides the modules of the others. The modules an earlier
-    plan resolved for a case (``prebuild_keymods.json``) are part of the plan too, so a
-    module the keymods file lists is a module the prebuild attempts."""
+    Each case is resolved once per process (the resolution is a GPU-less child, about 3 s)
+    and the children of the cases not yet seen run side by side. Every step is its own try:
+    a failing step is recorded in ``PLAN_ERRORS`` (and logged by the prebuild) but never
+    hides the modules of the others. The modules an earlier plan resolved for a case
+    (``prebuild_keymods.json``) are part of the plan too, so a module the keymods file
+    lists is a module the prebuild attempts."""
+    from concurrent.futures import ThreadPoolExecutor
+
     from . import workload
 
     need = {}
     PLAN_ERRORS.clear()
     keymods = read_keymods()
     specs = keymods.get(SPECS_KEY, {})
+    todo = []
     for c in cases:
         if c.kind != "fused" or c.token <= 0:
             continue
         try:
-            S = workload.resolve(c)
+            todo.append((c, workload.resolve(c)))
         except Exception:  # noqa: BLE001, S112  (invalid rows are reported by run)
             continue
-        mods = dict(modules_for_case(S))
+    fresh = [(c, S) for c, S in todo if _case_key(c) not in _PLAN_CACHE]
+    children = {}
+    if fresh:
+        workers = max(1, min(len(fresh), 16, (os.cpu_count() or 8) // 8))
 
-        def step(name, fn, mods=mods, c=c):
+        def resolve_in_child(c):
             try:
-                mods.update(fn() or {})
+                return routed_modules_in_child(c), None
             except Exception as e:  # noqa: BLE001
-                PLAN_ERRORS.setdefault(c.id, []).append(
-                    f"{name}: {type(e).__name__}: {str(e)[:200]}"
-                )
+                return {}, e
 
-        step("fallback", lambda S=S, c=c: fallback_modules(S, c))
-        step(
-            "candidate names",
-            lambda S=S, c=c: candidate_modules(S, _enumerate_all(S, c)[1]),
-        )
-        step("resolved routes", lambda c=c: routed_modules_in_child(c))
-        known = keymods.get(c.id, {})
-        for key_mods in known.values():
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {c.id: pool.submit(resolve_in_child, c) for c, _ in fresh}
+            children = {cid: f.result() for cid, f in futs.items()}
+    for c, S in todo:
+        key = _case_key(c)
+        if key not in _PLAN_CACHE:
+            mods = dict(modules_for_case(S))
+
+            def step(name, fn, mods=mods, c=c):
+                try:
+                    mods.update(fn() or {})
+                except Exception as e:  # noqa: BLE001
+                    PLAN_ERRORS.setdefault(c.id, []).append(
+                        f"{name}: {type(e).__name__}: {str(e)[:200]}"
+                    )
+
+            def routed(c=c):
+                found, err = children[c.id]
+                if err is not None:
+                    raise err
+                return found
+
+            step("resolved routes", routed)
+            _PLAN_CACHE[key] = mods
+        mods = dict(_PLAN_CACHE[key])
+        for key_mods in keymods.get(c.id, {}).values():
             for md in key_mods:
                 if md in specs:
                     mods.setdefault(md, specs[md])
@@ -468,7 +520,7 @@ def _enumerate_all(S, case):
 
 
 def failed_path():
-    return os.path.join(jit_dir(), "prebuild_failed.json")
+    return os.path.join(state_dir(), "prebuild_failed.json")
 
 
 def known_failed():
@@ -487,7 +539,7 @@ def missing(need):
 
 
 def attempted_path():
-    return os.path.join(jit_dir(), "prebuild_attempted.json")
+    return os.path.join(state_dir(), "prebuild_attempted.json")
 
 
 def read_attempted():
@@ -510,13 +562,121 @@ def record_attempted(results):
     os.replace(tmp, attempted_path())
 
 
-def require_prebuilt(cases):
+PLAN_FILE = "prebuild_plan.json"
+
+
+def plan_path():
+    return os.path.join(state_dir(), PLAN_FILE)
+
+
+def _plan_stamp():
+    """What a plan depends on besides the case: the tree under test, the target chip and
+    the harness (its enumeration decides the candidate kinds)."""
+    import aiter
+
+    from . import runner
+
+    tree = os.path.dirname(os.path.dirname(os.path.abspath(aiter.__file__)))
+    sha, _dirty = runner.tree_info(tree)
+    try:
+        arch, cu = gpu_identity()
+    except SystemExit:
+        arch, cu = "", ""
+    return {
+        "tree": os.path.realpath(tree),
+        "tree_sha": sha,
+        "arch": f"{arch}/{cu}",
+        "harness": runner.harness_sha(),
+    }
+
+
+def save_plan(cases, need):
+    """Write the host's plan for ``cases`` so a leased run reads it instead of planning.
+
+    One entry per planned case: its signature, the stamp it was planned under, and the
+    modules it needs; the build specs are shared. Entries of other cases stay."""
+    from . import runner
+
+    stamp = _plan_stamp()
+    try:
+        with open(plan_path()) as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        rec = {}
+    entries, specs = rec.setdefault("cases", {}), rec.setdefault("specs", {})
+    by_case = {}
+    for md, spec in need.items():
+        for cid in spec.get("cases", []):
+            by_case.setdefault(cid, []).append(md)
+        specs[md] = {k: v for k, v in spec.items() if k != "cases"}
+    for c in cases:
+        if c.kind != "fused" or c.token <= 0:
+            continue
+        entries[c.id] = dict(
+            stamp, sig=runner.case_sig(c), modules=sorted(by_case.get(c.id, []))
+        )
+    tmp = plan_path() + f".{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(rec, f, indent=1)
+    os.replace(tmp, plan_path())
+
+
+def leased_plan(cases):
+    """The plan of a leased run: read from the host's manifest, never computed (planning
+    takes minutes and imports aiter). Raises SystemExit at once, naming the cases, when the
+    manifest lacks a case or holds one planned for another case row, tree, chip or harness.
+    """
+    from . import runner
+
+    try:
+        with open(plan_path()) as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        rec = {}
+    entries, specs = rec.get("cases", {}), rec.get("specs", {})
+    stamp = _plan_stamp()
+    problems, need = [], {}
+    for c in cases:
+        if c.kind != "fused" or c.token <= 0:
+            continue
+        e = entries.get(c.id)
+        if e is None:
+            problems.append((c.id, "no plan"))
+            continue
+        why = [
+            k for k in ("tree", "tree_sha", "arch", "harness") if e.get(k) != stamp[k]
+        ]
+        if e.get("sig") != runner.case_sig(c):
+            why.append("case row")
+        if why:
+            problems.append((c.id, "planned for another " + ", ".join(why)))
+            continue
+        for md in e["modules"]:
+            need.setdefault(md, dict(specs.get(md, {"md_name": md}), cases=[]))[
+                "cases"
+            ].append(c.id)
+    if problems:
+        shown = "; ".join(f"{cid} ({why})" for cid, why in problems[:12])
+        raise SystemExit(
+            f"{len(problems)} of {len(cases)} cases have no current prebuild plan in "
+            f"{plan_path()} (tree {stamp['tree']}): {shown}"
+            f"{' ...' if len(problems) > 12 else ''}\n"
+            "A leased run never plans (minutes of CPU, aiter imports). Run `run --mode "
+            "prebuild --aiter <tree>` on the host for these cases first, or pass "
+            "--allow-build."
+        )
+    for md, spec in read_missing_record().items():
+        need.setdefault(md, dict(spec, cases=[]))["cases"].append("lease-recorded")
+    return need
+
+
+def require_prebuilt(cases, need=None):
     """Raise SystemExit when a module that should exist is missing: a leased run must never
     compile. A module a prebuild tried and could not build is not missing (its candidates
     are ``build_failed``, see ``excluded_keys``); one no prebuild tried is, and the cases
     that need it are named."""
     bad = known_failed()
-    need = plan(cases)
+    need = need if need is not None else plan(cases)
     miss = [m for m in missing(need) if m not in bad]
     if miss:
         tried = read_attempted()
@@ -558,7 +718,7 @@ def not_prebuilt_module(exc):
 
 
 def forbid_builds():
-    """In a worker: turn any JIT build into an error. Active under ``MOE_BENCH_NO_BUILD=1``
+    """In a worker (or the parent of a leased run): turn any JIT build into an error. Active under ``MOE_BENCH_NO_BUILD=1``
     and whenever FlyDSL is in run-only mode (``FLYDSL_RUNTIME_RUN_ONLY=1``): a lease is
     run-only for every compiler, not just FlyDSL."""
     if (
@@ -723,6 +883,12 @@ def run_prebuild(
     for cid, errs in PLAN_ERRORS.items():
         for e in errs:
             log(f"prebuild: PLAN ERROR {cid}: {e}")
+    try:
+        save_plan(cases, need)
+    except Exception as e:  # noqa: BLE001
+        log(
+            f"prebuild: WARNING plan manifest not written ({type(e).__name__}: {e}); leases will refuse"
+        )
     bad = {} if retry_failed else known_failed()
     todo = [need[m] for m in missing(need) if m not in bad]
     for m in missing(need):
@@ -1036,9 +1202,27 @@ def main(argv=None):
 
         case = schema.Case(json.loads(a.routed_modules), {})
         S = workload.resolve(case)
-        ctx, cands = _enumerate_all(S, case)
-        mods, by_key, _ = routed_modules(S, case, cands, ctx)
-        print("ROUTED " + json.dumps({"modules": mods, "by_key": by_key}))
+        mods, by_key, errors = {}, {}, []
+
+        def step(name, fn):
+            try:
+                return fn()
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{name}: {type(e).__name__}: {str(e)[:200]}")
+                return None
+
+        enum = step("enumerate", lambda: _enumerate_all(S, case))
+        ctx, cands = enum if enum else (None, [])
+        mods.update(step("fallback", lambda: fallback_modules(S, case)) or {})
+        mods.update(step("candidate names", lambda: candidate_modules(S, cands)) or {})
+        got = step("resolved routes", lambda: routed_modules(S, case, cands, ctx))
+        if got:
+            mods.update(got[0])
+            by_key = got[1]
+        print(
+            "ROUTED "
+            + json.dumps({"modules": mods, "by_key": by_key, "errors": errors})
+        )
         return 0
     if a.build:
         spec = json.loads(a.build)

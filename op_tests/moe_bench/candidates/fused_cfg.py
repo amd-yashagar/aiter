@@ -212,14 +212,22 @@ class ForcedConfig(Candidate):
         return None
 
 
-def flydsl_stage1_unsupported(name, model_dim):
-    """Why aiter's own validity check rejects this FlyDSL stage-1 kernel at ``model_dim``
-    (None when it accepts it): the K a block reduces over (after the split-K batches and
-    the intra-block K waves) must be a whole number of ``tile_k`` tiles. The kernel
-    raises at build time, so such a kernel is inapplicable to the shape, not broken."""
+LDS_BUDGET_KIB = {"gfx942": 64, "gfx950": 160}  # per workgroup, the arch's real limit
+
+
+def flydsl_stage1_unsupported(name, model_dim, gfx=None):
+    """Why a FlyDSL stage-1 kernel cannot run this shape on this arch (None when it can).
+
+    * aiter's own validity check: the K a block reduces over (after the split-K batches and
+      the intra-block K waves) must be a whole number of ``tile_k`` tiles. The kernel
+      raises at build time, so such a kernel is inapplicable to the shape, not broken.
+    * LDS (MOEBUG-061): ``moe_kernels`` filters the a16 (bf16 activation) configs at the
+      gfx950 budget (160 KiB) on every arch; a config that needs more than the arch's
+      real budget (64 KiB on gfx942) faults at its first launch (``hipErrorIllegalState``)
+      and poisons the context, so it is never tried."""
     if not str(name).startswith("flydsl_moe1_"):
         return None
-    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+    from aiter.ops.flydsl.moe_kernels import _gemm1_lds_bytes, get_flydsl_kernel_params
 
     p = get_flydsl_kernel_params(name)
     if not p:
@@ -227,6 +235,12 @@ def flydsl_stage1_unsupported(name, model_dim):
     tile_k = int(p.get("tile_k") or 0)
     batches = int(p.get("k_batch") or 1)
     waves = int(p.get("k_wave") or 1)
+    if str(p.get("a_dtype")) in ("bf16", "fp16") and gfx in LDS_BUDGET_KIB:
+        need = (
+            _gemm1_lds_bytes(int(p["tile_m"]), int(p["tile_n"]), tile_k, waves) // 1024
+        )
+        if need > LDS_BUDGET_KIB[gfx]:
+            return f"LDS {need} KiB > budget {LDS_BUDGET_KIB[gfx]} KiB (MOEBUG-061)"
     if not tile_k:
         return None
     k = int(model_dim)
@@ -319,7 +333,9 @@ class FusedCfgSource(Source):
                 m = re.search(r"_sk(\d+)$", k1)
                 ks = int(m.group(1)) if m else 0
                 name1 = re.sub(r"_sk\d+$", "", k1)
-                why = flydsl_stage1_unsupported(name1, a["model_dim"])
+                why = flydsl_stage1_unsupported(
+                    name1, a["model_dim"], ctx.dispatch_meta["gfx"]
+                )
                 if why:
                     unsupported.append((name1, bm, len(lst2), why))
                     continue

@@ -557,6 +557,16 @@ class Measurer:
                 # StreamId"): exit so the parent marks this candidate crashed and starts
                 # a fresh worker for the rest.
                 emit(self.fh, {"event": "log", "msg": f"gpu fault in {cand.id}: {msg}"})
+                # the runner records this candidate with the error before it restarts us
+                emit(
+                    self.fh,
+                    {
+                        "event": "gpu_fault",
+                        "case_id": self.case_id,
+                        "cand_id": cand.id,
+                        "detail": msg,
+                    },
+                )
                 os._exit(70)
             res["outcome"] = (
                 "compile"
@@ -912,7 +922,7 @@ def run_bar_group(cases, spec, fh):
                         "phase": "enumerate",
                         "mode": modes[0],
                         "status": "unsupported",
-                        "detail": f"{why} (aiter's validity check; {npairs} pairs not built or timed)",
+                        "detail": f"{why} ({npairs} pairs not built or timed)",
                     },
                 )
             for msg in getattr(ctx, "enum_errors", []):

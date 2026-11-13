@@ -85,6 +85,7 @@ def test_cktile_for_a8w4_and_nothing_ck_for_mx_swiglu():
 
 def test_a_leased_run_refuses_when_a_module_is_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    monkeypatch.setenv("MOE_BENCH_STATE_DIR", str(tmp_path))
     with pytest.raises(SystemExit) as e:
         prebuild.require_prebuilt([PTPC])
     assert "must not compile" in str(e.value)
@@ -124,6 +125,7 @@ def test_only_compile_failures_are_remembered_and_built_modules_are_forgotten(
     monkeypatch, tmp_path
 ):
     monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    monkeypatch.setenv("MOE_BENCH_STATE_DIR", str(tmp_path))
     need = prebuild.plan([PTPC])
     target = min(m for m in need if m.startswith("module_moe_ck2stages"))
 
@@ -136,6 +138,7 @@ def test_only_compile_failures_are_remembered_and_built_modules_are_forgotten(
 
     monkeypatch.setattr(prebuild.subprocess, "run", fake_run)
     monkeypatch.setattr(prebuild, "plan", lambda cases: {target: need[target]})
+    monkeypatch.setattr(prebuild, "save_plan", lambda cases, need: None)
     # an environment failure ("Sequence '-1' not recognized") is not recorded
     kw_out = {"text": "agent.cpp:208 Sequence '-1' not recognized"}
     res = prebuild.run_prebuild([], jobs=1, log=lambda *_: None)
@@ -193,8 +196,10 @@ def test_children_follow_the_aiter_tree_whatever_the_cwd(monkeypatch, tmp_path):
     jit = tmp_path / "jit"
     jit.mkdir()
     monkeypatch.setattr(prebuild, "jit_dir", lambda: str(jit))
+    monkeypatch.setenv("MOE_BENCH_STATE_DIR", str(jit))
     monkeypatch.setattr(prebuild, "use_tree", lambda t: str(t))
     monkeypatch.delenv("AITER_JIT_DIR", raising=False)
+    monkeypatch.setattr(prebuild, "save_plan", lambda cases, need: None)
     need = prebuild.plan([PTPC])
     target = min(m for m in need if m.startswith("module_moe_ck2stages"))
     seen = []
@@ -224,6 +229,7 @@ def test_a_candidate_that_would_compile_is_skipped_logged_and_recorded(
     from op_tests.moe_bench import bar_worker
 
     monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    monkeypatch.setenv("MOE_BENCH_STATE_DIR", str(tmp_path))
     status, detail, outcome = bar_worker.not_prebuilt_row("module_moe_x")
     assert (status, outcome) == ("not-prebuilt", "notprebuilt")
     assert detail == "not prebuilt: module_moe_x"
@@ -327,6 +333,7 @@ def test_every_build_goes_through_one_hook_that_records_module_spec_and_candidat
     from aiter.jit import core
 
     monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    monkeypatch.setenv("MOE_BENCH_STATE_DIR", str(tmp_path))
     monkeypatch.setenv(prebuild.NO_BUILD_ENV, "1")
     real = core.build_module
     try:
@@ -361,6 +368,7 @@ def test_candidates_whose_module_failed_on_the_host_are_build_failed_before_any_
     from op_tests.moe_bench import bar_worker
 
     monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    monkeypatch.setenv("MOE_BENCH_STATE_DIR", str(tmp_path))
     bad_md = "module_moe_ck2stages_abi2_f8_fp4x2_swiglu"
     mk = lambda i, s1, s2: types.SimpleNamespace(
         id=i, kernels=f"{s1} + {s2}", group="pair-bm32-0-0-0", meta={"s1": s1, "s2": s2}
@@ -406,6 +414,9 @@ def test_flydsl_stage1_kernels_aiter_rejects_for_the_shape_are_unsupported_not_f
     assert f(kw4, 2560) == "K per group=640 not divisible by tile_k=256"
     assert f(kw4, 4096) is None  # 1024 is whole tiles
     assert f(kw4, 3586) == "model_dim=3586 not divisible by k_wave=4"
+    big = "flydsl_moe1_abf16_wbf16_bf16_t32x16x256_bnt0_kw4"
+    assert f(big, 3072, "gfx942") == "LDS 128 KiB > budget 64 KiB (MOEBUG-061)"
+    assert f(big, 3072, "gfx950") is None
     assert f("flydsl_moe1_afp4_wfp4_bf16_t32x32x256_bnt0_gui", 3584) is None
     assert f("flydsl_moe2_afp4_wfp4_bf16_t32x128x128_atomic", 3584) is None  # stage 2
     assert f("moe_ck2stages_gemm1_x", 3584) is None
@@ -418,6 +429,7 @@ def _fake_plan(monkeypatch, tmp_path, child):
     """A plan whose per-case child resolution is ``child(case)`` (the real one needs the
     target arch's replay environment)."""
     monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    monkeypatch.setenv("MOE_BENCH_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(prebuild, "routed_modules_in_child", child)
     monkeypatch.setattr(prebuild, "fallback_modules", lambda S, c: {})
     monkeypatch.setattr(prebuild, "_enumerate_all", lambda S, c: (None, []))
@@ -496,6 +508,203 @@ def test_a_mixed_branch_pair_is_build_failed_with_the_moebug_054_reason():
 
 def test_a_prebuild_records_what_it_tried(monkeypatch, tmp_path):
     monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    monkeypatch.setenv("MOE_BENCH_STATE_DIR", str(tmp_path))
     prebuild.record_attempted({"a": "built"})
     prebuild.record_attempted({"b": "failed"})
     assert prebuild.read_attempted() == {"a": "built", "b": "failed"}
+
+
+def test_the_tests_keep_the_prebuild_records_out_of_the_jit_dir(monkeypatch):
+    """module_x once ended up in the shared jit dir's prebuild_missing.json/failed.json."""
+    import os
+
+    state = prebuild.state_dir()
+    assert state == os.environ["MOE_BENCH_STATE_DIR"] != prebuild.jit_dir()
+    prebuild.record_missing("module_x", {"md_name": "module_x", "kind": "static"})
+    assert os.path.dirname(prebuild.missing_record_path()) == state
+    assert not os.path.exists(os.path.join(prebuild.jit_dir(), "module_x.so"))
+    assert "module_x" in prebuild.read_missing_record()
+    monkeypatch.delenv("MOE_BENCH_STATE_DIR")
+    assert (
+        prebuild.state_dir() == prebuild.jit_dir()
+    )  # a real run keeps them with the jit dir
+
+
+def test_a_case_is_planned_once_however_often_the_run_asks(monkeypatch, tmp_path):
+    calls = []
+
+    def child(case):
+        calls.append(case.id)
+        return {}
+
+    _fake_plan(monkeypatch, tmp_path, child)
+    need1 = prebuild.plan([A8W4, PTPC])
+    need2 = prebuild.plan([A8W4, PTPC])  # the run-only guard, then require_prebuilt
+    assert sorted(calls) == ["c-a8w4", "c-ptpc"]
+    assert need1 == need2
+
+
+def _args(**kw):
+    import types
+
+    base = {
+        "aiter": ".",
+        "cases": "x",
+        "filter": None,
+        "launcher": "none",
+        "no_build": True,
+        "allow_build": False,
+    }
+    return types.SimpleNamespace(**{**base, **kw})
+
+
+def _guard(monkeypatch, tmp_path, cases):
+    """_guard_builds over ``cases`` with planning forbidden and the tree lookup stubbed."""
+    from op_tests.moe_bench import __main__ as cli
+    from op_tests.moe_bench import runner
+
+    monkeypatch.setattr(prebuild, "jit_dir", lambda: str(tmp_path))
+    monkeypatch.setenv("MOE_BENCH_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(prebuild, "use_tree", lambda t: t)
+    monkeypatch.setattr(runner, "select_cases", lambda c, f: cases)
+    monkeypatch.setattr(prebuild, "forbid_builds", lambda: None)
+    monkeypatch.setattr(prebuild, "flydsl_cases_missing", lambda cs: [])
+    monkeypatch.setattr(prebuild, "arm_flydsl_run_only", lambda: None)
+
+    def never(*a, **k):
+        raise AssertionError("a leased run planned")
+
+    monkeypatch.setattr(prebuild, "plan", never)
+    monkeypatch.setattr(prebuild, "routed_modules_in_child", never)
+    return lambda a: cli._guard_builds(a, runner)
+
+
+def _stamp(monkeypatch, **over):
+    stamp = {
+        "tree": "/t/aiter", "tree_sha": "abc", "arch": "gfx950/256", "harness": "h1",
+    }  # fmt: skip
+    stamp.update(over)
+    monkeypatch.setattr(prebuild, "_plan_stamp", lambda: dict(stamp))
+    return stamp
+
+
+def test_a_leased_run_reads_the_hosts_plan_and_never_plans(monkeypatch, tmp_path):
+    _stamp(monkeypatch)
+    guard = _guard(monkeypatch, tmp_path, [PTPC, A8W4])
+    # no plan at all: refused at once, naming every case, before anything else
+    with pytest.raises(SystemExit) as e:
+        guard(_args())
+    msg = str(e.value)
+    assert "c-ptpc (no plan)" in msg and "c-a8w4 (no plan)" in msg
+    assert "never plans" in msg and "--mode prebuild" in msg
+    # the host plans (here: stubbed) and writes the manifest; modules are built
+    need = {
+        "module_a": {"md_name": "module_a", "kind": "static", "cases": ["c-ptpc", "c-a8w4"]},
+        "module_b": {"md_name": "module_b", "kind": "static", "cases": ["c-a8w4"]},
+    }  # fmt: skip
+    prebuild.save_plan([PTPC, A8W4], need)
+    guard(_args(no_build=True)) if False else None
+    for md in need:
+        (tmp_path / f"{md}.so").write_text("")
+    guard(_args())  # reads the manifest, plans nothing, passes
+    import os
+
+    assert os.environ.get(prebuild.NO_BUILD_ENV) == "1"
+    # a module that should exist is missing: refused, with the case named
+    (tmp_path / "module_b.so").unlink()
+    with pytest.raises(SystemExit) as e:
+        guard(_args())
+    assert "module_b" in str(e.value) and "c-a8w4" in str(e.value)
+    # a module a prebuild could not build is skipped, not refused
+    (tmp_path / "prebuild_failed.json").write_text('{"module_b": "static assertion"}')
+    guard(_args())
+
+
+def test_a_plan_for_another_row_tree_chip_or_harness_is_refused_naming_the_case(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv(prebuild.NO_BUILD_ENV, "1")
+    _stamp(monkeypatch)
+    guard = _guard(monkeypatch, tmp_path, [PTPC])
+    prebuild.save_plan(
+        [PTPC], {"m": {"md_name": "m", "kind": "static", "cases": ["c-ptpc"]}}
+    )
+    (tmp_path / "m.so").write_text("")
+    guard(_args())
+    for field, value in (
+        ("tree", "/other/aiter"),
+        ("arch", "gfx942/304"),
+        ("harness", "h2"),
+    ):
+        _stamp(monkeypatch, **{field: value})
+        with pytest.raises(SystemExit) as e:
+            guard(_args())
+        assert f"c-ptpc (planned for another {field}" in str(e.value)
+    _stamp(monkeypatch)
+    changed = _case(
+        "c-ptpc", "fp8-token", 16, 4096, 128, 513, 11, "Silu", "fp8", "fp8", "per_Token"
+    )
+    guard = _guard(monkeypatch, tmp_path, [changed])
+    with pytest.raises(SystemExit) as e:
+        guard(_args())
+    assert "c-ptpc (planned for another case row" in str(e.value)
+
+
+def test_a_run_that_is_not_a_lease_does_not_plan_even_with_allow_build(
+    monkeypatch, tmp_path
+):
+    monkeypatch.delenv(prebuild.NO_BUILD_ENV, raising=False)
+    monkeypatch.delenv("FLYDSL_RUNTIME_RUN_ONLY", raising=False)
+    _stamp(monkeypatch)
+    guard = _guard(monkeypatch, tmp_path, [PTPC])
+    guard(
+        _args(no_build=False, allow_build=True, launcher="gpuq")
+    )  # planning would raise
+    guard(_args(no_build=False))  # not a lease: nothing planned, nothing refused
+
+
+def test_planning_and_the_jit_dir_follow_the_aiter_tree_under_test(tmp_path):
+    """The guard imported aiter from the harness's own checkout, so planning resolved the
+    wrong routes and JIT-built into that checkout's aiter/jit."""
+    import os
+    import subprocess
+    import sys
+
+    tree = os.environ.get(
+        "MOE_BENCH_ROUTED_TREE", "/workspaces/meta/wt/GM-123/aiter-core"
+    )
+    if not os.path.isdir(os.path.join(tree, "aiter")):
+        pytest.skip("needs a second aiter tree (MOE_BENCH_ROUTED_TREE)")
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if os.path.realpath(tree) == os.path.realpath(here):
+        pytest.skip("the tree under test is the harness's own")
+    tier = tmp_path / "t.csv"
+    row = {c: "" for c in schema.COLS}
+    row.update(
+        case_id="t-1", kind="fused", family="fp8-token", token="8", model_dim="4096",
+        inter_dim="128", expert="513", topk="11", act_type="Silu", dtype="bf16",
+        q_dtype_a="fp8", q_dtype_w="fp8", q_type="per_Token", use_g1u1="1",
+        doweight_stage1="0", modes="warm",
+    )  # fmt: skip
+    schema.write_tier(str(tier), [row])
+    env = dict(os.environ, PYTHONPATH=here, MOE_BENCH_STATE_DIR=str(tmp_path / "state"))
+    env.pop("AITER_JIT_DIR", None)
+    os.makedirs(env["MOE_BENCH_STATE_DIR"])
+    probe = "\n".join(
+        [
+            "import sys, os",
+            f"sys.argv = ['x', 'run', '--aiter', {tree!r}, '--cases', {str(tier)!r},",
+            f"    '--mode', 'bar', '--out-dir', {str(tmp_path / 'out')!r}, '--no-build']",
+            "from op_tests.moe_bench import __main__ as m",
+            "try:\n    m.main()",
+            "except SystemExit as e:\n    print('EXIT', e)",
+            "import aiter; print('AITER', os.path.realpath(aiter.__file__))",
+        ]
+    )
+    r = subprocess.run(
+        [sys.executable, "-c", probe], env=env, cwd=here, capture_output=True,
+        text=True, timeout=600, check=False,
+    )  # fmt: skip
+    out = r.stdout
+    assert "AITER " + os.path.realpath(tree) in out, (out, r.stderr[-800:])
+    assert "t-1 (no plan)" in out and os.path.realpath(tree) in out.split("EXIT")[1]

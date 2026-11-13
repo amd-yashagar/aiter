@@ -90,19 +90,27 @@ def cmd_cases(a):
 
 
 def _guard_builds(a, runner):
-    """A leased run must never compile: refuse when modules are missing (gpuq), warn
-    otherwise, and make workers fail a candidate instead of building."""
+    """A leased run must never compile or plan: it reads the plan the host prebuild wrote
+    (refusing at once, naming the cases, when a case has none), refuses when a module that
+    should exist is missing, and makes workers fail a candidate instead of building. A run
+    that is not a lease does not plan at all; it only warns when a stored plan says modules
+    are missing. Everything is looked up in the --aiter tree under test."""
     from . import prebuild
 
-    cases = runner.select_cases(a.cases.split(","), a.filter)
-    bad = prebuild.known_failed()
-    miss = [m for m in prebuild.missing(prebuild.plan(cases)) if m not in bad]
+    prebuild.use_tree(a.aiter)
     run_only_env = (
         os.environ.get(prebuild.NO_BUILD_ENV) == "1"
         or os.environ.get("FLYDSL_RUNTIME_RUN_ONLY") == "1"
     )
-    if (a.launcher == "gpuq" or a.no_build or run_only_env) and not a.allow_build:
-        prebuild.require_prebuilt(cases)
+    lease = (a.launcher == "gpuq" or a.no_build or run_only_env) and not a.allow_build
+    cases = runner.select_cases(a.cases.split(","), a.filter)
+    miss = []
+    if lease:
+        # the parent of a lease must not JIT-build either (planning used to)
+        os.environ[prebuild.NO_BUILD_ENV] = "1"
+        prebuild.forbid_builds()
+        need = prebuild.leased_plan(cases)
+        prebuild.require_prebuilt(cases, need)
         fly = prebuild.flydsl_cases_missing(cases)
         if fly:
             raise SystemExit(
@@ -111,10 +119,18 @@ def _guard_builds(a, runner):
                 "Run `run --mode prebuild` first, or pass --allow-build:\n  "
                 + "\n  ".join(fly[:20])
             )
-        os.environ[prebuild.NO_BUILD_ENV] = "1"
         prebuild.arm_flydsl_run_only()
-    elif os.path.exists(prebuild.manifest_path()):
-        os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = prebuild.flydsl_cache_dir()
+    else:
+        if os.path.exists(prebuild.manifest_path()):
+            os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = prebuild.flydsl_cache_dir()
+        try:
+            need = prebuild.leased_plan(cases)
+        except SystemExit:
+            need = (
+                {}
+            )  # no current plan: nothing is known about the modules, nothing planned
+        bad = prebuild.known_failed()
+        miss = [m for m in prebuild.missing(need) if m not in bad]
     if not miss:
         return
     print(
@@ -373,7 +389,10 @@ def main(argv=None):
 
         return routes_cmd.cmd_coverage(a)
     if a.fn == "run":
+        from . import prebuild as _prebuild
         from . import runner as _runner
+
+        _prebuild.use_tree(a.aiter)
 
         _runner.wait_for_disk(tempfile.gettempdir(), a.min_free_gb)
         if a.mode == "prebuild" or a.prebuild_only:

@@ -225,6 +225,7 @@ class BarGroupJob(runner.GroupJob):
         self.source_modules = list(source_modules)
         self.screen = screen
         self.bad = {}
+        self.faults = {}  # (case id, cand id) -> the error the worker died of
         self.main_failures = {}
         self.dispatch_us = {}
 
@@ -252,6 +253,9 @@ class BarGroupJob(runner.GroupJob):
         )
 
     def handle_other(self, ev):
+        if ev.get("event") == "gpu_fault":
+            self.faults[(ev["case_id"], ev["cand_id"])] = ev.get("detail", "")
+            return
         if ev.get("event") != "cand" or self.cand_table is None:
             return
         c = next((x for x in self.cases if x.id == ev["case_id"]), None)
@@ -268,6 +272,9 @@ class BarGroupJob(runner.GroupJob):
             cid = self.phase[len("cand:") :]
             c = self.pending[self.inflight]
             self.bad.setdefault(c.id, set()).add(cid)
+            fault = self.faults.get((c.id, cid))
+            if fault:
+                detail = f"{detail}; worker error before exit: {fault}"
             ev = {
                 "case_id": c.id,
                 "cand_id": cid,
