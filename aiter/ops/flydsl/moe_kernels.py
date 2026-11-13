@@ -502,10 +502,19 @@ def _register_production_variants_stage2(
         kernels[_base + psuffix] = {**kernels[_base], **povr}
 
 
-# gfx950 LDS budget per workgroup. A registered name whose LDS request exceeds this
-# is not merely slow, it fails to build ("local memory (N) exceeds limit"), so the
-# tuner never times it and the AOT precompile silently drops the config.
-_MAX_LDS_BYTES = 160 * 1024
+# LDS budget per workgroup of the arch the registry is built for (64 KiB on gfx942, 160 KiB
+# on gfx950). A registered name whose LDS request exceeds it is not merely slow: on gfx950
+# it fails to build ("local memory (N) exceeds limit"), on gfx942 it builds and then fails
+# its first launch with hipErrorIllegalState, which poisons the HIP context. So the tuner
+# never times it and the AOT precompile drops the config.
+def _lds_budget_bytes() -> int:
+    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
+    try:
+        return get_lds_capacity_bytes()
+    except (RuntimeError, KeyError, ValueError, OSError):
+        # No GPU tooling on this host: keep the widest budget (the former constant).
+        return 160 * 1024
 
 
 def _gemm1_lds_bytes(tile_m: int, tile_n: int, tile_k: int, k_wave: int) -> int:
@@ -524,6 +533,19 @@ def _gemm1_lds_bytes(tile_m: int, tile_n: int, tile_k: int, k_wave: int) -> int:
     return max(a_lds, reduce_bytes)
 
 
+def _gemm2_lds_bytes(tile_m: int, tile_n: int, tile_k: int, mode: str) -> int:
+    """LDS bytes ``compile_gemm2_a16w4_port`` allocates (no ``reuse_lds``) for this tile.
+
+    Mirrors ``_lds_bytes`` in :mod:`kernels.moe_2stage_a16wmix.gemm2`: the ``BM x TILE_K``
+    bf16 A tile, plus a ``BM x TILE_N`` fp32 accumulator staging area for the atomic
+    epilogue (the reduce epilogue stages bf16 and overlays the A tile).
+    """
+    a_bytes = tile_m * tile_k * 2
+    if mode == "reduce":
+        return max(a_bytes, tile_m * tile_n * 2)
+    return a_bytes + tile_m * tile_n * 4
+
+
 def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     """Return {kernelName: params} for all supported int4_bf16 (a16wi4) stage1 configs.
 
@@ -535,6 +557,7 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     split-K its tuned timing assumed. Retune such rows onto ``_kw{n}``.
     """
     kernels = {}
+    lds_budget = _lds_budget_bytes()
     a_dtype = "bf16"
     b_dtype = "int4"
     tile_ks = [128, 256]
@@ -579,7 +602,7 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
                         continue
                     if kw > 1 and 4 * tn > tk:
                         continue
-                    if _gemm1_lds_bytes(tm, tn, tk, kw) > _MAX_LDS_BYTES:
+                    if _gemm1_lds_bytes(tm, tn, tk, kw) > lds_budget:
                         continue
                     for bnt in (0, 2):
                         _emit(tm, tn, tk, kw=kw, bnt=bnt)
@@ -598,6 +621,7 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     not forward ``persist`` to the port, so such a name would silently run non-persist.
     """
     kernels = {}
+    lds_budget = _lds_budget_bytes()
     a_dtype = "bf16"
     b_dtype = "int4"
     tile_ks = [128, 256]
@@ -609,6 +633,8 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
         for tn in tile_ns:
             for tk in tile_ks:
                 for mode in modes:
+                    if _gemm2_lds_bytes(tm, tn, tk, mode) > lds_budget:
+                        continue
                     base_name = flydsl_kernel_name(
                         2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
                     )
@@ -642,6 +668,7 @@ def get_flydsl_stage1_kernels_a16w16(out_dtype: str) -> dict[str, dict]:
     if out_dtype != "bf16":
         return {}
     kernels = {}
+    lds_budget = _lds_budget_bytes()
     a_dtype = "bf16"
     b_dtype = "bf16"
     tile_ks = [128, 256]
@@ -677,7 +704,7 @@ def get_flydsl_stage1_kernels_a16w16(out_dtype: str) -> dict[str, dict]:
                         continue
                     if kw > 1 and 4 * tn > tk:
                         continue
-                    if _gemm1_lds_bytes(tm, tn, tk, kw) > _MAX_LDS_BYTES:
+                    if _gemm1_lds_bytes(tm, tn, tk, kw) > lds_budget:
                         continue
                     for bnt in (0, 2):
                         _emit(tm, tn, tk, kw=kw, bnt=bnt)
@@ -693,6 +720,7 @@ def get_flydsl_stage2_kernels_a16w16(out_dtype: str) -> dict[str, dict]:
     if out_dtype != "bf16":
         return {}
     kernels = {}
+    lds_budget = _lds_budget_bytes()
     a_dtype = "bf16"
     b_dtype = "bf16"
     tile_ks = [128, 256]
@@ -706,6 +734,8 @@ def get_flydsl_stage2_kernels_a16w16(out_dtype: str) -> dict[str, dict]:
         for tn in tile_ns:
             for tk in tile_ks:
                 for mode in modes:
+                    if _gemm2_lds_bytes(tm, tn, tk, mode) > lds_budget:
+                        continue
                     base_name = flydsl_kernel_name(
                         2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
                     )
