@@ -21,7 +21,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 
 _CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
 _ACTS = {ActivationType.Silu: "silu"}
-# Core's route_to_tiles is 1.2-1.6x slower on the device than Opus at mid and large M.
+# Opus moe_sorting unless a config says "sort": "core"; this forces core's route_to_tiles for every call.
 _CORE_SORT = os.getenv("AITER_FP8B_CORE_SORT", "0") == "1"
 
 
@@ -268,7 +268,9 @@ class _Fp8BlockGfx950(MoeKernel):
         zero = None if combine.startswith("rows") else buf
         # As fused_moe sorts: global expert count, EP mask (local expert ids out, masked
         # and -1 routes dropped, their rows zeroed), num_local_tokens.
-        if _CORE_SORT:
+        # core's route_to_tiles where the config asks for it (p128w8c: exact against Opus, 10-15 us
+        # less sort at DSV3 E257 M >= 8192); AITER_FP8B_CORE_SORT=1 forces it everywhere
+        if _CORE_SORT or cfg.get("sort") == "core":
             tmap = route_to_tiles(
                 call.topk_ids.to(torch.int32),
                 call.topk_weight.to(torch.float32),

@@ -151,6 +151,12 @@
         "nt",
         "sc1"
       ]
+    },
+    "p128w8c": {
+      "tile_m": 128,
+      "tile_n2": 128,
+      "stage1": "8wave",
+      "sort": "core"
     }
   },
   "default": [
