@@ -78,6 +78,7 @@ def parse_config(config):
             "so",
             "rn",
             "sa",
+            "cs",
         )
         if key in keys and tok[len(key) :]:
             out[key] = int(tok[len(key) :])
@@ -279,7 +280,14 @@ class _MxGfx950(MoeKernel):
             s1,
             s2,
             r,
-            (direct, bool(cfg.get("iq", 0)), xcd, xg, bool(cfg.get("sa", 1))),
+            (
+                direct,
+                bool(cfg.get("iq", 0)),
+                xcd,
+                xg,
+                bool(cfg.get("sa", 1)),
+                cfg.get("cs"),
+            ),
         )
 
     def warmup(self, weights, m, topk, config):
@@ -328,8 +336,12 @@ class _MxGfx950(MoeKernel):
         out = call.output
         # Core's sort is faster at decode, Opus at large M (smci355, core be32165cd:
         # M=8 13.4 vs 16.4 us; DSV4-Pro M=4096 34.2 vs 30.7; Kimi-K3 63.7 vs 31.4).
+        # cs1/cs0 in the config pick core/Opus per route (core f197997b3: core wins
+        # at M=256 on DeepSeek-V4.1 5120/2304/E24, Opus on MiniMax M=4096).
         sort = os.environ.get("AITER_MOE_MX_SORT") or (
-            "opus" if self.prefill else "core"
+            ("core" if direct[5] else "opus")
+            if direct[5] is not None
+            else ("opus" if self.prefill else "core")
         )
         if sort == "core":
             if out is None:
