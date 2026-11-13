@@ -5069,7 +5069,25 @@ def get_2stage_cfgs(
     is_opus1 = isinstance(kernelName1, str) and kernelName1.startswith("opus_moe1_")
     is_cktile2 = isinstance(kernelName2, str) and kernelName2.startswith("cktile_")
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
+    is_cktile1 = isinstance(kernelName1, str) and kernelName1.startswith("cktile_")
+    is_asm1 = isinstance(kernelName1, str) and kernelName1.startswith("_ZN5aiter")
     if is_opus1 or is_flydsl1 or is_flydsl2:
+        if not (is_opus1 or is_flydsl1) and (is_flydsl2_layout or is_opus2):
+            raise NotImplementedError(
+                f"Stage 1 {kernelName1!r} cannot feed the layout stage 2 "
+                f"{kernelName2!r}: layout stage 2 kernels read the quantized "
+                "intermediate and scales that their paired FlyDSL or opus stage 1 "
+                f"writes (token={token}, model_dim={model_dim}, inter_dim={inter_dim}, "
+                f"expert={expert}, topk={topk})."
+            )
+        if is_asm1:
+            raise NotImplementedError(
+                f"ASM stage 1 {kernelName1!r} has no verified pairing with the "
+                f"FlyDSL stage 2 {kernelName2!r}: its fp8 output and scale layout "
+                f"is not what FlyDSL stage 2 reads (token={token}, "
+                f"model_dim={model_dim}, inter_dim={inter_dim}, expert={expert}, "
+                f"topk={topk})."
+            )
         enable_bias = (
             activation == ActivationType.Swiglu
             and _needs_swiglu_bias_support(dtype, q_type)
@@ -5091,6 +5109,15 @@ def get_2stage_cfgs(
                 activation=activation,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
+            )
+        elif is_cktile1:
+            stage1_func = functools.partial(
+                cktile_moe_stage1,
+                n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
+                k_pad_zeros=hidden_pad // 128 * 128,
+                activation=activation,
+                split_k=1,
+                dtype=dtype,
             )
         else:
             stage1_func = functools.partial(
@@ -5158,7 +5185,7 @@ def get_2stage_cfgs(
             block_m,
             int(ksplit),
             run_1stage,
-            has_bias=enable_bias and (is_opus1 or is_flydsl1),
+            has_bias=enable_bias and (is_opus1 or is_flydsl1 or is_cktile1),
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias and (is_flydsl2 or is_cktile2),
             skip_inter_quant="_moe2_layout_" in str(kernelName2),
