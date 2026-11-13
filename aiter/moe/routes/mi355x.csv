@@ -1,1 +1,6 @@
 family,model_dim,inter_dim,experts,topk,act,doweight_stage1,m_min,m_max,kernel,config,verified,note
+# Provisional gfx950 MX rows: no worse than dispatch (AITER_MOE_DISABLE=1) warm and cold, on uniform, hot1 and zipf routing, at both ends of each M range; re-gate against the MI355X MX bars when they land.
+a4w4,3072,512,128,4,swiglu,*,1,8,gfx950_mx_a4w4.decode,,provisional harness 972db4e11 (vs dispatch; no MX bar yet),gpt-oss decode: measured M=1 (tier1-00431) and M=8 (tier1-00164); loses at M=256
+a4w4,6144,384,129,5,swiglu,*,3073,8192,gfx950_mx_a4w4.prefill,bm64_la2_aa2_nt0_sl1_o12_nb2_so1_xg3_rn1_sa0_cs0,provisional harness 972db4e11 (vs dispatch; no MX bar yet),MiniMax-M3: measured M=3073 4096 (tier1-00103) 8192; loses at 16384 and 32768
+a4w4,4096,512,257,6,swiglu,*,4096,32768,gfx950_mx_a4w4.prefill,,provisional harness 972db4e11 (vs dispatch; no MX bar yet),measured M=4096 and 32768 (tier1-00000); loses on zipf at 2048
+a4w4,6144,512,257,9,swiglu,*,16384,32768,gfx950_mx_a4w4.prefill,,provisional harness 972db4e11 (vs dispatch; no MX bar yet),GLM-5.x: measured M=16384 and 32768 (tier1-00066); loses at 8192
