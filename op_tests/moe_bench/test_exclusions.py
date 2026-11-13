@@ -29,7 +29,9 @@ def test_only_tile_n_64_of_the_per_token_fp8_stage_1_family_matches():
 
 def test_the_stage_1_name_comes_from_the_pair_id_or_the_route():
     assert exclusions.stage1_of(f"fused_moe|{T64}|{CK}|bm32|ks0|nt0") == T64
-    assert exclusions.stage1_of("fused_moe|1stage|asm_k|bm32|flat0|asm_1stage") == ""
+    assert (
+        exclusions.stage1_of("fused_moe|1stage|asm_k|bm32|flat0|asm_1stage") == "asm_k"
+    )
     assert exclusions.stage1_of("fused_moe|graph|impl__x") == ""
     assert exclusions.stage1_of("dispatch", T64B) == T64B
     assert exclusions.stage1_of("dispatch") == ""
@@ -159,18 +161,18 @@ def test_the_unsafe_list_holds_every_failed_kernel_of_the_verification_files():
     assert "buffer probe" in t[("gfx950", "64x128_2tg_pf3")]
     assert exclusions.stage1_tile(UNSAFE) == "32x256_2tg_pf2"
     assert exclusions.stage1_tile("moe_ck2stages_gemm1_x") is None
-    # another .co (doweight, blockscale) with the same tile is not the listed kernel
+    # another .co (doweight, blockscale) with the same tile is keyed by its whole name, not the listed tile
     assert (
         exclusions.stage1_tile(
             "_ZN5aiter51fmoe_stage1_bf16_pertokenFp8_doweight_g1u1_32x64_4tg_pf3E"
         )
-        is None
+        != "32x64_4tg_pf3"
     )
     assert (
         exclusions.stage1_tile(
             "fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1_64x128_2tg_pf3E"
         )
-        is None
+        != "64x128_2tg_pf3"
     )
 
 
@@ -219,3 +221,75 @@ def test_the_list_is_extended_by_appending_verdicts_in_one_file(tmp_path):
         "also_on"
     ] == "gfx951"
     assert exclusions.append_verdicts(got, path) == 1
+
+
+ONE = "_ZN5aiter47fmoe_bf16_pertokenFp8_g1u1_tkw1_silu_1tg_32x64E"  # P01, P03, P04, P05 on gfx950
+ONE_OTHER = "_ZN5aiter47fmoe_bf16_pertokenFp8_g1u1_vs_silu_1tg_32x256E"  # P06 passed
+
+
+def test_the_one_stage_kernel_of_the_p_rows_is_on_the_list_by_name():
+    assert (
+        exclusions.kernel_key(ONE) == "fmoe_bf16_pertokenFp8_g1u1_tkw1_silu_1tg_32x64"
+    )
+    assert "unsafe kernel" in exclusions.unsafe_reason("gfx950", ONE)
+    assert exclusions.unsafe_reason("gfx950", ONE_OTHER) == ""
+    assert exclusions.unsafe_reason("gfx942", ONE) == ""
+    # a 2-stage tile of the same text is another kernel; blockscale 1-stage is another family
+    assert exclusions.kernel_key(
+        "_ZN5aiter47fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x128E"
+    ).startswith("fmoe_bf16_blockscale")
+    cid = f"fused_moe|1stage|{ONE}|bm32|flat0|asm_1stage"
+    assert exclusions.stage1_of(cid) == ONE
+    got = exclusions.excluded([(cid, exclusions.stage1_of(cid), "ok")], "gfx950")
+    assert "unsafe kernel" in got[cid]
+
+
+def test_a_one_stage_kernel_never_sets_the_bar_on_its_arch():
+    bad = f"fused_moe|1stage|{ONE}|bm32|flat0|asm_1stage"
+    good = f"fused_moe|1stage|{ONE_OTHER}|bm32|flat0|asm_1stage"
+    row = row_of({bad: result(bad, 20.0), good: result(good, 25.0)})
+    assert row["bar_id"] == good and "unsafe kernel" in row["bar_exclusions"]
+
+
+def test_one_stage_verdicts_ingest_with_the_family_prefix(tmp_path):
+    src = tmp_path / "v.csv"
+    src.write_text(
+        "row_id,kind,stage1_kernel,verdict,uniform_bad_reps,hot1_bad_reps\r\n"
+        "B1,shipped_gfx950_blockscale_1stage_asm_row,vs_silu_1tg_32x128,FAIL,1/6,0/6\r\n"
+        "P1,shipped_gfx950_per_token_fp8_1stage_asm_row,tkw1_silu_1tg_32x64,FAIL,2/6,1/6\r\n"
+        "X1,extra_shipped_gfx950_row,64x128_2tg_pf3,FAIL,3/6,6/6\r\n"
+    )
+    got = {r["row_id"]: r["stage1_tile"] for r in exclusions.ingest(str(src), "gfx950")}
+    assert got == {
+        "B1": "fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_32x128",
+        "P1": "fmoe_bf16_pertokenFp8_g1u1_tkw1_silu_1tg_32x64",
+        "X1": "64x128_2tg_pf3",
+    }
+
+
+def test_taint_is_for_two_stage_pairs_only():
+    ones = [
+        "fused_moe|1stage|K|bm32|flat0|asm_1stage",
+        "fused_moe|1stage|K|bm32|flat1|asm_1stage",
+    ]
+    got = exclusions.excluded([(ones[0], "K", "ok"), (ones[1], "K", "fail")], "gfx950")
+    assert got == {}  # a failing flat variant does not take the other variant out
+
+
+def test_a_pair_that_failed_accuracy_in_the_screen_taints_too():
+    good = f"fused_moe|{OK1}|{CK}|bm32|ks0|nt0"
+    screened_bad = (
+        f"fused_moe|{OK1}|{CK}_s|bm32|ks0|nt0"  # failed while screened: in no result
+    )
+    other = f"fused_moe|{OK2}|{CK}|bm64|ks0|nt0"
+    results = {good: result(good, 30.0), other: result(other, 80.0)}
+    fh = io.StringIO()
+    S = SimpleNamespace(kind="x", D=1, I=1, E=1, topk=1)
+    bar_worker._emit_summary(
+        fh, SimpleNamespace(id="c1"), S, "warm", results, {"gpu": "g", "sku": "", "gfx": "gfx942"}, [], "bar",
+        failed=[screened_bad],
+    )  # fmt: skip
+    row = next(
+        json.loads(x) for x in fh.getvalue().splitlines() if '"event": "row"' in x
+    )
+    assert row["bar_id"] == other and "taint" in row["bar_exclusions"]

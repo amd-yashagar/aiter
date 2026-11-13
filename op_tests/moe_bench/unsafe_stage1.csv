@@ -10,3 +10,4 @@ gfx950,32x64_4tg_pf3,,results/smci355-moebug064-gfx950.csv,H13,"uniform 6/6, hot
 gfx950,64x64_2tg_pf3,,results/smci355-moebug064-gfx950.csv,H16,"uniform 6/6, hot1 6/6 bad reps"
 gfx950,64x64_3tg_pf2,,results/smci355-moebug064-gfx950.csv,H19,"uniform 0/6, hot1 1/6 bad reps"
 gfx942,32x64_4tg_pf3,,status/meta-moebug064-tuned-rows.csv,R24,"uniform 6/6, hot1 6/6 bad reps"
+gfx950,fmoe_bf16_pertokenFp8_g1u1_tkw1_silu_1tg_32x64,,results/smci355-moebug064-gfx950.csv,"P01,P03,P04,P05","1-stage kernel, shipped ds_v3 rows 346-350 (aiter-integ): P01 uniform 2/6 hot1 1/6, P03 1/6 0/6, P04 4/6 1/6 (non-finite and 1e10 seen), P05 3/6 0/6 bad reps; P02 passed"

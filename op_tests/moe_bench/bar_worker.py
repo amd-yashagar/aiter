@@ -371,6 +371,9 @@ class Measurer:
         )  # "source:backend" -> {"total", "ok", "fail", "compile", "error"}
         self.fh, self.case_id = fh, case_id
         self.records = []  # confirmed results for the bar
+        self.failed = (
+            []
+        )  # ids of every candidate that failed accuracy, screened or confirmed
         self.routes_disabled = False  # bar mode: assert no route served a call
 
     def measure(self, cand, quick=False, modes=("warm",), check=True):
@@ -379,6 +382,8 @@ class Measurer:
         ``check=False`` is the timing-only screen of two-phase bar mode: the router check
         and a short warm timing, no accuracy (finalists get the full measurement)."""
         res = self._measure(cand, quick, modes, check)
+        if res.get("outcome") == "fail":
+            self.failed.append(cand.id)
         self._tally(cand, res)
         return res
 
@@ -1099,6 +1104,7 @@ def run_bar_group(cases, spec, fh):
                     if pre_excluded
                     else ""
                 ),
+                meas.failed,
             )
         from .candidates.fused_cfg import unforce
 
@@ -1280,7 +1286,7 @@ def _add_review(row, ok, results, mode):
     row.update(_gate("lr", lr.get("acc"), lr.get("numerics", "")))
 
 
-def _bar_exclusions(results, gfx=None):
+def _bar_exclusions(results, gfx=None, failed=()):
     """{candidate id: reason} of the results a bar must not count (see ``exclusions``)."""
     entries = []
     for cid, r in results.items():
@@ -1291,7 +1297,11 @@ def _bar_exclusions(results, gfx=None):
             getattr(cand, "id", cid), (r.get("route") or {}).get("kernel1", "")
         )
         entries.append((cid, s1, r.get("outcome")))
-    return exclusions.excluded(entries, gfx)
+    # a pair that failed accuracy while being screened is in no result but still taints
+    entries += [
+        (f, exclusions.stage1_of(f), "fail") for f in failed if f not in results
+    ]
+    return {k: v for k, v in exclusions.excluded(entries, gfx).items() if k in results}
 
 
 def _emit_summary(
@@ -1306,6 +1316,7 @@ def _emit_summary(
     main_failure=None,
     accounting=None,
     pre_excluded=None,
+    failed=(),
 ):
     from . import roofline
 
@@ -1314,7 +1325,7 @@ def _emit_summary(
         for cid, r in results.items()
         if r.get("ok") and mode in r.get("by_mode", {})
     }
-    skip = _bar_exclusions(results, ident.get("gfx"))
+    skip = _bar_exclusions(results, ident.get("gfx"), failed)
     for cid in skip:
         ok.pop(cid, None)
     row = {
