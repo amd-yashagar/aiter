@@ -237,7 +237,7 @@ def _flydsl_fhmoe_stage1_wrapper(
 
     parsed = moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
-        raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+        raise ValueError(moe_kernels.flydsl_kernel_error(kernelName))
     act = "swiglu" if activation == ActivationType.Swiglu else "silu"
     return flydsl_fhmoe_stage1(
         a=hidden_states,
@@ -307,7 +307,7 @@ def _flydsl_fhmoe_stage2_wrapper(
 
     parsed = moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
-        raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+        raise ValueError(moe_kernels.flydsl_kernel_error(kernelName))
     return flydsl_fhmoe_stage2(
         inter_states=inter_states,
         w2=w2,

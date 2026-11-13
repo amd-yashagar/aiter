@@ -188,6 +188,44 @@ def resolve_flydsl_stage1_tile_n(inter_dim: int, tile_n: int) -> int:
     return tile_n
 
 
+_A16WMIX_NAME_RE = re.compile(
+    r"^flydsl_moe(?P<stage>[12])_abf16_w(?:bf16|int4|fp4)_[a-z0-9]+_"
+    r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)(?P<rest>.*)$"
+)
+
+
+def explain_unregistered_kernel(name: str) -> str | None:
+    """Why an a16w-mix FlyDSL kernel name is not registered on this arch, or None.
+
+    The registries drop configs whose LDS exceeds the arch's workgroup budget; a tuned
+    row or user CSV naming one of them would otherwise only be told the name is invalid.
+    """
+    m = _A16WMIX_NAME_RE.match(name)
+    if m is None:
+        return None
+    tm, tn, tk = (int(m.group(k)) for k in ("tm", "tn", "tk"))
+    rest = m.group("rest")
+    if m.group("stage") == "1":
+        kw = re.search(r"_kw(\d+)", rest)
+        needed = _gemm1_lds_bytes(tm, tn, tk, int(kw.group(1)) if kw else 1)
+    else:
+        needed = _gemm2_lds_bytes(
+            tm, tn, tk, "reduce" if "_reduce" in rest else "atomic"
+        )
+    limit = _lds_budget_bytes()
+    if needed <= limit:
+        return None
+    return (
+        f"FlyDSL kernel {name!r} needs {needed} bytes of LDS per workgroup but this "
+        f"arch allows {limit}, so it is not registered and cannot launch here"
+    )
+
+
+def flydsl_kernel_error(name: str, what: str = "Invalid FlyDSL kernel name") -> str:
+    """Message for a FlyDSL kernel name that is not in the registry."""
+    return explain_unregistered_kernel(name) or f"{what}: {name}"
+
+
 def get_flydsl_kernel_params(name: str) -> dict | None:
     """Lookup kernel params by name.
 

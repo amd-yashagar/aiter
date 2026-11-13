@@ -965,8 +965,10 @@ def _stage2_honors_runtime_reduce_override(stage2: Callable) -> bool:
     kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
     parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
     if parsed is None:
+        why = _get_flydsl_moe_kernels().explain_unregistered_kernel(kernel_name)
         raise ValueError(
-            "Runtime reduce overrides require a recognized FlyDSL stage2 "
+            why
+            or "Runtime reduce overrides require a recognized FlyDSL stage2 "
             f"kernel, got {kernel_name!r}"
         )
     # The a16w-mix launcher returns before the environment override.
@@ -2820,7 +2822,7 @@ def _flydsl_stage1_wrapper(
     moe_kernels = _get_flydsl_moe_kernels()
     parsed = moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
-        raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+        raise ValueError(moe_kernels.flydsl_kernel_error(kernelName))
     if out_dtype is not None:
         parsed = {**parsed, "out_dtype": out_dtype}
     if activation == ActivationType.Swiglu:
@@ -2908,7 +2910,7 @@ def _flydsl_stage2_wrapper(
     moe_kernels = _get_flydsl_moe_kernels()
     parsed = moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
-        raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+        raise ValueError(moe_kernels.flydsl_kernel_error(kernelName))
     effective_sort_block_m = parsed.get("sort_block_m", 0) or parsed["tile_m"]
     if block_m is not None and int(block_m) != effective_sort_block_m:
         raise ValueError(

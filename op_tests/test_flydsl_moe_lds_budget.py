@@ -122,6 +122,41 @@ def test_gfx950_registry_keeps_its_160_kib_budget(monkeypatch):
         assert all(_lds(label, p) <= 160 * KIB for p in kernels.values()), label
 
 
+def test_dropped_kernel_names_say_why_they_are_missing(monkeypatch):
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx942")
+    stage2 = "flydsl_moe2_abf16_wbf16_bf16_t128x128x128_atomic"
+    msg = mk.explain_unregistered_kernel(stage2)
+    assert stage2 in msg and "98304 bytes of LDS" in msg and "allows 65536" in msg
+    stage1 = "flydsl_moe1_abf16_wfp4_bf16_t32x32x256_kw4"
+    msg = mk.explain_unregistered_kernel(stage1)
+    assert stage1 in msg and "131072 bytes of LDS" in msg and "allows 65536" in msg
+    # a kernel that fits, and a name that is simply wrong, get no LDS explanation
+    assert (
+        mk.explain_unregistered_kernel(
+            "flydsl_moe2_abf16_wbf16_bf16_t64x128x256_atomic"
+        )
+        is None
+    )
+    assert mk.flydsl_kernel_error("flydsl_moe1_nonsense") == (
+        "Invalid FlyDSL kernel name: flydsl_moe1_nonsense"
+    )
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx950")
+    assert mk.explain_unregistered_kernel(stage2) is None
+
+
+def test_tuned_row_naming_a_dropped_kernel_gets_the_lds_message(monkeypatch):
+    import functools
+
+    import aiter.fused_moe as fm
+
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx942")
+    name = "flydsl_moe2_abf16_wbf16_bf16_t128x128x128_atomic"
+    monkeypatch.delitem(mk._KERNEL_PARAMS, name, raising=False)
+    stage2 = functools.partial(fm._flydsl_stage2_wrapper, kernelName=name)
+    with pytest.raises(ValueError, match=r"needs 98304 bytes of LDS.*allows 65536"):
+        fm._stage2_honors_runtime_reduce_override(stage2)
+
+
 def _launch_stage(stage, name, tile_m):
     from aiter import ActivationType, dtypes
     from aiter.fused_moe import (
