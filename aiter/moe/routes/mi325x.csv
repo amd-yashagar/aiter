@@ -27,12 +27,6 @@ fp8-token,7168,256,257,9,silu,0,0,8,gfx942_fp8_token.decode,,harness 186be311c/4
 fp8-tensor,7168,256,257,9,silu,0,0,8,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,DeepSeek-V3 per-tensor: zipf loses warm at M=12 (1.25x)
 fp8-tensor,7168,256,256,8,silu,0,0,8,gfx942_fp8_token.decode,,harness 186be311c/42d7b4279 variants + 946a02adc bar,DeepSeek-V3 per-tensor E256 (vllm E-scale layout measured): zipf loses warm at M=12 (1.16x)
 fp8-token,6144,384,129,5,swiglu,0,3328,2147483648,gfx942_fp8_token.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,MiniMax-M3 E129: bar and every variant from M=3328
-fp8-token,4096,128,513,11,silu,0,6144,2147483648,gfx942_fp8_token.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,Qwen3.5-397B: zipf loses to dispatch below M=6144
-fp8-token,6144,384,128,4,swiglu,0,4096,2147483648,gfx942_fp8_token.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,MiniMax-M3 E128: every variant at M 4096-16384
-fp8-token,5120,384,161,9,silu,0,16384,2147483648,gfx942_fp8_token.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,zipf loses to dispatch below M=16384
-fp8-token,6144,256,257,9,silu,0,16384,2147483648,gfx942_fp8_token.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,GLM-5: zipf loses to dispatch below M=16384
-fp8-token,7168,256,257,9,silu,0,16384,2147483648,gfx942_fp8_token.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,DeepSeek-V3: zipf loses to dispatch below M=16384
-fp8-tensor,2560,320,513,11,silu,0,4096,2147483648,gfx942_fp8_tensor.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,every variant at M 4096-16384
-fp8-tensor,7168,256,256,8,silu,0,4096,2147483648,gfx942_fp8_tensor.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,DeepSeek-V3 per-tensor E256: every variant at M 4096-16384
-fp8-tensor,7168,256,257,9,silu,0,4096,2147483648,gfx942_fp8_tensor.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,DeepSeek-V3 per-tensor: every variant at M 4096-16384
-fp8-tensor,1024,384,1,1,silu,0,16384,2147483648,gfx942_fp8_tensor.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,hot1/zipf lose to dispatch below M=16384
+fp8-token,4096,128,513,11,silu,0,16384,2147483648,gfx942_fp8_token.prefill,,harness 42d7b4279 bar + variants,Qwen3.5-397B: every variant no worse at M=16384; loses the bar (1.10x) and zipf (1.02x) at M=8192
+fp8-token,6144,384,128,4,swiglu,0,4096,6144,gfx942_fp8_token.prefill,,harness 42d7b4279 bar + 186be311c variants,MiniMax-M3 E128: no worse than the post-fix bar and dispatch on every variant at M 4096-6144; loses the bar at 8192
+fp8-tensor,2560,320,513,11,silu,0,4096,2147483648,gfx942_fp8_tensor.prefill,,harness 186be311c variants + 972db4e11/2660e606a bar,"REVIEW per-tensor 2560/320/E513: aiter dispatch raises at every M (MOEBUG-027, CK device_gemm unsupported); gfx942_fp8_tensor.prefill is the only correct path; fixed-tree -027 safe bar pending"
