@@ -80,6 +80,9 @@ def _build_stage1(
     sched_pin=False,
     waves_per_eu=0,
     xcd_group=1,
+    scale_lds=False,
+    lds_pack=False,
+    a_ahead=2,
 ):
     K = int(model_dim)
     INTER = int(inter_dim)
@@ -94,7 +97,7 @@ def _build_stage1(
     WCOLS = BNH // 4
     NT = WCOLS // 8  # weight tiles per wave: NT // 2 gate tiles, then their up tiles
     LA = int(ahead)
-    ALA = min(LA, 2)  # token tiles: two register sets (tiles kt+1, kt+2) at most
+    ALA = min(LA, int(a_ahead))  # token tiles: register sets issued ahead
     STATIC_HALF = interleave or (WCOLS // 16) % 2 == 0
     assert K % 256 == 0, f"model_dim={K} must be a multiple of 256"
     assert INTER % 32 == 0, f"inter_dim={INTER} must be a multiple of 32"
@@ -150,6 +153,29 @@ def _build_stage1(
     a_dump = rl_off + BM * 4 + 32  # 16 B dump for idle lanes of the inline quant
     tk_off = rl_off + (BM * 4 + 48 if DIRECT else 0)
     lds_bytes = tk_off + (0 if DIRECT else BM * 4)
+    # Scales staged in LDS once per tile: the tile's token scales (shared by every
+    # wave) and each wave's weight-scale rows for all of K, by dwordx4 loads, so the
+    # K loop reads them from LDS instead of issuing narrow loads per K tile.
+    SLDS = (
+        bool(scale_lds)
+        and not INLINE
+        and not DIRECT
+        and (GP8 * 32) % 1024 == 0
+        and GP % 16 == 0
+    )
+    AS_STRIDE = GP + 16
+    AS_OFF = cm.pad_up(lds_bytes, 16)
+    WS_ROWB = GP8 * 32
+    WS_OFF = AS_OFF + BM * AS_STRIDE
+    if SLDS:
+        lds_bytes = WS_OFF + NW * 2 * WS_ROWB
+    if SLDS and bool(lds_pack) and not A_RESIDENT:
+        # Scales right after the 2-slot A ring; the epilogue's f32 tile (written after
+        # the K loop's last barrier) overlays ring and scales; token ids go last.
+        AS_OFF = 2 * a_lds_bytes
+        WS_OFF = AS_OFF + BM * AS_STRIDE
+        tk_off = max(cm.pad_up(WS_OFF + NW * 2 * WS_ROWB, 16), acc_bytes)
+        lds_bytes = tk_off + BM * 4
     # aiter's Swiglu (gpt-oss form) clamps at 7.0 when no limit is given; the
     # other activations clamp only with an explicit limit.
     if swiglu_limit is None:
@@ -336,7 +362,11 @@ def _build_stage1(
         rb = (wave_all // fx.Int32(4)) * fx.Int32(MT * 16)
         nblk = fx.Int32(gpu.block_id("x"))
         mblk = fx.Int32(gpu.block_id("y"))
-        if const_expr(XCD):
+        if const_expr(XCD and int(xcd_group) == 0):
+            nblk, mblk = cm.xcd_slice(
+                nblk, mblk, NX, cm.global_ptr(arg_nvalid, T.i32)[0], BM
+            )
+        elif const_expr(XCD):
             nblk, mblk = cm.xcd_tile(nblk, mblk, NX, int(xcd_group))
         m_row = mblk * fx.Int32(BM)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -532,6 +562,18 @@ def _build_stage1(
                         per_ks.append(f)
                     frags.append(per_ks)
                 scales = []
+                if const_expr(SLDS):
+                    for q in range_constexpr(len(sc_row)):
+                        v = _lds_ld(
+                            lds_base,
+                            ws_wave
+                            + fx.Int32(q * WS_ROWB + kt * 256)
+                            + lane * fx.Int32(4),
+                        )
+                        if const_expr(sc_shift[q] is not None):
+                            v = v.shrui(sc_shift[q])
+                        scales.append(v)
+                    return frags, scales
                 for q in range_constexpr(len(sc_row)):
                     off = fx.Int64(
                         scale_offset_mfma(
@@ -545,6 +587,17 @@ def _build_stage1(
                 return frags, scales
 
             def load_a_scales(kt):
+                if const_expr(SLDS):
+                    return [
+                        _lds_ld(
+                            lds_base,
+                            fx.Int32(AS_OFF)
+                            + (rb + fx.Int32(j * 16) + lane16) * fx.Int32(AS_STRIDE)
+                            + lgrp * fx.Int32(GQ)
+                            + fx.Int32(4 * (kt // 2)),
+                        )
+                        for j in range_constexpr(MT)
+                    ]
                 if const_expr(INLINE):
                     return [
                         fx.ptr_load(
@@ -572,6 +625,65 @@ def _build_stage1(
                     for j in range_constexpr(MT)
                 ]
 
+            if const_expr(SLDS):
+                assert len(sc_row) <= 2
+                ws_wave = fx.Int32(WS_OFF) + wave_all * fx.Int32(2 * WS_ROWB)
+                AS_CH = GP // 16
+                as_regs = []
+                for p in range_constexpr(-(-(BM * AS_CH) // NTHR)):
+                    c = (tid + fx.Int32(p * NTHR)) % fx.Int32(BM * AS_CH)
+                    r = c // fx.Int32(AS_CH)
+                    col = c % fx.Int32(AS_CH)
+                    as_regs.append(
+                        (
+                            r,
+                            col,
+                            cm.global_vec_load(
+                                arg_as,
+                                fx.Int64(row_token(r)) * fx.Int64(GP)
+                                + fx.Int64(col * fx.Int32(16)),
+                                4,
+                            ),
+                        )
+                    )
+                ws_regs = []
+                for q in range_constexpr(len(sc_row)):
+                    for c in range_constexpr(WS_ROWB // 1024):
+                        ws_regs.append(
+                            cm.global_vec_load(
+                                arg_ws,
+                                fx.Int64(sc_row[q] * fx.Int32(WS_ROWB))
+                                + fx.Int64(fx.Int32(c * 1024) + lane * fx.Int32(16)),
+                                4,
+                            )
+                        )
+                for r, col, v in as_regs:
+                    fx.ptr_store(
+                        v,
+                        lds_typed_ptr(
+                            lds_base,
+                            T.i32,
+                            align=16,
+                            byte_offset=fx.Int32(AS_OFF)
+                            + r * fx.Int32(AS_STRIDE)
+                            + col * fx.Int32(16),
+                        ),
+                    )
+                i = 0
+                for q in range_constexpr(len(sc_row)):
+                    for c in range_constexpr(WS_ROWB // 1024):
+                        fx.ptr_store(
+                            ws_regs[i],
+                            lds_typed_ptr(
+                                lds_base,
+                                T.i32,
+                                align=16,
+                                byte_offset=ws_wave
+                                + fx.Int32(q * WS_ROWB + c * 1024)
+                                + lane * fx.Int32(16),
+                            ),
+                        )
+                        i += 1
             atoms = _scale_atoms(a_dtype, w_dtype)
             zero4 = fx.full(4, 0.0, fx.Float32)
             acc = [
@@ -594,13 +706,23 @@ def _build_stage1(
             else:
                 a_pend = {i: load_a_tile(i) for i in range(min(ALA, KT))}
             w_pend = {i: load_w(i) for i in range(min(LA, KT))}
-            if const_expr(not INLINE):
+            if const_expr(SLDS):
+                # The weight scales are wave-private in LDS (same-wave order); the
+                # token scales are shared, so they are read after the barrier.
+                if const_expr(not A_RESIDENT):
+                    store_a_tile(a_pend.pop(0), 0)
+                gpu.barrier()
                 s_pend = {
                     p: load_a_scales(2 * p) for p in range((min(LA, KT) + 1) // 2)
                 }
-            if const_expr(not A_RESIDENT):
-                store_a_tile(a_pend.pop(0), 0)
-            gpu.barrier()
+            else:
+                if const_expr(not INLINE):
+                    s_pend = {
+                        p: load_a_scales(2 * p) for p in range((min(LA, KT) + 1) // 2)
+                    }
+                if const_expr(not A_RESIDENT):
+                    store_a_tile(a_pend.pop(0), 0)
+                gpu.barrier()
             if const_expr(INLINE):
                 s_pend = {
                     p: load_a_scales(2 * p) for p in range((min(LA, KT) + 1) // 2)
