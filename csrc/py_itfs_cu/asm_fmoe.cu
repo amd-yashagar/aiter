@@ -850,7 +850,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u1. ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
+        impl_ptr = get_heuristic_kernel(
+            inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, 32, model_dim);
     }
     else if(input->dtype() == AITER_DTYPE_fp8) // fp8
     {
@@ -866,7 +867,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenFp8_g1u1_gelu;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenFp8_g1u1. ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
+        impl_ptr = get_heuristic_kernel(
+            inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, 32, model_dim);
     }
     else
     {
@@ -954,7 +956,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         else
             AITER_CHECK(false, __func__, ": unsupport current activation type");
     }
-    impl_ptr = get_heuristic_kernel(inter_dim, estimated_sub_X_cnt, config_map, 0, kernel_name_str);
+    impl_ptr = get_heuristic_kernel(
+        inter_dim, estimated_sub_X_cnt, config_map, 0, kernel_name_str, block_m, model_dim);
     impl_ptr->launch_kernel<1, 2>(out,
                                   input,
                                   gate,

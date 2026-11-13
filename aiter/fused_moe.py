@@ -4744,6 +4744,25 @@ def get_2stage_cfgs(
             f"activation {activation}; using default heuristics"
         )
 
+    # The per-token asm 1-stage kernels walk model_dim in steps of 256 and return wrong
+    # results otherwise, including when it is a multiple of 128 (fp8 on gfx942 and
+    # gfx950, int8 on gfx942).
+    asm_pertoken_needs_dim256 = (
+        q_type == QuantType.per_Token
+        and (
+            (get_gfx() in ("gfx942", "gfx950") and q_dtype_w == dtypes.fp8)
+            or (get_gfx() == "gfx942" and q_dtype_w == dtypes.i8)
+        )
+        and model_dim % 256 != 0
+    )
+    if cfg is not None and cfg.get("run_1stage", False) and asm_pertoken_needs_dim256:
+        cfg = None
+        logger.warning(
+            f"[fused_moe] discarding 1-stage tuned config for {keys}: the "
+            f"per-token asm kernels need model_dim % 256 == 0 (got {model_dim}); "
+            "using default heuristics"
+        )
+
     # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue.
     clamp_per_1x128 = (
         bool(swiglu_limit)
@@ -4840,9 +4859,11 @@ def get_2stage_cfgs(
                 )
                 run_1stage_xbf16 = run_1stage and xbf16
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
-                run_1stage = token > 32
+                run_1stage = token > 32 and not asm_pertoken_needs_dim256
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
-                run_1stage = token > 16 or inter_dim % 128 != 0
+                run_1stage = (
+                    token > 16 or inter_dim % 128 != 0
+                ) and not asm_pertoken_needs_dim256
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
 
