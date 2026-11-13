@@ -225,6 +225,9 @@ def get_flydsl_stage1_kernels(
     # extra tile_k=128 and xcd_swizzle=1 variants its tuned kernelNames name
     # (t32x{64,128,192,256}x128 / _xcd1), which the other dtypes don't use.
     is_a16w4 = a_dtype == "bf16" and is_fp4_b
+    # The a16w4 port allocates A (and k_wave scratch) in LDS: names over the arch's
+    # budget fail their first launch on gfx942 (see _lds_budget_bytes).
+    lds_budget = _lds_budget_bytes()
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
     tile_ks = [128, 256] if is_a16w4 else [256]
@@ -293,6 +296,12 @@ def get_flydsl_stage1_kernels(
                                             and num_n_waves < 2
                                         ):
                                             continue
+                                        if (
+                                            is_a16w4
+                                            and _gemm1_lds_bytes(tm, tn, tk, kw)
+                                            > lds_budget
+                                        ):
+                                            continue
                                         name = base + (f"_kw{kw}" if kw > 1 else "")
                                         kernels[name] = {
                                             "stage": 1,
@@ -328,6 +337,8 @@ def get_flydsl_stage2_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
     is_fp8 = b_dtype == "fp8"
+    is_a16w4 = a_dtype == "bf16" and is_fp4
+    lds_budget = _lds_budget_bytes()
     tile_ns = [128, 256] if is_fp4 else [128]
     # fp4 stage2 supports tile_k=128 (pack_K=1 scale sub-group shift path) as
     # well as 256.  tile_k=128 cleanly tiles K=inter_dim for TP-sharded shapes
@@ -344,6 +355,8 @@ def get_flydsl_stage2_kernels(
         for tn in tile_ns:
             for tk in tile_ks:
                 for mode in modes:
+                    if is_a16w4 and _gemm2_lds_bytes(tm, tn, tk, mode) > lds_budget:
+                        continue
                     for bnt in b_nts:
                         for xcd in xcd_swizzles:
                             base_name = flydsl_kernel_name(

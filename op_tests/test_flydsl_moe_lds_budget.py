@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL a16w16 / a16wi4 MoE configs must fit the LDS of the arch they are registered for.
+"""FlyDSL a16w16 / a16wi4 / a16w4 MoE configs must fit the LDS of the arch they are registered for.
 
 The registry filtered configs against the gfx950 budget (160 KiB) on every arch. On gfx942
 (64 KiB per workgroup) the over-budget stage-1 configs (``t32x{16,32,64}x256_kw4``,
@@ -27,6 +27,8 @@ def _registry(monkeypatch, gfx):
         "a16w16 s2": mk.get_flydsl_stage2_kernels_a16w16("bf16"),
         "int4 s1": mk.get_flydsl_stage1_kernels_int4_bf16("bf16"),
         "int4 s2": mk.get_flydsl_stage2_kernels_int4_bf16("bf16"),
+        "a16w4 s1": mk.get_flydsl_stage1_kernels("bf16", "fp4", "bf16"),
+        "a16w4 s2": mk.get_flydsl_stage2_kernels("bf16", "fp4", "bf16"),
     }
 
 
@@ -70,6 +72,27 @@ def test_gfx942_drops_the_configs_that_cannot_launch(monkeypatch):
         assert "flydsl_moe2_abf16_wint4_bf16_" + tile not in reg["int4 s2"], tile
 
 
+def test_gfx942_drops_the_a16w4_configs_that_cannot_launch(monkeypatch):
+    reg = _registry(monkeypatch, "gfx942")
+    prefix1 = "flydsl_moe1_abf16_wfp4_bf16_"
+    for tile in ("t32x32x256_kw4", "t32x32x256_xcd4_kw4", "t64x32x256_kw4"):
+        assert prefix1 + tile not in reg["a16w4 s1"], tile
+    prefix2 = "flydsl_moe2_abf16_wfp4_bf16_"
+    for tile in (
+        "t64x256x128_atomic",
+        "t64x256x256_atomic_persist",
+        "t128x128x128_atomic",
+        "t128x128x256_atomic_bnt2",
+        "t128x256x128_atomic",
+        "t128x256x256_atomic",
+    ):
+        assert prefix2 + tile not in reg["a16w4 s2"], tile
+    for tile in ("t32x32x128_kw4", "t16x128x256"):
+        assert prefix1 + tile in reg["a16w4 s1"], tile
+    for tile in ("t32x256x128_atomic", "t64x128x256_atomic"):
+        assert prefix2 + tile in reg["a16w4 s2"], tile
+
+
 def test_gfx942_keeps_configs_at_exactly_64_kib(monkeypatch):
     # Not a size rule: configs at exactly 64 KiB launch (767 launches observed, tile_m 16/32/64,
     # and every stage-1 tile_m=128 config at 64 KiB launches on its own).
@@ -92,6 +115,9 @@ def test_gfx950_registry_keeps_its_160_kib_budget(monkeypatch):
     assert "flydsl_moe1_abf16_wbf16_bf16_t128x128x256" in reg["a16w16 s1"]
     assert "flydsl_moe1_abf16_wbf16_bf16_t32x16x256_kw4" in reg["a16w16 s1"]
     assert "flydsl_moe2_abf16_wbf16_bf16_t128x128x256_atomic" in reg["a16w16 s2"]
+    # a16w4 stage 2: exactly 160 KiB fits, 192 KiB does not
+    assert "flydsl_moe2_abf16_wfp4_bf16_t128x256x128_atomic" in reg["a16w4 s2"]
+    assert "flydsl_moe2_abf16_wfp4_bf16_t128x256x256_atomic" not in reg["a16w4 s2"]
     for label, kernels in reg.items():
         assert all(_lds(label, p) <= 160 * KIB for p in kernels.values()), label
 
@@ -111,6 +137,15 @@ def _launch_stage(stage, name, tile_m):
     x = torch.randn(M, D, dtype=dtypes.bf16, device="cuda")
     w1 = torch.randn(E, 2 * I, D, dtype=dtypes.bf16, device="cuda") * 0.05
     w2 = torch.randn(E, D, I, dtype=dtypes.bf16, device="cuda") * 0.05
+    fp4 = "_wfp4_" in name
+    if fp4:
+        # packed MXFP4 weights and e8m0 scales; the values only need to be finite
+        w1 = torch.randint(0, 120, (E, 2 * I, D // 2), dtype=torch.uint8, device="cuda")
+        w2 = torch.randint(0, 120, (E, D, I // 2), dtype=torch.uint8, device="cuda")
+        w1s = torch.full(
+            (E * 2 * I * (D // 32),), 127, dtype=torch.uint8, device="cuda"
+        )
+        w2s = torch.full((E * D * (I // 32),), 127, dtype=torch.uint8, device="cuda")
     tw, ti = fused_topk(
         x, torch.randn(M, E, dtype=dtypes.bf16, device="cuda"), topk, True
     )
@@ -119,8 +154,8 @@ def _launch_stage(stage, name, tile_m):
         out = torch.zeros(M, topk, I, dtype=dtypes.bf16, device="cuda")
         _flydsl_stage1_wrapper(
             x,
-            shuffle_weight(w1, layout=(16, 16)),
-            w2,
+            w1 if fp4 else shuffle_weight(w1, layout=(16, 16)),
+            torch.zeros_like(w2) if fp4 else w2,
             sid,
             seid,
             nv,
@@ -128,20 +163,22 @@ def _launch_stage(stage, name, tile_m):
             topk,
             kernelName=name,
             activation=ActivationType.Silu,
+            w1_scale=w1s if fp4 else None,
         )
     else:
         out = torch.zeros(M, D, dtype=dtypes.bf16, device="cuda")
         inter = torch.randn(sid.shape[0], I, dtype=dtypes.bf16, device="cuda") * 0.1
         _flydsl_stage2_wrapper(
             inter,
-            w1,
-            shuffle_weight(w2, layout=(16, 16)),
+            torch.zeros_like(w1) if fp4 else w1,
+            w2 if fp4 else shuffle_weight(w2, layout=(16, 16)),
             sid,
             seid,
             nv,
             out,
             topk,
             kernelName=name,
+            w2_scale=w2s if fp4 else None,
             sorted_weights=sw,
             block_m=tile_m,
         )
@@ -160,6 +197,8 @@ def _launch_stage(stage, name, tile_m):
         (1, "flydsl_moe1_abf16_wbf16_bf16_t16x64x256_kw4", 16),
         (1, "flydsl_moe1_abf16_wbf16_bf16_t128x128x128", 128),
         (2, "flydsl_moe2_abf16_wbf16_bf16_t64x128x256_atomic", 64),
+        (1, "flydsl_moe1_abf16_wfp4_bf16_t32x32x128_kw4", 32),
+        (2, "flydsl_moe2_abf16_wfp4_bf16_t64x128x256_atomic", 64),
     ],
 )
 def test_registered_configs_launch_at_64_kib(stage, name, tile_m):
