@@ -179,12 +179,21 @@ def device_cu_count(device_index: int) -> int:
         return 256
 
 
-def _build_kernel(ctx_stride: int):
+def _build_kernel(ctx_stride: int, max_nn: int = MAX_NN):
+    # The query count is host metadata. Do not reserve eight rows for decode
+    # or five-row verify: that needlessly limits resident workgroups through LDS.
+    if not 1 <= max_nn <= MAX_NN:
+        raise ValueError("max_nn must be between 1 and 8")
+    Q_LDS_BYTES = max_nn * Q_ROW_BYTES
+    W_LDS_BYTES = max_nn * W_ROW_BYTES
+    LDS_BYTES = K_LDS_BYTES + Q_LDS_BYTES + W_LDS_BYTES
+    Q_LDS_OFF = K_LDS_BYTES
+    W_LDS_OFF = Q_LDS_OFF + Q_LDS_BYTES
     # ctx_stride is a build-time constant: 1 for a [B] context_lens (the
     # pre-2D kernel and name), n for a (B, n) table (its own build and name).
     kernel_name = (
         "fp8_paged_mqa_logits_gfx950_H32_D128_bkv64_kvb64_"
-        "nn8_w8_lds2_mfma16_ntg2l_flydsl"
+        f"nn{max_nn}_w8_lds2_mfma16_ntg2l_flydsl"
     )
     if ctx_stride != 1:
         kernel_name += f"_cs{ctx_stride}"
@@ -268,7 +277,7 @@ def _build_kernel(ctx_stride: int):
 
         # Cached prologue: live Q rows and their f32 head weights.
         q_batch_base = pid_batch * stride_q_batch
-        for rep in range_constexpr(Q_LDS_BYTES // (THREADS * 16)):
+        for rep in range_constexpr((Q_LDS_BYTES + THREADS * 16 - 1) // (THREADS * 16)):
             ci = tid + rep * THREADS
             row = udiv(ci * 16, Q_ROW_BYTES)
             pred = row < nn
@@ -379,7 +388,7 @@ def _build_kernel(ctx_stride: int):
                     value,
                 )
 
-            for r in range_constexpr(MAX_NN):
+            for r in range_constexpr(max_nn):
 
                 def _do(_r=r):
                     _score_row(fx.Int32(_r))
@@ -483,9 +492,9 @@ def _build_kernel(ctx_stride: int):
     return launch
 
 
-@lru_cache(maxsize=MAX_NN)
-def _compile(ctx_stride: int = 1):
-    return _build_kernel(ctx_stride)
+@lru_cache(maxsize=64)
+def _compile(ctx_stride: int = 1, max_nn: int = MAX_NN):
+    return _build_kernel(ctx_stride, max_nn)
 
 
 def flydsl_fp8_paged_mqa_logits(
@@ -604,7 +613,7 @@ def flydsl_fp8_paged_mqa_logits(
         split_kv = max(1, int(SplitKV))
 
     grid_blocks = batch_size * split_kv
-    launcher = _compile(int(ctx_stride))
+    launcher = _compile(int(ctx_stride), int(next_n))
     launcher.compile_hints = dict(DEFAULT_COMPILE_HINTS)
     stream = stream or torch.cuda.current_stream(q_fp8.device)
     with torch.cuda.device(q_fp8.device.index):

@@ -399,9 +399,33 @@ def check_graph_replay_reads_lengths_on_device():
             msg=f"{name}: CUDA graph replay",
         )
         assert err < 0.05, f"{name}: replay checkAllclose mismatch ratio {err}"
-        assert torch.isneginf(
-            inp["out_logits"][:, new_len:kv_len]
-        ).all(), f"{name}: replay wrote past the new context length"
+        assert torch.isneginf(inp["out_logits"][:, new_len:kv_len]).all(), (
+            f"{name}: replay wrote past the new context length"
+        )
+
+
+def check_flydsl_query_count_specialization():
+    """Odd query counts exercise the rounded-up final Q-copy iteration."""
+    if get_gfx_runtime() != "gfx950":
+        return
+    from aiter.ops.flydsl.kernels.mqa_logits.fp8_paged_mqa_logits_gfx950 import (
+        flydsl_fp8_paged_mqa_logits,
+    )
+
+    for n in range(1, 9):
+        inp = build_inputs((2, n, 32, 128, 64, True), 65, 256)
+        q, cache, w = inp["q_fp8"], inp["kv_cache"], inp["weights"]
+        lens, table, out = inp["context_lens"], inp["kv_indices"], inp["out_logits"]
+        table[:, 2:] = -1  # Empty splits and padding must not read page -1.
+        flydsl_fp8_paged_mqa_logits(
+            q, cache, w, out, lens, table, 256, SplitKV=4, TotalCuCount=256
+        )
+        reference = run_torch(inp, 65)
+        valid = torch.isfinite(reference)
+        got = out[:, :65].masked_fill(~valid, 0)
+        reference = reference.masked_fill(~valid, 0)
+        torch.testing.assert_close(got, reference, rtol=1e-2, atol=5.0)
+        assert calc_diff(got, reference) < 1e-3
 
 
 def main():
@@ -412,6 +436,7 @@ def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("paged_mqa_logits unsupported on %s; skipping", get_gfx())
         return
+    check_flydsl_query_count_specialization()
     check_launches_shipped_row()
     check_flydsl_fallback_keeps_gluon_knobs()
     check_strided_context_lens_rejected()
