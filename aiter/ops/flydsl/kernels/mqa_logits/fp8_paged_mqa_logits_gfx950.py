@@ -515,8 +515,9 @@ def flydsl_fp8_paged_mqa_logits(
 ):
     """Paged FP8 MQA logits for contiguous Q ``[B, next_n, 32, 128]``.
 
-    ``next_n`` may be 1..8. The compiled kernel reserves LDS for eight rows;
-    ``next_n_lens`` optionally selects fewer live rows per sequence.
+    ``next_n`` may be 1..8. Query and weight LDS allocations are specialized to
+    ``next_n``. ``next_n_lens`` optionally selects fewer live rows per sequence
+    without reducing those allocations.
 
     ``context_lens``: int32, contiguous, on ``q_fp8``'s device. Either
 
@@ -592,9 +593,10 @@ def flydsl_fp8_paged_mqa_logits(
     if next_n_lens.dtype != torch.int32 or next_n_lens.device != q_fp8.device:
         raise ValueError("next_n_lens must be int32 on the same device as q_fp8")
 
-    # One page fills all four compute SIMDs. Target three resident WGs/CU,
-    # matching the 50 KiB LDS allocation. Auto mode reads the runtime context
-    # maximum once; explicit SplitKV is graph-capture safe.
+    # One page fills all four compute SIMDs. Auto splitting targets three WGs/CU
+    # in the grid, not guaranteed residency: LDS allocation depends on next_n.
+    # Auto mode reads the runtime context maximum once; explicit SplitKV is
+    # graph-capture safe.
     if SplitKV is None or int(SplitKV) <= 0:
         real_pages = max(
             1,
