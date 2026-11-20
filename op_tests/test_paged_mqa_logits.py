@@ -399,9 +399,9 @@ def check_graph_replay_reads_lengths_on_device():
             msg=f"{name}: CUDA graph replay",
         )
         assert err < 0.05, f"{name}: replay checkAllclose mismatch ratio {err}"
-        assert torch.isneginf(inp["out_logits"][:, new_len:kv_len]).all(), (
-            f"{name}: replay wrote past the new context length"
-        )
+        assert torch.isneginf(
+            inp["out_logits"][:, new_len:kv_len]
+        ).all(), f"{name}: replay wrote past the new context length"
 
 
 def check_flydsl_query_count_specialization():
